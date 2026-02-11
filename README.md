@@ -110,10 +110,6 @@ Environment variables:
 | `CACHE_TTL` | Cache TTL duration | `250ms` |
 | `CACHE_MAX_SIZE` | Maximum cached entries | `10000` |
 | `CACHE_DISTRIBUTED_INVALIDATION` | Enable distributed cache invalidation via PostgreSQL LISTEN/NOTIFY | `false` |
-| `CACHE_SMART_POLICY` | Enable intelligent cache policy (recommended for mixed workloads) | `false` |
-| `CACHE_MIN_TTL` | Minimum key TTL to be cached (keys with shorter TTL are not cached) | `1s` |
-| `CACHE_MAX_WRITE_FREQ` | Max writes/sec before key is considered "hot" and not cached | `10` |
-| `CACHE_WRITE_TRACKING_WINDOW` | Time window for tracking write frequency | `10s` |
 | `CACHE_EXCLUDE_PATTERNS` | Comma-separated key patterns to never cache (e.g., `pubsub:*,lock:*`) | `` |
 | `CACHE_INCLUDE_PATTERNS` | Comma-separated key patterns to always cache (overrides exclusions) | `` |
 | `DEBUG` | Enable debug logging (set to `1` to enable) | `` |
@@ -140,38 +136,19 @@ export CACHE_MAX_SIZE=10000
 **Multi-pod deployments:**
 With distributed cache invalidation, all postkeys instances share cache coherency. When any instance writes a key, all instances invalidate that key from their local caches within milliseconds. This allows using longer cache TTLs (e.g., 5-30 seconds) while maintaining consistency.
 
-### Smart Cache Policy
+### Cache Pattern Filtering
 
-For applications that use Redis for both caching AND messaging/pubsub patterns, the **smart cache policy** prevents caching of "hot" keys that are frequently written or have short TTLs. This avoids cache thrashing and stale data issues in mixed workloads.
+Use include/exclude patterns (glob-style) to control which keys are cached:
 
 ```bash
 export CACHE_ENABLED=true
-export CACHE_SMART_POLICY=true
-
-# Optional tuning (these are the defaults)
-export CACHE_MIN_TTL=1s              # Keys with TTL < 1s won't be cached
-export CACHE_MAX_WRITE_FREQ=10       # Keys written > 10/sec won't be cached
-export CACHE_WRITE_TRACKING_WINDOW=10s
-
-# Explicit pattern control
 export CACHE_EXCLUDE_PATTERNS="pubsub:*,channel:*,lock:*,queue:*"
 export CACHE_INCLUDE_PATTERNS="static:*,cache:*"
 ```
 
-**How it works:**
-1. **TTL-based filtering**: Keys with short TTL (e.g., < 1 second) are considered transient and not cached
-2. **Write frequency tracking**: Keys written frequently (e.g., > 10 writes/sec) are detected as "hot" and excluded from cache
-3. **Pattern matching**: Explicit include/exclude patterns for known key patterns (include patterns take precedence)
-
-**Ideal for:**
-- Applications using Redis as both a cache AND a message bus
-- Workloads mixing static content with real-time data
-- Avoiding cache pollution from high-frequency counters or pubsub keys
-
-**Metrics:**
-- `postkeys_cache_skips_total{reason="ttl_too_short"}` - Keys skipped due to short TTL
-- `postkeys_cache_skips_total{reason="write_frequency_too_high"}` - Keys skipped due to high write frequency
-- `postkeys_cache_skips_total{reason="exclude_pattern"}` - Keys skipped due to pattern match
+- **Include patterns** take precedence over exclude patterns
+- Patterns use simple glob matching with `*` as wildcard
+- Monitor excluded keys with `postkeys_cache_skips_total{reason="exclude_pattern"}`
 
 ### Tracing
 
@@ -410,16 +387,10 @@ The following table lists the configurable parameters of the postkeys chart and 
 | `cache.ttl` | Cache TTL duration | `250ms` |
 | `cache.maxSize` | Maximum number of cached entries | `10000` |
 | `cache.distributedInvalidation` | Enable distributed cache invalidation via PostgreSQL LISTEN/NOTIFY | `false` |
-| `cache.smartPolicy.enabled` | Enable intelligent cache policy (recommended for mixed workloads) | `false` |
-| `cache.smartPolicy.minTTL` | Minimum key TTL to be cached (keys with shorter TTL are not cached) | `1s` |
-| `cache.smartPolicy.maxWriteFrequency` | Max writes/sec before key is considered "hot" and not cached | `10` |
-| `cache.smartPolicy.writeTrackingWindow` | Time window for tracking write frequency | `10s` |
-| `cache.smartPolicy.excludePatterns` | Comma-separated key patterns to never cache (e.g., `pubsub:*,lock:*`) | `""` |
-| `cache.smartPolicy.includePatterns` | Comma-separated key patterns to always cache (overrides exclusions) | `""` |
+| `cache.excludePatterns` | Comma-separated key patterns to never cache (e.g., `pubsub:*,lock:*`) | `""` |
+| `cache.includePatterns` | Comma-separated key patterns to always cache (overrides exclusions) | `""` |
 
 > **Note:** When `cache.distributedInvalidation` is enabled, cache invalidations are broadcast across all pods via PostgreSQL LISTEN/NOTIFY, ensuring cache coherency in multi-pod deployments. This adds ~0.3ms overhead per write operation. For single-pod deployments, leave disabled and use a short TTL.
-
-> **Smart Cache Policy:** When `cache.smartPolicy.enabled` is true, postkeys intelligently decides which keys to cache based on their TTL and write frequency. This is ideal for applications using Redis for both caching (long-lived keys) and messaging/pubsub (frequently written, short-lived keys). Keys with TTL below `minTTL` or written more frequently than `maxWriteFrequency` will not be cached, preventing cache thrashing and stale data issues.
 
 #### Debug Configuration
 

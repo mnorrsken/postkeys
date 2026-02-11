@@ -72,11 +72,11 @@ var (
 		},
 	)
 
-	// CacheSkips counts cache skips by reason (smart policy decisions)
+	// CacheSkips counts cache skips by reason (pattern-based exclusion)
 	CacheSkips = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "postkeys_cache_skips_total",
-			Help: "Total number of cache skips by reason (smart policy)",
+			Help: "Total number of cache skips by reason",
 		},
 		[]string{"reason"},
 	)

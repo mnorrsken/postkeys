@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.19.0] - 2026-02-11
+
+### Changed
+- **Cache pattern filtering moved to normal cache settings**: `excludePatterns` and `includePatterns` are now part of the standard cache configuration instead of the smart policy
+- Helm chart: `cache.excludePatterns` and `cache.includePatterns` replace `cache.smartPolicy.excludePatterns` and `cache.smartPolicy.includePatterns`
+
+### Removed
+- **Smart cache policy**: Removed the `cache.smartPolicy` feature including TTL-based filtering, write frequency tracking, and all related configuration (`CACHE_SMART_POLICY`, `CACHE_MIN_TTL`, `CACHE_MAX_WRITE_FREQ`, `CACHE_WRITE_TRACKING_WINDOW`)
+- Removed `NewCachedStoreWithPolicy` constructor and `Policy` struct
+- Helm chart: Removed `cache.smartPolicy.*` configuration section
+
 ## [0.18.1] - 2026-02-04
 
 ### Fixed

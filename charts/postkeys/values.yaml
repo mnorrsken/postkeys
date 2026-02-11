@@ -210,21 +210,7 @@ cache:
   # Adds ~0.3ms overhead per write operation
   # For single-pod deployments, leave disabled and use short TTL
   distributedInvalidation: false
-  
-  # Smart cache policy - intelligently avoids caching "hot" keys
-  # Recommended for mixed workloads (caching + messaging/pubsub)
-  smartPolicy:
-    # Enable intelligent cache decisions based on TTL and write frequency
-    enabled: false
-    # Minimum key TTL to be cached (keys with shorter TTL are not cached)
-    # Set to "0" to disable TTL-based filtering
-    minTTL: "1s"
-    # Maximum writes per second before key is considered "hot" and not cached
-    # Set to 0 to disable write frequency tracking
-    maxWriteFrequency: 10
-    # Time window for tracking write frequency
-    writeTrackingWindow: "10s"
-    # Comma-separated key patterns to never cache (glob-style, e.g., "pubsub:*,lock:*")
-    excludePatterns: ""
-    # Comma-separated key patterns to always cache (overrides exclusions, e.g., "static:*")
-    includePatterns: ""
+  # Comma-separated key patterns to never cache (glob-style, e.g., "pubsub:*,lock:*")
+  excludePatterns: ""
+  # Comma-separated key patterns to always cache (overrides exclusions, e.g., "static:*")
+  includePatterns: ""

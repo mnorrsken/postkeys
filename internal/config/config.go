@@ -32,11 +32,7 @@ type Config struct {
 	CacheMaxSize                 int
 	CacheDistributedInvalidation bool
 
-	// Smart cache policy (intelligent caching to avoid caching hot/messaging keys)
-	CacheSmartPolicy           bool          // Enable intelligent cache decisions
-	CacheMinTTLForCache        time.Duration // Minimum key TTL to be cached (0 = no minimum)
-	CacheMaxWriteFrequency     float64       // Max writes/sec before key is considered "hot" (0 = no tracking)
-	CacheWriteTrackingWindow   time.Duration // Window for tracking write frequency
+	// Cache key patterns
 	CacheExcludePatterns       string        // Comma-separated patterns to never cache (e.g., "pubsub:*,lock:*")
 	CacheIncludePatterns       string        // Comma-separated patterns to always cache (e.g., "static:*")
 
@@ -68,10 +64,6 @@ func Load() *Config {
 		CacheTTL:                     getEnvDuration("CACHE_TTL", 250*time.Millisecond),
 		CacheMaxSize:                 getEnvInt("CACHE_MAX_SIZE", 10000),
 		CacheDistributedInvalidation: getEnvBool("CACHE_DISTRIBUTED_INVALIDATION", false),
-		CacheSmartPolicy:             getEnvBool("CACHE_SMART_POLICY", false),
-		CacheMinTTLForCache:          getEnvDuration("CACHE_MIN_TTL", 1*time.Second),
-		CacheMaxWriteFrequency:       getEnvFloat("CACHE_MAX_WRITE_FREQ", 10.0),
-		CacheWriteTrackingWindow:     getEnvDuration("CACHE_WRITE_TRACKING_WINDOW", 10*time.Second),
 		CacheExcludePatterns:         getEnv("CACHE_EXCLUDE_PATTERNS", ""),
 		CacheIncludePatterns:         getEnv("CACHE_INCLUDE_PATTERNS", ""),
 		Debug:                        getEnv("DEBUG", "") == "1",
@@ -100,15 +92,6 @@ func getEnvBool(key string, defaultValue bool) bool {
 	if value := os.Getenv(key); value != "" {
 		if boolVal, err := strconv.ParseBool(value); err == nil {
 			return boolVal
-		}
-	}
-	return defaultValue
-}
-
-func getEnvFloat(key string, defaultValue float64) float64 {
-	if value := os.Getenv(key); value != "" {
-		if floatVal, err := strconv.ParseFloat(value, 64); err == nil {
-			return floatVal
 		}
 	}
 	return defaultValue

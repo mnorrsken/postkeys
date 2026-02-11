@@ -124,23 +124,13 @@ spec:
             - name: CACHE_DISTRIBUTED_INVALIDATION
               value: "true"
             {{- end }}
-            {{- if .Values.cache.smartPolicy.enabled }}
-            - name: CACHE_SMART_POLICY
-              value: "true"
-            - name: CACHE_MIN_TTL
-              value: {{ .Values.cache.smartPolicy.minTTL | quote }}
-            - name: CACHE_MAX_WRITE_FREQ
-              value: {{ .Values.cache.smartPolicy.maxWriteFrequency | quote }}
-            - name: CACHE_WRITE_TRACKING_WINDOW
-              value: {{ .Values.cache.smartPolicy.writeTrackingWindow | quote }}
-            {{- if .Values.cache.smartPolicy.excludePatterns }}
+            {{- if .Values.cache.excludePatterns }}
             - name: CACHE_EXCLUDE_PATTERNS
-              value: {{ .Values.cache.smartPolicy.excludePatterns | quote }}
+              value: {{ .Values.cache.excludePatterns | quote }}
             {{- end }}
-            {{- if .Values.cache.smartPolicy.includePatterns }}
+            {{- if .Values.cache.includePatterns }}
             - name: CACHE_INCLUDE_PATTERNS
-              value: {{ .Values.cache.smartPolicy.includePatterns | quote }}
-            {{- end }}
+              value: {{ .Values.cache.includePatterns | quote }}
             {{- end }}
             {{- end }}
             {{- if .Values.debug }}

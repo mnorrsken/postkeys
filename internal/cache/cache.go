@@ -26,6 +26,15 @@ type Config struct {
 	TTL             time.Duration
 	MaxSize         int
 	CleanupInterval time.Duration
+
+	// ExcludePatterns is a list of key patterns to never cache (glob-style).
+	// Example: ["pubsub:*", "channel:*", "lock:*"]
+	ExcludePatterns []string
+
+	// IncludePatterns is a list of key patterns to always cache (glob-style).
+	// These patterns take precedence over exclusion rules.
+	// Example: ["static:*", "cache:*"]
+	IncludePatterns []string
 }
 
 // New creates a new cache with the given configuration

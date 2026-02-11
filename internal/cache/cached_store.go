@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/mnorrsken/postkeys/internal/metrics"
@@ -10,34 +11,21 @@ import (
 
 // CachedStore wraps a storage.Backend with an in-memory cache
 type CachedStore struct {
-	backend     storage.Backend
-	cache       *Cache
-	invalidator *Invalidator
-	policy      *Policy       // optional smart caching policy
-	ttlCache    *Cache        // tracks TTL for keys (if policy enabled)
+	backend         storage.Backend
+	cache           *Cache
+	invalidator     *Invalidator
+	excludePatterns []string
+	includePatterns []string
 }
 
 // NewCachedStore creates a new cached storage wrapper
 func NewCachedStore(backend storage.Backend, cfg Config) *CachedStore {
 	return &CachedStore{
-		backend: backend,
-		cache:   New(cfg),
+		backend:         backend,
+		cache:           New(cfg),
+		excludePatterns: cfg.ExcludePatterns,
+		includePatterns: cfg.IncludePatterns,
 	}
-}
-
-// NewCachedStoreWithPolicy creates a cached storage wrapper with smart policy
-func NewCachedStoreWithPolicy(backend storage.Backend, cfg Config, policyCfg PolicyConfig) *CachedStore {
-	cs := &CachedStore{
-		backend: backend,
-		cache:   New(cfg),
-		policy:  NewPolicy(policyCfg),
-	}
-	// Use a separate cache to track TTL metadata (longer lived)
-	cs.ttlCache = New(Config{
-		TTL:     30 * time.Second,
-		MaxSize: cfg.MaxSize,
-	})
-	return cs
 }
 
 // SetInvalidator sets the distributed cache invalidator
@@ -53,47 +41,52 @@ func (s *CachedStore) GetCache() *Cache {
 // Close closes the cached store and underlying backend
 func (s *CachedStore) Close() {
 	s.cache.Stop()
-	if s.ttlCache != nil {
-		s.ttlCache.Stop()
-	}
 	s.backend.Close()
 }
 
-// shouldCache checks if a key should be cached based on policy
-// Returns true if no policy is set, or if policy allows caching
+// shouldCache checks if a key should be cached based on include/exclude patterns.
+// Include patterns take precedence over exclude patterns.
+// Returns true if no patterns are configured.
 func (s *CachedStore) shouldCache(key string) bool {
-	if s.policy == nil {
+	// Check include patterns first (they take precedence)
+	if len(s.includePatterns) > 0 && matchesAnyPattern(key, s.includePatterns) {
 		return true
 	}
 
-	// Get stored TTL for this key (if known)
-	var ttl time.Duration
-	if s.ttlCache != nil {
-		if ttlStr, found := s.ttlCache.Get(key); found {
-			if d, err := time.ParseDuration(ttlStr); err == nil {
-				ttl = d
-			}
-		}
+	// Check exclude patterns
+	if len(s.excludePatterns) > 0 && matchesAnyPattern(key, s.excludePatterns) {
+		metrics.CacheSkips.WithLabelValues("exclude_pattern").Inc()
+		return false
 	}
 
-	decision := s.policy.ShouldCache(key, ttl)
-	if !decision.ShouldCache {
-		metrics.CacheSkips.WithLabelValues(decision.Reason).Inc()
-	}
-	return decision.ShouldCache
+	return true
 }
 
-// recordWrite records a write operation for policy tracking
-func (s *CachedStore) recordWrite(key string, ttl time.Duration) {
-	if s.policy == nil {
-		return
+// matchesAnyPattern checks if a key matches any of the glob patterns
+func matchesAnyPattern(key string, patterns []string) bool {
+	for _, pattern := range patterns {
+		if matchGlob(pattern, key) {
+			return true
+		}
 	}
-	s.policy.RecordWrite(key)
+	return false
+}
 
-	// Store TTL metadata for future cache decisions
-	if s.ttlCache != nil && ttl > 0 {
-		s.ttlCache.Set(key, ttl.String())
+// matchGlob performs simple glob matching with * as wildcard
+func matchGlob(pattern, str string) bool {
+	if pattern == str {
+		return true
 	}
+	if strings.HasSuffix(pattern, "*") {
+		return strings.HasPrefix(str, strings.TrimSuffix(pattern, "*"))
+	}
+	if strings.HasPrefix(pattern, "*") {
+		return strings.HasSuffix(str, strings.TrimPrefix(pattern, "*"))
+	}
+	if idx := strings.Index(pattern, "*"); idx >= 0 {
+		return strings.HasPrefix(str, pattern[:idx]) && strings.HasSuffix(str, pattern[idx+1:])
+	}
+	return false
 }
 
 // invalidate invalidates a key locally and broadcasts to other instances
@@ -148,9 +141,6 @@ func (s *CachedStore) Get(ctx context.Context, key string) (string, bool, error)
 }
 
 func (s *CachedStore) Set(ctx context.Context, key, value string, ttl time.Duration) error {
-	// Record write for policy tracking (before the actual write)
-	s.recordWrite(key, ttl)
-
 	err := s.backend.Set(ctx, key, value, ttl)
 	if err != nil {
 		return err

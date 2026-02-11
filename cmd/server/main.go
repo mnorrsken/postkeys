@@ -50,25 +50,13 @@ func main() {
 	var cacheInvalidator *cache.Invalidator
 	if cfg.CacheEnabled {
 		cacheCfg := cache.Config{
-			TTL:     cfg.CacheTTL,
-			MaxSize: cfg.CacheMaxSize,
+			TTL:             cfg.CacheTTL,
+			MaxSize:         cfg.CacheMaxSize,
+			ExcludePatterns: parsePatterns(cfg.CacheExcludePatterns),
+			IncludePatterns: parsePatterns(cfg.CacheIncludePatterns),
 		}
 
-		// Use smart policy if enabled
-		if cfg.CacheSmartPolicy {
-			policyCfg := cache.PolicyConfig{
-				MinTTLForCache:      cfg.CacheMinTTLForCache,
-				MaxWriteFrequency:   cfg.CacheMaxWriteFrequency,
-				WriteTrackingWindow: cfg.CacheWriteTrackingWindow,
-				ExcludePatterns:     parsePatterns(cfg.CacheExcludePatterns),
-				IncludePatterns:     parsePatterns(cfg.CacheIncludePatterns),
-			}
-			cachedStore = cache.NewCachedStoreWithPolicy(store, cacheCfg, policyCfg)
-			log.Printf("Smart cache policy enabled (MinTTL: %v, MaxWriteFreq: %.1f/s)", 
-				cfg.CacheMinTTLForCache, cfg.CacheMaxWriteFrequency)
-		} else {
-			cachedStore = cache.NewCachedStore(store, cacheCfg)
-		}
+		cachedStore = cache.NewCachedStore(store, cacheCfg)
 		backend = cachedStore
 
 		// Set up distributed cache invalidation (optional, for multi-pod deployments)
