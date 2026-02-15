@@ -31,18 +31,24 @@ func main() {
 	// Connect to PostgreSQL
 	log.Printf("Connecting to PostgreSQL at %s:%d...", cfg.PGHost, cfg.PGPort)
 	store, err := storage.New(ctx, storage.Config{
-		Host:          cfg.PGHost,
-		Port:          cfg.PGPort,
-		User:          cfg.PGUser,
-		Password:      cfg.PGPassword,
-		Database:      cfg.PGDatabase,
-		SSLMode:       cfg.PGSSLMode,
-		SQLTraceLevel: cfg.SQLTraceLevel,
+		Host:              cfg.PGHost,
+		Port:              cfg.PGPort,
+		User:              cfg.PGUser,
+		Password:          cfg.PGPassword,
+		Database:          cfg.PGDatabase,
+		SSLMode:           cfg.PGSSLMode,
+		SQLTraceLevel:     cfg.SQLTraceLevel,
+		MaxConns:          cfg.PGMaxConns,
+		MinConns:          cfg.PGMinConns,
+		MaxConnLifetime:   cfg.PGMaxConnLifetime,
+		MaxConnIdleTime:   cfg.PGMaxConnIdleTime,
+		HealthCheckPeriod: cfg.PGHealthCheckPeriod,
 	})
 	if err != nil {
 		log.Fatalf("Failed to connect to PostgreSQL: %v", err)
 	}
-	log.Println("Connected to PostgreSQL")
+	log.Printf("Connected to PostgreSQL (pool: min=%d, max=%d, lifetime=%v, health_check=%v)",
+		cfg.PGMinConns, cfg.PGMaxConns, cfg.PGMaxConnLifetime, cfg.PGHealthCheckPeriod)
 
 	// Wrap with cache if enabled
 	var backend storage.Backend = store
