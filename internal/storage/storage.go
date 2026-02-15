@@ -27,6 +27,13 @@ type Config struct {
 	Database      string
 	SSLMode       string
 	SQLTraceLevel int // 0=off, 1=important, 2=most queries, 3=everything
+
+	// Connection pool settings
+	MaxConns         int           // Maximum number of connections in the pool
+	MinConns         int           // Minimum number of connections in the pool
+	MaxConnLifetime  time.Duration // Maximum lifetime of a connection before it's closed
+	MaxConnIdleTime  time.Duration // Maximum time a connection can be idle before it's closed
+	HealthCheckPeriod time.Duration // Period between health checks on idle connections
 }
 
 // New creates a new Store with the given configuration
@@ -36,7 +43,30 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 		cfg.User, cfg.Password, cfg.Host, cfg.Port, cfg.Database, cfg.SSLMode,
 	)
 
-	pool, err := pgxpool.New(ctx, connStr)
+	// Parse config and set pool parameters for better resilience
+	poolConfig, err := pgxpool.ParseConfig(connStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse config: %w", err)
+	}
+
+	// Configure pool settings for handling master node switchovers
+	if cfg.MaxConns > 0 {
+		poolConfig.MaxConns = int32(cfg.MaxConns)
+	}
+	if cfg.MinConns > 0 {
+		poolConfig.MinConns = int32(cfg.MinConns)
+	}
+	if cfg.MaxConnLifetime > 0 {
+		poolConfig.MaxConnLifetime = cfg.MaxConnLifetime
+	}
+	if cfg.MaxConnIdleTime > 0 {
+		poolConfig.MaxConnIdleTime = cfg.MaxConnIdleTime
+	}
+	if cfg.HealthCheckPeriod > 0 {
+		poolConfig.HealthCheckPeriod = cfg.HealthCheckPeriod
+	}
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create pool: %w", err)
 	}

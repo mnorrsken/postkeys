@@ -106,6 +106,11 @@ Environment variables:
 | `PG_PASSWORD` | PostgreSQL password | `postgres` |
 | `PG_DATABASE` | PostgreSQL database | `postkeys` |
 | `PG_SSLMODE` | PostgreSQL SSL mode | `disable` |
+| `PG_MAX_CONNS` | Maximum number of connections in pool | `10` |
+| `PG_MIN_CONNS` | Minimum number of connections in pool | `2` |
+| `PG_MAX_CONN_LIFETIME` | Maximum lifetime of a connection | `30m` |
+| `PG_MAX_CONN_IDLE_TIME` | Maximum idle time before closing connection | `5m` |
+| `PG_HEALTH_CHECK_PERIOD` | Period between health checks on idle connections | `1m` |
 | `CACHE_ENABLED` | Enable in-memory cache (opt-in) | `false` |
 | `CACHE_TTL` | Cache TTL duration | `250ms` |
 | `CACHE_MAX_SIZE` | Maximum cached entries | `10000` |
@@ -115,6 +120,17 @@ Environment variables:
 | `DEBUG` | Enable debug logging (set to `1` to enable) | `` |
 | `SQLTRACE` | SQL query tracing level (0-3, see Tracing section) | `0` |
 | `TRACE` | RESP command tracing level (0-3, see Tracing section) | `0` |
+
+### Database Connection Pool
+
+postkeys uses a configurable connection pool to manage PostgreSQL connections efficiently and handle database failovers gracefully:
+
+- **Health checks** (`PG_HEALTH_CHECK_PERIOD`): Idle connections are periodically checked to ensure they're still alive
+- **Connection lifetime** (`PG_MAX_CONN_LIFETIME`): Connections are automatically closed and recreated after a maximum lifetime, ensuring fresh connections during database switchovers
+- **Idle timeout** (`PG_MAX_CONN_IDLE_TIME`): Idle connections are closed to free resources
+- **Pool sizing** (`PG_MIN_CONNS`, `PG_MAX_CONNS`): Controls the minimum and maximum number of connections maintained
+
+These settings work together with the existing reconnection logic in LISTEN/NOTIFY components (pub/sub, cache invalidation, list blocking operations) to provide resilience during PostgreSQL master node switchovers or network disruptions.
 
 ### In-Memory Cache
 

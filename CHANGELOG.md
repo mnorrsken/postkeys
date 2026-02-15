@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.20.0] - 2026-02-15
+
+### Added
+- **Database connection pool configuration for improved resilience**: Added configurable connection pool settings to handle PostgreSQL master node switchovers and connection failures more gracefully
+  - `PG_MAX_CONNS` (default: 10): Maximum number of connections in the pool
+  - `PG_MIN_CONNS` (default: 2): Minimum number of connections in the pool
+  - `PG_MAX_CONN_LIFETIME` (default: 30m): Maximum lifetime of a connection before it's closed and recreated
+  - `PG_MAX_CONN_IDLE_TIME` (default: 5m): Maximum time a connection can be idle before it's closed
+  - `PG_HEALTH_CHECK_PERIOD` (default: 1m): Period between health checks on idle connections
+  - These settings ensure connections are regularly refreshed and health-checked, providing better resilience during database failovers
+
+### Changed
+- Connection pool now proactively manages connection lifecycle with configurable health checks and connection lifetimes
+- Log messages now include pool configuration details on startup
+
 ## [0.19.0] - 2026-02-11
 
 ### Changed

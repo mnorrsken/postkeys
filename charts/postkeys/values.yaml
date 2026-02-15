@@ -128,6 +128,21 @@ postgresql:
   # PostgreSQL SSL mode (disable, require, verify-ca, verify-full)
   sslmode: "disable"
   
+  # Connection pool configuration for improved resilience during failovers
+  pool:
+    # Maximum number of connections in the pool
+    maxConns: 10
+    # Minimum number of connections to maintain in the pool
+    minConns: 2
+    # Maximum lifetime of a connection before it's closed and recreated
+    # This ensures connections are refreshed during database switchovers
+    maxConnLifetime: "30m"
+    # Maximum time a connection can be idle before it's closed
+    maxConnIdleTime: "5m"
+    # Period between health checks on idle connections
+    # Helps detect and remove stale connections
+    healthCheckPeriod: "1m"
+  
   # Use an existing secret for PostgreSQL credentials
   existingSecret:
     # Name of the existing secret
