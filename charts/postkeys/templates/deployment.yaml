@@ -102,6 +102,18 @@ spec:
                 secretKeyRef:
                   name: {{ include "postkeys.postgresqlSecretName" . }}
                   key: {{ .Values.postgresql.existingSecret.passwordKey }}
+            {{- if .Values.postgresql.pool }}
+            - name: PG_MAX_CONNS
+              value: {{ .Values.postgresql.pool.maxConns | quote }}
+            - name: PG_MIN_CONNS
+              value: {{ .Values.postgresql.pool.minConns | quote }}
+            - name: PG_MAX_CONN_LIFETIME
+              value: {{ .Values.postgresql.pool.maxConnLifetime | quote }}
+            - name: PG_MAX_CONN_IDLE_TIME
+              value: {{ .Values.postgresql.pool.maxConnIdleTime | quote }}
+            - name: PG_HEALTH_CHECK_PERIOD
+              value: {{ .Values.postgresql.pool.healthCheckPeriod | quote }}
+            {{- end }}
             {{- if or .Values.redis.password.value .Values.redis.password.existingSecret.name }}
             - name: REDIS_PASSWORD
               valueFrom:
