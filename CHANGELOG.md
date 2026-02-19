@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.20.1] - 2026-02-19
+
+### Fixed
+- **Critical: Expired key data not cleaned from `kv_zsets` and `kv_hyperloglog` tables**: The background cleanup goroutine only deleted expired rows from `kv_strings`, `kv_hashes`, `kv_lists`, and `kv_sets`, completely missing sorted sets and HyperLogLog data. This caused unbounded disk growth in PostgreSQL.
+- **EXPIRE/EXPIREAT not propagated to sorted set data rows**: When `EXPIRE` was called on a sorted set key, `expires_at` was updated in `kv_meta` but never in `kv_zsets`, so the background cleaner could not match those rows. The meta row was eventually deleted, leaving permanently orphaned data.
+- **Orphaned data row cleanup**: `deleteExpiredKeys` now uses `DELETE ... RETURNING key` on `kv_meta` and batch-deletes any remaining data rows for those keys, preventing orphaned rows from accumulating.
+- **PERSIST missing `kv_zsets` and `kv_hyperloglog`**: Clearing a TTL via `PERSIST` did not update these tables.
+- **RENAME missing sorted set and HyperLogLog types**: Renaming a key of these types silently left data behind under the old key name.
+- **DEL/overwrite missing `kv_hyperloglog`**: `deleteKeyFromAllTables` and `deleteKeysFromAllTables` did not include the HyperLogLog table, leaving orphaned rows on key deletion or type change.
+
 ## [0.20.0] - 2026-02-15
 
 ### Added

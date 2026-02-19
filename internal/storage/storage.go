@@ -188,15 +188,54 @@ func (s *Store) cleanupExpiredKeys(ctx context.Context) {
 
 func (s *Store) deleteExpiredKeys(ctx context.Context) {
 	now := time.Now()
-	queries := []string{
+
+	// Phase 1: Delete expired rows from all data tables (including kv_zsets and kv_hyperloglog)
+	dataQueries := []string{
 		"DELETE FROM kv_strings WHERE expires_at IS NOT NULL AND expires_at <= $1",
 		"DELETE FROM kv_hashes WHERE expires_at IS NOT NULL AND expires_at <= $1",
 		"DELETE FROM kv_lists WHERE expires_at IS NOT NULL AND expires_at <= $1",
 		"DELETE FROM kv_sets WHERE expires_at IS NOT NULL AND expires_at <= $1",
-		"DELETE FROM kv_meta WHERE expires_at IS NOT NULL AND expires_at <= $1",
+		"DELETE FROM kv_zsets WHERE expires_at IS NOT NULL AND expires_at <= $1",
+		"DELETE FROM kv_hyperloglog WHERE expires_at IS NOT NULL AND expires_at <= $1",
 	}
-	for _, q := range queries {
+	for _, q := range dataQueries {
 		s.pool.Exec(ctx, q, now)
+	}
+
+	// Phase 2: Collect keys expired in kv_meta, then delete their data rows
+	// This handles the case where expires_at was set on kv_meta but not
+	// propagated to the data table (e.g. sorted sets via EXPIRE command).
+	rows, err := s.pool.Query(ctx,
+		"DELETE FROM kv_meta WHERE expires_at IS NOT NULL AND expires_at <= $1 RETURNING key",
+		now,
+	)
+	if err != nil {
+		return
+	}
+	var orphanKeys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			rows.Close()
+			return
+		}
+		orphanKeys = append(orphanKeys, key)
+	}
+	rows.Close()
+
+	// Clean up any data rows for these expired meta keys
+	if len(orphanKeys) > 0 {
+		orphanQueries := []string{
+			"DELETE FROM kv_strings WHERE key = ANY($1)",
+			"DELETE FROM kv_hashes WHERE key = ANY($1)",
+			"DELETE FROM kv_lists WHERE key = ANY($1)",
+			"DELETE FROM kv_sets WHERE key = ANY($1)",
+			"DELETE FROM kv_zsets WHERE key = ANY($1)",
+			"DELETE FROM kv_hyperloglog WHERE key = ANY($1)",
+		}
+		for _, q := range orphanQueries {
+			s.pool.Exec(ctx, q, orphanKeys)
+		}
 	}
 }
 

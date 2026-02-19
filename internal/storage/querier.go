@@ -77,6 +77,25 @@ type queryOps struct{}
 
 // ============== Helper Methods ==============
 
+// dataTableForType returns the data table name for a given key type.
+// Returns empty string for TypeNone and unknown types.
+func dataTableForType(kt KeyType) string {
+	switch kt {
+	case TypeString:
+		return "kv_strings"
+	case TypeHash:
+		return "kv_hashes"
+	case TypeList:
+		return "kv_lists"
+	case TypeSet:
+		return "kv_sets"
+	case TypeZSet:
+		return "kv_zsets"
+	default:
+		return ""
+	}
+}
+
 func (queryOps) getKeyType(ctx context.Context, q Querier, key string) (KeyType, error) {
 	var keyType string
 	err := q.QueryRow(ctx,
@@ -123,6 +142,7 @@ func (queryOps) deleteKeyFromAllTables(ctx context.Context, q Querier, key strin
 		"DELETE FROM kv_lists WHERE key = $1",
 		"DELETE FROM kv_sets WHERE key = $1",
 		"DELETE FROM kv_zsets WHERE key = $1",
+		"DELETE FROM kv_hyperloglog WHERE key = $1",
 		"DELETE FROM kv_meta WHERE key = $1",
 	}
 	for _, query := range queries {
@@ -144,6 +164,7 @@ func (queryOps) deleteKeysFromAllTables(ctx context.Context, q Querier, keys []s
 		"DELETE FROM kv_lists WHERE key = ANY($1)",
 		"DELETE FROM kv_sets WHERE key = ANY($1)",
 		"DELETE FROM kv_zsets WHERE key = ANY($1)",
+		"DELETE FROM kv_hyperloglog WHERE key = ANY($1)",
 		"DELETE FROM kv_meta WHERE key = ANY($1)",
 	}
 	for _, query := range queries {
@@ -779,17 +800,8 @@ func (o queryOps) expire(ctx context.Context, q Querier, key string, ttl time.Du
 		return false, err
 	}
 
-	var table string
-	switch keyType {
-	case TypeString:
-		table = "kv_strings"
-	case TypeHash:
-		table = "kv_hashes"
-	case TypeList:
-		table = "kv_lists"
-	case TypeSet:
-		table = "kv_sets"
-	default:
+	table := dataTableForType(keyType)
+	if table == "" {
 		return true, nil
 	}
 
@@ -860,7 +872,7 @@ func (o queryOps) persist(ctx context.Context, q Querier, key string) (bool, err
 	}
 
 	// Also clear expires_at in data tables
-	tables := []string{"kv_strings", "kv_hashes", "kv_lists", "kv_sets"}
+	tables := []string{"kv_strings", "kv_hashes", "kv_lists", "kv_sets", "kv_zsets", "kv_hyperloglog"}
 	for _, table := range tables {
 		q.Exec(ctx, fmt.Sprintf("UPDATE %s SET expires_at = NULL WHERE key = $1", table), key)
 	}
@@ -913,16 +925,9 @@ func (o queryOps) rename(ctx context.Context, q Querier, oldKey, newKey string) 
 	}
 
 	// Rename in data table
-	var table string
-	switch keyType {
-	case TypeString:
-		table = "kv_strings"
-	case TypeHash:
-		table = "kv_hashes"
-	case TypeList:
-		table = "kv_lists"
-	case TypeSet:
-		table = "kv_sets"
+	table := dataTableForType(keyType)
+	if table == "" {
+		return fmt.Errorf("unsupported key type for rename: %s", keyType)
 	}
 
 	_, err = q.Exec(ctx, fmt.Sprintf("UPDATE %s SET key = $2 WHERE key = $1", table), oldKey, newKey)
@@ -2809,19 +2814,8 @@ func (o queryOps) expireAt(ctx context.Context, q Querier, key string, timestamp
 		return false, err
 	}
 
-	var table string
-	switch keyType {
-	case TypeString:
-		table = "kv_strings"
-	case TypeHash:
-		table = "kv_hashes"
-	case TypeList:
-		table = "kv_lists"
-	case TypeSet:
-		table = "kv_sets"
-	case TypeZSet:
-		table = "kv_zsets"
-	default:
+	table := dataTableForType(keyType)
+	if table == "" {
 		return true, nil
 	}
 
