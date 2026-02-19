@@ -172,6 +172,10 @@ func (s *Store) initSchema(ctx context.Context) error {
 	return err
 }
 
+// advisoryLockCleanup is a fixed advisory lock ID used to ensure only one
+// instance runs expired key cleanup at a time across multiple replicas.
+const advisoryLockCleanup int64 = 0x706B5F636C65616E // "pk_clean" as int64
+
 func (s *Store) cleanupExpiredKeys(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
@@ -187,6 +191,20 @@ func (s *Store) cleanupExpiredKeys(ctx context.Context) {
 }
 
 func (s *Store) deleteExpiredKeys(ctx context.Context) {
+	// Try to acquire an advisory lock so only one instance runs cleanup.
+	// pg_try_advisory_xact_lock is transaction-scoped and non-blocking:
+	// if another instance already holds it, we skip this cycle.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	var acquired bool
+	if err := tx.QueryRow(ctx, "SELECT pg_try_advisory_xact_lock($1)", advisoryLockCleanup).Scan(&acquired); err != nil || !acquired {
+		return
+	}
+
 	now := time.Now()
 
 	// Phase 1: Delete expired rows from all data tables (including kv_zsets and kv_hyperloglog)
@@ -237,6 +255,8 @@ func (s *Store) deleteExpiredKeys(ctx context.Context) {
 			s.pool.Exec(ctx, q, orphanKeys)
 		}
 	}
+
+	tx.Commit(ctx)
 }
 
 // withTx wraps an operation in a transaction

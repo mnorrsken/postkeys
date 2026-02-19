@@ -5296,3 +5296,369 @@ func TestScriptFlush(t *testing.T) {
 	}
 }
 
+// ============== Expiration & Cleanup Fix Tests ==============
+// These tests verify the fixes for sorted set, HyperLogLog, and orphaned data cleanup.
+
+// TestExpireZSetCleanup verifies that EXPIRE on a sorted set key causes the data
+// to be removed after expiration (previously kv_zsets rows were never cleaned).
+func TestExpireZSetCleanup(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	// Create a sorted set
+	ts.client.ZAdd(ctx, "zset:expire", redis.Z{Score: 1.0, Member: "a"}, redis.Z{Score: 2.0, Member: "b"})
+
+	// Set a short TTL
+	ok, err := ts.client.Expire(ctx, "zset:expire", 1*time.Second).Result()
+	if err != nil {
+		t.Fatalf("EXPIRE failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("Expected EXPIRE to return true")
+	}
+
+	// Verify TTL is set
+	ttl, _ := ts.client.TTL(ctx, "zset:expire").Result()
+	if ttl < 0 || ttl > 1*time.Second {
+		t.Errorf("Expected TTL between 0 and 1s, got %v", ttl)
+	}
+
+	// Wait for expiration + cleanup cycle
+	time.Sleep(2200 * time.Millisecond)
+
+	// Key should no longer exist via Redis protocol
+	exists, _ := ts.client.Exists(ctx, "zset:expire").Result()
+	if exists != 0 {
+		t.Error("Expected sorted set key to be expired")
+	}
+
+	// Verify no orphaned rows remain in kv_zsets
+	var rowCount int
+	err = ts.store.Pool().QueryRow(ctx,
+		"SELECT COUNT(*) FROM kv_zsets WHERE key = $1", "zset:expire",
+	).Scan(&rowCount)
+	if err != nil {
+		t.Fatalf("Failed to query kv_zsets: %v", err)
+	}
+	if rowCount != 0 {
+		t.Errorf("Expected 0 orphaned rows in kv_zsets, got %d", rowCount)
+	}
+}
+
+// TestExpireAtZSetCleanup verifies that EXPIREAT on a sorted set key works correctly.
+func TestExpireAtZSetCleanup(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	// Create a sorted set
+	ts.client.ZAdd(ctx, "zset:expireat", redis.Z{Score: 1.0, Member: "x"})
+
+	// Set expiration at specific time
+	expireTime := time.Now().Add(1 * time.Second)
+	ok, err := ts.client.ExpireAt(ctx, "zset:expireat", expireTime).Result()
+	if err != nil {
+		t.Fatalf("EXPIREAT failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("Expected EXPIREAT to return true")
+	}
+
+	// Wait for expiration + cleanup
+	time.Sleep(2200 * time.Millisecond)
+
+	// Key should be gone
+	exists, _ := ts.client.Exists(ctx, "zset:expireat").Result()
+	if exists != 0 {
+		t.Error("Expected sorted set key to be expired")
+	}
+
+	// Verify no orphaned rows
+	var rowCount int
+	err = ts.store.Pool().QueryRow(ctx,
+		"SELECT COUNT(*) FROM kv_zsets WHERE key = $1", "zset:expireat",
+	).Scan(&rowCount)
+	if err != nil {
+		t.Fatalf("Failed to query kv_zsets: %v", err)
+	}
+	if rowCount != 0 {
+		t.Errorf("Expected 0 orphaned rows in kv_zsets, got %d", rowCount)
+	}
+}
+
+// TestExpireHyperLogLogCleanup verifies that EXPIRE on a HyperLogLog key causes the data
+// to be removed after expiration.
+func TestExpireHyperLogLogCleanup(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	// Create a HyperLogLog
+	ts.client.PFAdd(ctx, "hll:expire", "a", "b", "c")
+
+	// Set a short TTL
+	ok, err := ts.client.Expire(ctx, "hll:expire", 1*time.Second).Result()
+	if err != nil {
+		t.Fatalf("EXPIRE failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("Expected EXPIRE to return true")
+	}
+
+	// Wait for expiration + cleanup cycle
+	time.Sleep(2200 * time.Millisecond)
+
+	// Key should no longer exist
+	exists, _ := ts.client.Exists(ctx, "hll:expire").Result()
+	if exists != 0 {
+		t.Error("Expected HyperLogLog key to be expired")
+	}
+
+	// Verify no orphaned rows remain in kv_hyperloglog
+	var rowCount int
+	err = ts.store.Pool().QueryRow(ctx,
+		"SELECT COUNT(*) FROM kv_hyperloglog WHERE key = $1", "hll:expire",
+	).Scan(&rowCount)
+	if err != nil {
+		t.Fatalf("Failed to query kv_hyperloglog: %v", err)
+	}
+	if rowCount != 0 {
+		t.Errorf("Expected 0 orphaned rows in kv_hyperloglog, got %d", rowCount)
+	}
+}
+
+// TestPersistZSet verifies that PERSIST works correctly on sorted set keys.
+func TestPersistZSet(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	// Create a sorted set with TTL
+	ts.client.ZAdd(ctx, "zset:persist", redis.Z{Score: 1.0, Member: "a"})
+	ts.client.Expire(ctx, "zset:persist", 10*time.Second)
+
+	// Verify TTL is set
+	ttl, _ := ts.client.TTL(ctx, "zset:persist").Result()
+	if ttl <= 0 {
+		t.Fatalf("Expected positive TTL, got %v", ttl)
+	}
+
+	// PERSIST should remove the TTL
+	ok, err := ts.client.Persist(ctx, "zset:persist").Result()
+	if err != nil {
+		t.Fatalf("PERSIST failed: %v", err)
+	}
+	if !ok {
+		t.Error("Expected PERSIST to return true")
+	}
+
+	// TTL should now be -1 (no expiry)
+	ttl, _ = ts.client.TTL(ctx, "zset:persist").Result()
+	if ttl >= 0 {
+		t.Errorf("Expected negative TTL after PERSIST, got %v", ttl)
+	}
+
+	// Verify the data table also has NULL expires_at
+	var expiresAt *time.Time
+	err = ts.store.Pool().QueryRow(ctx,
+		"SELECT expires_at FROM kv_zsets WHERE key = $1 LIMIT 1", "zset:persist",
+	).Scan(&expiresAt)
+	if err != nil {
+		t.Fatalf("Failed to query kv_zsets: %v", err)
+	}
+	if expiresAt != nil {
+		t.Errorf("Expected NULL expires_at in kv_zsets, got %v", expiresAt)
+	}
+}
+
+// TestRenameZSet verifies that RENAME works correctly on sorted set keys.
+func TestRenameZSet(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	// Create a sorted set
+	ts.client.ZAdd(ctx, "zset:old", redis.Z{Score: 1.0, Member: "a"}, redis.Z{Score: 2.0, Member: "b"})
+
+	// Rename it
+	err := ts.client.Rename(ctx, "zset:old", "zset:new").Err()
+	if err != nil {
+		t.Fatalf("RENAME failed: %v", err)
+	}
+
+	// Old key should not exist
+	exists, _ := ts.client.Exists(ctx, "zset:old").Result()
+	if exists != 0 {
+		t.Error("Old key should not exist after RENAME")
+	}
+
+	// New key should have the data
+	members, err := ts.client.ZRangeWithScores(ctx, "zset:new", 0, -1).Result()
+	if err != nil {
+		t.Fatalf("ZRANGE failed: %v", err)
+	}
+	if len(members) != 2 {
+		t.Errorf("Expected 2 members, got %d", len(members))
+	}
+
+	// Verify no orphaned rows remain under the old key
+	var rowCount int
+	err = ts.store.Pool().QueryRow(ctx,
+		"SELECT COUNT(*) FROM kv_zsets WHERE key = $1", "zset:old",
+	).Scan(&rowCount)
+	if err != nil {
+		t.Fatalf("Failed to query kv_zsets: %v", err)
+	}
+	if rowCount != 0 {
+		t.Errorf("Expected 0 rows for old key in kv_zsets, got %d", rowCount)
+	}
+}
+
+// TestDelHyperLogLogNoOrphans verifies that DEL on a HyperLogLog key removes
+// data from kv_hyperloglog (previously missing from deleteKeyFromAllTables).
+func TestDelHyperLogLogNoOrphans(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	// Create a HyperLogLog
+	ts.client.PFAdd(ctx, "hll:del", "a", "b", "c")
+
+	// Verify it exists in the data table
+	var rowCount int
+	err := ts.store.Pool().QueryRow(ctx,
+		"SELECT COUNT(*) FROM kv_hyperloglog WHERE key = $1", "hll:del",
+	).Scan(&rowCount)
+	if err != nil {
+		t.Fatalf("Failed to query kv_hyperloglog: %v", err)
+	}
+	if rowCount != 1 {
+		t.Fatalf("Expected 1 row in kv_hyperloglog, got %d", rowCount)
+	}
+
+	// Delete the key
+	deleted, err := ts.client.Del(ctx, "hll:del").Result()
+	if err != nil {
+		t.Fatalf("DEL failed: %v", err)
+	}
+	if deleted != 1 {
+		t.Errorf("Expected 1 key deleted, got %d", deleted)
+	}
+
+	// Verify no orphaned rows in kv_hyperloglog
+	err = ts.store.Pool().QueryRow(ctx,
+		"SELECT COUNT(*) FROM kv_hyperloglog WHERE key = $1", "hll:del",
+	).Scan(&rowCount)
+	if err != nil {
+		t.Fatalf("Failed to query kv_hyperloglog: %v", err)
+	}
+	if rowCount != 0 {
+		t.Errorf("Expected 0 orphaned rows in kv_hyperloglog after DEL, got %d", rowCount)
+	}
+}
+
+// TestOverwriteZSetWithStringNoOrphans verifies that overwriting a sorted set key
+// with a string value properly cleans up the old zset data.
+func TestOverwriteZSetWithStringNoOrphans(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	// Create a sorted set
+	ts.client.ZAdd(ctx, "overwrite:key", redis.Z{Score: 1.0, Member: "a"}, redis.Z{Score: 2.0, Member: "b"})
+
+	// Overwrite with a string
+	err := ts.client.Set(ctx, "overwrite:key", "stringvalue", 0).Err()
+	if err != nil {
+		t.Fatalf("SET failed: %v", err)
+	}
+
+	// Verify type changed
+	keyType, _ := ts.client.Type(ctx, "overwrite:key").Result()
+	if keyType != "string" {
+		t.Errorf("Expected type 'string', got '%s'", keyType)
+	}
+
+	// Verify no orphaned zset rows
+	var rowCount int
+	err = ts.store.Pool().QueryRow(ctx,
+		"SELECT COUNT(*) FROM kv_zsets WHERE key = $1", "overwrite:key",
+	).Scan(&rowCount)
+	if err != nil {
+		t.Fatalf("Failed to query kv_zsets: %v", err)
+	}
+	if rowCount != 0 {
+		t.Errorf("Expected 0 orphaned rows in kv_zsets, got %d", rowCount)
+	}
+}
+
+// TestSetWithExpiryZSetCleanup verifies that a sorted set created via SET
+// (which would be a type change) with expiry properly expires and gets cleaned.
+func TestExpireMultipleTypesCleanup(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	// Create keys of different types with short TTL
+	ts.client.Set(ctx, "exp:string", "val", 0)
+	ts.client.HSet(ctx, "exp:hash", "f", "v")
+	ts.client.ZAdd(ctx, "exp:zset", redis.Z{Score: 1.0, Member: "m"})
+	ts.client.PFAdd(ctx, "exp:hll", "x")
+
+	// Set TTL on all
+	for _, key := range []string{"exp:string", "exp:hash", "exp:zset", "exp:hll"} {
+		ts.client.Expire(ctx, key, 1*time.Second)
+	}
+
+	// Wait for expiration + cleanup
+	time.Sleep(2200 * time.Millisecond)
+
+	// All keys should be gone
+	exists, _ := ts.client.Exists(ctx, "exp:string", "exp:hash", "exp:zset", "exp:hll").Result()
+	if exists != 0 {
+		t.Errorf("Expected 0 keys to exist, got %d", exists)
+	}
+
+	// Verify no orphaned rows in any data table
+	tables := map[string]string{
+		"kv_strings":     "exp:string",
+		"kv_hashes":      "exp:hash",
+		"kv_zsets":       "exp:zset",
+		"kv_hyperloglog": "exp:hll",
+	}
+	for table, key := range tables {
+		var rowCount int
+		err := ts.store.Pool().QueryRow(ctx,
+			fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE key = $1", table), key,
+		).Scan(&rowCount)
+		if err != nil {
+			t.Fatalf("Failed to query %s: %v", table, err)
+		}
+		if rowCount != 0 {
+			t.Errorf("Expected 0 orphaned rows in %s for key %s, got %d", table, key, rowCount)
+		}
+	}
+
+	// Verify kv_meta is clean too
+	var metaCount int
+	err := ts.store.Pool().QueryRow(ctx,
+		"SELECT COUNT(*) FROM kv_meta WHERE key = ANY($1)",
+		[]string{"exp:string", "exp:hash", "exp:zset", "exp:hll"},
+	).Scan(&metaCount)
+	if err != nil {
+		t.Fatalf("Failed to query kv_meta: %v", err)
+	}
+	if metaCount != 0 {
+		t.Errorf("Expected 0 orphaned rows in kv_meta, got %d", metaCount)
+	}
+}
+

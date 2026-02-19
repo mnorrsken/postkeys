@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.20.2] - 2026-02-19
+
+### Added
+- **PostgreSQL advisory lock for expired key cleanup**: When running multiple replicas, only one instance performs the background cleanup per cycle using `pg_try_advisory_xact_lock`. This eliminates redundant DELETE queries from all other pods.
+- **Integration tests for expiration and cleanup fixes**: Added 8 tests covering EXPIRE/EXPIREAT/PERSIST/RENAME/DEL on sorted sets and HyperLogLog keys, verifying no orphaned data rows remain at the PostgreSQL level.
+
 ## [0.20.1] - 2026-02-19
 
 ### Fixed
