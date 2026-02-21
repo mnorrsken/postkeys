@@ -256,6 +256,29 @@ func (s *Store) deleteExpiredKeys(ctx context.Context) {
 		}
 	}
 
+	// Phase 3: Clean up orphaned kv_meta entries where data was removed but meta remains.
+	// This handles cases like LPOP/RPOP emptying a list, SREM removing all set members, etc.
+	// We batch delete to limit the impact per cleanup cycle.
+	s.pool.Exec(ctx, `
+		DELETE FROM kv_meta WHERE key IN (
+			SELECT m.key FROM kv_meta m
+			WHERE m.key_type = 'string' AND NOT EXISTS (SELECT 1 FROM kv_strings s WHERE s.key = m.key)
+			UNION ALL
+			SELECT m.key FROM kv_meta m
+			WHERE m.key_type = 'list' AND NOT EXISTS (SELECT 1 FROM kv_lists l WHERE l.key = m.key)
+			UNION ALL
+			SELECT m.key FROM kv_meta m
+			WHERE m.key_type = 'hash' AND NOT EXISTS (SELECT 1 FROM kv_hashes h WHERE h.key = m.key)
+			UNION ALL
+			SELECT m.key FROM kv_meta m
+			WHERE m.key_type = 'set' AND NOT EXISTS (SELECT 1 FROM kv_sets s WHERE s.key = m.key)
+			UNION ALL
+			SELECT m.key FROM kv_meta m
+			WHERE m.key_type = 'zset' AND NOT EXISTS (SELECT 1 FROM kv_zsets z WHERE z.key = m.key)
+			LIMIT 1000
+		)
+	`)
+
 	tx.Commit(ctx)
 }
 

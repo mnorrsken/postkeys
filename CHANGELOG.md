@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.20.3] - 2026-02-21
+
+### Fixed
+- **Orphaned `kv_meta` entries for empty data structures**: When all elements were removed from lists/sets/hashes/sorted sets via operations like `LPOP`, `SREM`, `HDEL`, `ZREM`, the `kv_meta` entry was not deleted. These accumulated indefinitely for keys without TTL. The background cleanup now includes a Phase 3 that removes orphaned `kv_meta` entries where the corresponding data tables have no rows.
+
 ## [0.20.2] - 2026-02-19
 
 ### Added
