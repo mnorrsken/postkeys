@@ -22,7 +22,7 @@ type PubSubClientState interface {
 // HandleSubscribe handles SUBSCRIBE command
 func (h *Handler) HandleSubscribe(hub *pubsub.Hub, client PubSubClientState, channels []string) []resp.Value {
 	start := time.Now()
-	
+
 	if len(channels) == 0 {
 		return []resp.Value{resp.ErrWrongArgs("subscribe")}
 	}

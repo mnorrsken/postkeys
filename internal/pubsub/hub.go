@@ -53,24 +53,24 @@ type Subscriber interface {
 
 // Hub manages pub/sub subscriptions and message routing
 type Hub struct {
-	pool     *pgxpool.Pool
-	connStr  string
+	pool    *pgxpool.Pool
+	connStr string
 
 	mu            sync.RWMutex
 	subscriptions map[string]map[uint64]Subscriber // channel -> subscriberID -> subscriber
 	subscribers   map[uint64]map[string]bool       // subscriberID -> channels
 
 	// Pattern subscriptions (for PSUBSCRIBE)
-	patternMu      sync.RWMutex
-	patterns       map[string]map[uint64]Subscriber // pattern -> subscriberID -> subscriber
-	subPatterns    map[uint64]map[string]bool       // subscriberID -> patterns
+	patternMu   sync.RWMutex
+	patterns    map[string]map[uint64]Subscriber // pattern -> subscriberID -> subscriber
+	subPatterns map[uint64]map[string]bool       // subscriberID -> patterns
 
 	// Listener connection (dedicated for LISTEN/NOTIFY)
-	listenerConn   *pgx.Conn
-	listenerMu     sync.Mutex
-	listening      map[string]bool   // pg channels we're currently LISTENing to
-	pgToRedis      map[string]string // pg channel name -> redis channel name (for hashed names)
-	listenCmds     chan listenCmd    // channel for LISTEN/UNLISTEN commands
+	listenerConn *pgx.Conn
+	listenerMu   sync.Mutex
+	listening    map[string]bool   // pg channels we're currently LISTENing to
+	pgToRedis    map[string]string // pg channel name -> redis channel name (for hashed names)
+	listenCmds   chan listenCmd    // channel for LISTEN/UNLISTEN commands
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -80,8 +80,8 @@ type Hub struct {
 
 // listenCmd represents a LISTEN/UNLISTEN command to be executed by the listener goroutine
 type listenCmd struct {
-	channel  string
-	listen   bool // true for LISTEN, false for UNLISTEN
+	channel string
+	listen  bool // true for LISTEN, false for UNLISTEN
 }
 
 // NewHub creates a new pub/sub hub
@@ -172,7 +172,7 @@ func (h *Hub) Unsubscribe(sub Subscriber, channels ...string) []int {
 	defer h.mu.Unlock()
 
 	subID := sub.GetID()
-	
+
 	// If no channels specified, unsubscribe from all
 	if len(channels) == 0 {
 		if subChannels, exists := h.subscribers[subID]; exists {

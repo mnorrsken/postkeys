@@ -1970,9 +1970,9 @@ func TestBinaryKeyWithSpecialBytes(t *testing.T) {
 	// Test keys with bytes that could cause issues in protocols
 	// Note: PostgreSQL TEXT columns cannot store null bytes or invalid UTF-8 sequences
 	specialKeys := []struct {
-		name      string
-		key       string
-		skipPg    bool // Skip for PostgreSQL due to TEXT column UTF-8 limitation
+		name   string
+		key    string
+		skipPg bool // Skip for PostgreSQL due to TEXT column UTF-8 limitation
 	}{
 		{"null_byte", "key\x00null", true},
 		{"carriage_return", "key\rwith\rCR", false},
@@ -2306,17 +2306,17 @@ func TestMultiExecBasic(t *testing.T) {
 
 	// Use pipeline with TxPipeline for MULTI/EXEC
 	pipe := ts.client.TxPipeline()
-	
+
 	setCmd := pipe.Set(ctx, "tx_key1", "value1", 0)
 	setCmd2 := pipe.Set(ctx, "tx_key2", "value2", 0)
 	getCmd := pipe.Get(ctx, "tx_key1")
-	
+
 	// Execute the transaction
 	_, err := pipe.Exec(ctx)
 	if err != nil {
 		t.Fatalf("EXEC failed: %v", err)
 	}
-	
+
 	// Check results
 	if setCmd.Err() != nil {
 		t.Errorf("SET tx_key1 in transaction failed: %v", setCmd.Err())
@@ -2330,7 +2330,7 @@ func TestMultiExecBasic(t *testing.T) {
 	if getCmd.Val() != "value1" {
 		t.Errorf("Expected value1, got %s", getCmd.Val())
 	}
-	
+
 	// Verify keys exist outside transaction
 	val, err := ts.client.Get(ctx, "tx_key1").Result()
 	if err != nil {
@@ -2339,7 +2339,7 @@ func TestMultiExecBasic(t *testing.T) {
 	if val != "value1" {
 		t.Errorf("Expected value1 after transaction, got %s", val)
 	}
-	
+
 	val2, err := ts.client.Get(ctx, "tx_key2").Result()
 	if err != nil {
 		t.Errorf("GET tx_key2 after transaction failed: %v", err)
@@ -2363,16 +2363,16 @@ func TestMultiExecIncr(t *testing.T) {
 
 	// Use transaction to increment multiple times
 	pipe := ts.client.TxPipeline()
-	
+
 	incr1 := pipe.Incr(ctx, "counter")
 	incr2 := pipe.Incr(ctx, "counter")
 	incr3 := pipe.Incr(ctx, "counter")
-	
+
 	_, err = pipe.Exec(ctx)
 	if err != nil {
 		t.Fatalf("EXEC failed: %v", err)
 	}
-	
+
 	// Check intermediate results
 	if incr1.Val() != 11 {
 		t.Errorf("Expected 11 after first INCR, got %d", incr1.Val())
@@ -2383,7 +2383,7 @@ func TestMultiExecIncr(t *testing.T) {
 	if incr3.Val() != 13 {
 		t.Errorf("Expected 13 after third INCR, got %d", incr3.Val())
 	}
-	
+
 	// Verify final value
 	val, err := ts.client.Get(ctx, "counter").Result()
 	if err != nil {
@@ -2401,16 +2401,16 @@ func TestMultiExecWithHash(t *testing.T) {
 	ctx := context.Background()
 
 	pipe := ts.client.TxPipeline()
-	
+
 	hsetCmd := pipe.HSet(ctx, "myhash", "field1", "value1")
 	hsetCmd2 := pipe.HSet(ctx, "myhash", "field2", "value2")
 	hgetCmd := pipe.HGet(ctx, "myhash", "field1")
-	
+
 	_, err := pipe.Exec(ctx)
 	if err != nil {
 		t.Fatalf("EXEC failed: %v", err)
 	}
-	
+
 	if hsetCmd.Err() != nil {
 		t.Errorf("HSET field1 failed: %v", hsetCmd.Err())
 	}
@@ -2420,7 +2420,7 @@ func TestMultiExecWithHash(t *testing.T) {
 	if hgetCmd.Val() != "value1" {
 		t.Errorf("Expected value1, got %s", hgetCmd.Val())
 	}
-	
+
 	// Verify outside transaction
 	all, err := ts.client.HGetAll(ctx, "myhash").Result()
 	if err != nil {
@@ -2438,19 +2438,19 @@ func TestMultiExecWithList(t *testing.T) {
 	ctx := context.Background()
 
 	pipe := ts.client.TxPipeline()
-	
+
 	lpushCmd := pipe.LPush(ctx, "mylist", "a", "b", "c")
 	lrangeCmd := pipe.LRange(ctx, "mylist", 0, -1)
-	
+
 	_, err := pipe.Exec(ctx)
 	if err != nil {
 		t.Fatalf("EXEC failed: %v", err)
 	}
-	
+
 	if lpushCmd.Val() != 3 {
 		t.Errorf("Expected list length 3, got %d", lpushCmd.Val())
 	}
-	
+
 	vals := lrangeCmd.Val()
 	if len(vals) != 3 {
 		t.Errorf("Expected 3 elements, got %d", len(vals))
@@ -2464,16 +2464,16 @@ func TestMultiExecWithSet(t *testing.T) {
 	ctx := context.Background()
 
 	pipe := ts.client.TxPipeline()
-	
+
 	saddCmd := pipe.SAdd(ctx, "myset", "a", "b", "c")
 	scardCmd := pipe.SCard(ctx, "myset")
 	sismemberCmd := pipe.SIsMember(ctx, "myset", "b")
-	
+
 	_, err := pipe.Exec(ctx)
 	if err != nil {
 		t.Fatalf("EXEC failed: %v", err)
 	}
-	
+
 	if saddCmd.Val() != 3 {
 		t.Errorf("Expected 3 added, got %d", saddCmd.Val())
 	}
@@ -2492,18 +2492,18 @@ func TestMultiExecMixed(t *testing.T) {
 	ctx := context.Background()
 
 	pipe := ts.client.TxPipeline()
-	
+
 	// Mix different command types
 	setCmd := pipe.Set(ctx, "str_key", "str_value", 0)
 	hsetCmd := pipe.HSet(ctx, "hash_key", "field", "hash_value")
 	lpushCmd := pipe.LPush(ctx, "list_key", "list_value")
 	saddCmd := pipe.SAdd(ctx, "set_key", "set_value")
-	
+
 	_, err := pipe.Exec(ctx)
 	if err != nil {
 		t.Fatalf("EXEC failed: %v", err)
 	}
-	
+
 	if setCmd.Err() != nil {
 		t.Errorf("SET failed: %v", setCmd.Err())
 	}
@@ -2516,13 +2516,13 @@ func TestMultiExecMixed(t *testing.T) {
 	if saddCmd.Err() != nil {
 		t.Errorf("SADD failed: %v", saddCmd.Err())
 	}
-	
+
 	// Verify all types exist
 	strType, _ := ts.client.Type(ctx, "str_key").Result()
 	hashType, _ := ts.client.Type(ctx, "hash_key").Result()
 	listType, _ := ts.client.Type(ctx, "list_key").Result()
 	setType, _ := ts.client.Type(ctx, "set_key").Result()
-	
+
 	if strType != "string" {
 		t.Errorf("Expected string type, got %s", strType)
 	}
@@ -2564,14 +2564,14 @@ func TestDiscardTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initial SET failed: %v", err)
 	}
-	
+
 	// The go-redis library doesn't expose DISCARD directly in a useful way for testing
 	// So we just verify that if we don't call Exec, the commands aren't applied
 	pipe := ts.client.TxPipeline()
 	pipe.Set(ctx, "discard_test", "changed", 0)
 	// Don't call Exec - discard implicitly
 	pipe.Discard()
-	
+
 	// Verify value is unchanged
 	val, err := ts.client.Get(ctx, "discard_test").Result()
 	if err != nil {
@@ -5661,4 +5661,3 @@ func TestExpireMultipleTypesCleanup(t *testing.T) {
 		t.Errorf("Expected 0 orphaned rows in kv_meta, got %d", metaCount)
 	}
 }
-

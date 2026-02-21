@@ -16,26 +16,26 @@ var clientIDCounter uint64
 
 // ClientState holds per-connection state
 type ClientState struct {
-	ID          uint64
-	Name        string
-	Addr        string
-	CreatedAt   time.Time
-	LibName     string
-	LibVersion  string
-	mu          sync.RWMutex
-	debug       bool
-	
+	ID         uint64
+	Name       string
+	Addr       string
+	CreatedAt  time.Time
+	LibName    string
+	LibVersion string
+	mu         sync.RWMutex
+	debug      bool
+
 	// Protocol version (2 or 3, defaults to 2 for RESP2)
 	protocolVersion int
-	
+
 	// Transaction state
-	inTransaction   bool
-	queuedCommands  []resp.Value
+	inTransaction  bool
+	queuedCommands []resp.Value
 
 	// Pub/sub state
-	inPubSubMode   bool
-	writer         *resp.Writer
-	writerMu       sync.Mutex
+	inPubSubMode bool
+	writer       *resp.Writer
+	writerMu     sync.Mutex
 }
 
 // NewClientState creates a new client state for a connection
@@ -112,19 +112,19 @@ func (c *ClientState) SetLibInfo(libName, libVersion string) {
 func (c *ClientState) GetInfo() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	
+
 	age := int64(time.Since(c.CreatedAt).Seconds())
-	
+
 	info := fmt.Sprintf("id=%d addr=%s age=%d name=%s",
 		c.ID, c.Addr, age, c.Name)
-	
+
 	if c.LibName != "" {
 		info += fmt.Sprintf(" lib-name=%s", c.LibName)
 	}
 	if c.LibVersion != "" {
 		info += fmt.Sprintf(" lib-ver=%s", c.LibVersion)
 	}
-	
+
 	return info
 }
 
@@ -222,7 +222,7 @@ func (c *ClientState) SendPubSubMessage(msgType, channel, payload string) error 
 	}
 
 	var response resp.Value
-	
+
 	// RESP3 clients receive pub/sub messages as Push type (>)
 	// RESP2 clients receive them as regular arrays
 	respType := resp.Array

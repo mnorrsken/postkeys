@@ -183,10 +183,10 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		// Check authentication before processing commands
 		var response resp.Value
 		var multiResponse []resp.Value
-		
+
 		// Add protocol version to context for handlers
 		cmdCtx := handler.WithProtocolVersion(ctx, client.GetProtocolVersion())
-		
+
 		if cmd.Type == resp.Array && len(cmd.Array) > 0 {
 			cmdName := strings.ToUpper(cmd.Array[0].Bulk)
 

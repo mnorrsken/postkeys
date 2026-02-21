@@ -131,10 +131,10 @@ func TestReader_ReadBulkString(t *testing.T) {
 
 func TestReader_ReadArray(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		length   int
-		isNull   bool
+		name   string
+		input  string
+		length int
+		isNull bool
 	}{
 		{"empty", "*0\r\n", 0, false},
 		{"null", "*-1\r\n", 0, true},
