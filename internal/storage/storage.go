@@ -29,10 +29,10 @@ type Config struct {
 	SQLTraceLevel int // 0=off, 1=important, 2=most queries, 3=everything
 
 	// Connection pool settings
-	MaxConns         int           // Maximum number of connections in the pool
-	MinConns         int           // Minimum number of connections in the pool
-	MaxConnLifetime  time.Duration // Maximum lifetime of a connection before it's closed
-	MaxConnIdleTime  time.Duration // Maximum time a connection can be idle before it's closed
+	MaxConns          int           // Maximum number of connections in the pool
+	MinConns          int           // Minimum number of connections in the pool
+	MaxConnLifetime   time.Duration // Maximum lifetime of a connection before it's closed
+	MaxConnIdleTime   time.Duration // Maximum time a connection can be idle before it's closed
 	HealthCheckPeriod time.Duration // Period between health checks on idle connections
 }
 
@@ -879,6 +879,7 @@ func (s *Store) LInsert(ctx context.Context, key, pivot, element string, before 
 	})
 	return result, err
 }
+
 // ============== HyperLogLog Commands ==============
 
 func (s *Store) PFAdd(ctx context.Context, key string, elements []string) (int64, error) {
