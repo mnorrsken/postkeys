@@ -3,10 +3,13 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math/rand"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -207,23 +210,26 @@ func (s *Store) deleteExpiredKeys(ctx context.Context) {
 
 	now := time.Now()
 
-	// Phase 1: Delete expired rows from all data tables (including kv_zsets and kv_hyperloglog)
+	// Phase 1: Delete expired rows from all data tables within the transaction.
+	// Uses LIMIT to bound the number of rows locked per cycle, reducing contention.
 	dataQueries := []string{
-		"DELETE FROM kv_strings WHERE expires_at IS NOT NULL AND expires_at <= $1",
-		"DELETE FROM kv_hashes WHERE expires_at IS NOT NULL AND expires_at <= $1",
-		"DELETE FROM kv_lists WHERE expires_at IS NOT NULL AND expires_at <= $1",
-		"DELETE FROM kv_sets WHERE expires_at IS NOT NULL AND expires_at <= $1",
-		"DELETE FROM kv_zsets WHERE expires_at IS NOT NULL AND expires_at <= $1",
-		"DELETE FROM kv_hyperloglog WHERE expires_at IS NOT NULL AND expires_at <= $1",
+		"DELETE FROM kv_strings WHERE key IN (SELECT key FROM kv_strings WHERE expires_at IS NOT NULL AND expires_at <= $1 LIMIT 1000)",
+		"DELETE FROM kv_hashes WHERE key IN (SELECT DISTINCT key FROM kv_hashes WHERE expires_at IS NOT NULL AND expires_at <= $1 LIMIT 1000)",
+		"DELETE FROM kv_lists WHERE key IN (SELECT DISTINCT key FROM kv_lists WHERE expires_at IS NOT NULL AND expires_at <= $1 LIMIT 1000)",
+		"DELETE FROM kv_sets WHERE key IN (SELECT DISTINCT key FROM kv_sets WHERE expires_at IS NOT NULL AND expires_at <= $1 LIMIT 1000)",
+		"DELETE FROM kv_zsets WHERE key IN (SELECT DISTINCT key FROM kv_zsets WHERE expires_at IS NOT NULL AND expires_at <= $1 LIMIT 1000)",
+		"DELETE FROM kv_hyperloglog WHERE key IN (SELECT key FROM kv_hyperloglog WHERE expires_at IS NOT NULL AND expires_at <= $1 LIMIT 1000)",
 	}
 	for _, q := range dataQueries {
-		s.pool.Exec(ctx, q, now)
+		if _, err := tx.Exec(ctx, q, now); err != nil {
+			return
+		}
 	}
 
-	// Phase 2: Collect keys expired in kv_meta, then delete their data rows
+	// Phase 2: Collect keys expired in kv_meta, then delete their data rows.
 	// This handles the case where expires_at was set on kv_meta but not
 	// propagated to the data table (e.g. sorted sets via EXPIRE command).
-	rows, err := s.pool.Query(ctx,
+	rows, err := tx.Query(ctx,
 		"DELETE FROM kv_meta WHERE expires_at IS NOT NULL AND expires_at <= $1 RETURNING key",
 		now,
 	)
@@ -252,14 +258,16 @@ func (s *Store) deleteExpiredKeys(ctx context.Context) {
 			"DELETE FROM kv_hyperloglog WHERE key = ANY($1)",
 		}
 		for _, q := range orphanQueries {
-			s.pool.Exec(ctx, q, orphanKeys)
+			if _, err := tx.Exec(ctx, q, orphanKeys); err != nil {
+				return
+			}
 		}
 	}
 
 	// Phase 3: Clean up orphaned kv_meta entries where data was removed but meta remains.
 	// This handles cases like LPOP/RPOP emptying a list, SREM removing all set members, etc.
 	// We batch delete to limit the impact per cleanup cycle.
-	s.pool.Exec(ctx, `
+	tx.Exec(ctx, `
 		DELETE FROM kv_meta WHERE key IN (
 			SELECT m.key FROM kv_meta m
 			WHERE m.key_type = 'string' AND NOT EXISTS (SELECT 1 FROM kv_strings s WHERE s.key = m.key)
@@ -282,8 +290,47 @@ func (s *Store) deleteExpiredKeys(ctx context.Context) {
 	tx.Commit(ctx)
 }
 
-// withTx wraps an operation in a transaction
+// isRetryableError returns true if the error is a PostgreSQL deadlock (40P01)
+// or serialization failure (40001), both of which are safe to retry.
+func isRetryableError(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "40P01" || pgErr.Code == "40001"
+	}
+	return false
+}
+
+// IsRetryableError reports whether the error is a PostgreSQL deadlock or
+// serialization failure that can be safely retried.
+func IsRetryableError(err error) bool {
+	return isRetryableError(err)
+}
+
+const maxDeadlockRetries = 3
+
+// withTx wraps an operation in a transaction, retrying on deadlock or serialization errors.
 func (s *Store) withTx(ctx context.Context, fn func(tx pgx.Tx) error) error {
+	for attempt := 0; attempt <= maxDeadlockRetries; attempt++ {
+		err := s.execTx(ctx, fn)
+		if err == nil {
+			return nil
+		}
+		if !isRetryableError(err) || attempt == maxDeadlockRetries {
+			return err
+		}
+		// Exponential backoff with jitter: 5ms, 10ms, 20ms base
+		base := time.Duration(5<<uint(attempt)) * time.Millisecond
+		jitter := time.Duration(rand.Int63n(int64(base)))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(base + jitter):
+		}
+	}
+	return nil // unreachable
+}
+
+func (s *Store) execTx(ctx context.Context, fn func(tx pgx.Tx) error) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err

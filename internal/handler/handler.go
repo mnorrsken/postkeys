@@ -4,6 +4,7 @@ package handler
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"strconv"
 	"strings"
 	"time"
@@ -306,7 +307,9 @@ func (h *Handler) HandleDiscard(client TransactionClientState) resp.Value {
 	return resp.OK()
 }
 
-// HandleExec executes all queued commands in a transaction
+const maxExecRetries = 3
+
+// HandleExec executes all queued commands in a transaction, retrying on deadlock.
 func (h *Handler) HandleExec(ctx context.Context, client TransactionClientState) resp.Value {
 	if !client.InTransaction() {
 		return resp.Err("ERR EXEC without MULTI")
@@ -314,38 +317,56 @@ func (h *Handler) HandleExec(ctx context.Context, client TransactionClientState)
 
 	commands := client.GetQueuedCommands()
 
-	// Start a storage transaction
-	tx, err := h.store.BeginTx(ctx)
-	if err != nil {
-		return resp.Err(fmt.Sprintf("ERR transaction start failed: %v", err))
-	}
-
-	// Execute all commands within the transaction using the unified Operations interface
-	results := make([]resp.Value, len(commands))
-
-	for i, cmd := range commands {
-		if cmd.Type != resp.Array || len(cmd.Array) == 0 {
-			results[i] = resp.Err("invalid command format")
-			continue
+	for attempt := 0; attempt <= maxExecRetries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff with jitter before retry
+			base := time.Duration(5<<uint(attempt-1)) * time.Millisecond
+			jitter := time.Duration(rand.Int63n(int64(base)))
+			select {
+			case <-ctx.Done():
+				return resp.Err(fmt.Sprintf("ERR transaction aborted: %v", ctx.Err()))
+			case <-time.After(base + jitter):
+			}
 		}
 
-		cmdName := strings.ToUpper(cmd.Array[0].Bulk)
-		args := cmd.Array[1:]
+		// Start a storage transaction
+		tx, err := h.store.BeginTx(ctx)
+		if err != nil {
+			return resp.Err(fmt.Sprintf("ERR transaction start failed: %v", err))
+		}
 
-		// Execute using the unified handler with the transaction
-		results[i] = h.ExecuteWithOps(ctx, tx, cmdName, args)
+		// Execute all commands within the transaction using the unified Operations interface
+		results := make([]resp.Value, len(commands))
+
+		for i, cmd := range commands {
+			if cmd.Type != resp.Array || len(cmd.Array) == 0 {
+				results[i] = resp.Err("invalid command format")
+				continue
+			}
+
+			cmdName := strings.ToUpper(cmd.Array[0].Bulk)
+			args := cmd.Array[1:]
+
+			// Execute using the unified handler with the transaction
+			results[i] = h.ExecuteWithOps(ctx, tx, cmdName, args)
+		}
+
+		// Commit the transaction
+		if err := tx.Commit(ctx); err != nil {
+			tx.Rollback(ctx)
+			if storage.IsRetryableError(err) && attempt < maxExecRetries {
+				continue
+			}
+			return resp.Err(fmt.Sprintf("ERR transaction commit failed: %v", err))
+		}
+
+		// Record metrics for EXEC
+		metrics.RecordCommand("EXEC", 0, false)
+
+		return resp.Value{Type: resp.Array, Array: results}
 	}
 
-	// Commit the transaction
-	if err := tx.Commit(ctx); err != nil {
-		tx.Rollback(ctx)
-		return resp.Err(fmt.Sprintf("ERR transaction commit failed: %v", err))
-	}
-
-	// Record metrics for EXEC
-	metrics.RecordCommand("EXEC", 0, false)
-
-	return resp.Value{Type: resp.Array, Array: results}
+	return resp.Err("ERR transaction failed after retries")
 }
 
 // ============== Connection Commands ==============

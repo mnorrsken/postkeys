@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -276,12 +277,16 @@ func (o queryOps) mSet(ctx context.Context, q Querier, pairs map[string]string) 
 		return nil
 	}
 
-	// Collect all keys for batch operations
+	// Collect and sort keys for consistent lock ordering to prevent deadlocks
 	keys := make([]string, 0, len(pairs))
-	values := make([][]byte, 0, len(pairs))
-	for key, value := range pairs {
+	for key := range pairs {
 		keys = append(keys, key)
-		values = append(values, []byte(value))
+	}
+	sort.Strings(keys)
+
+	values := make([][]byte, 0, len(pairs))
+	for _, key := range keys {
+		values = append(values, []byte(pairs[key]))
 	}
 
 	// Batch delete from all tables
@@ -750,6 +755,8 @@ func (o queryOps) incrByFloat(ctx context.Context, q Querier, key string, delta 
 // ============== Key Commands ==============
 
 func (o queryOps) del(ctx context.Context, q Querier, keys []string) (int64, error) {
+	// Sort keys for consistent lock ordering to prevent deadlocks
+	sort.Strings(keys)
 	var deleted int64
 	for _, key := range keys {
 		keyType, err := o.getKeyType(ctx, q, key)
