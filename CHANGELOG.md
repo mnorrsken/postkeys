@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.20.5] - 2026-03-09
+
+### Fixed
+- **Deadlock prevention via consistent lock ordering**: Concurrent write operations (SET, MSET, INCR, HSET, LPUSH, SADD, ZADD, etc.) could deadlock when multiple transactions acquired locks on `kv_meta` and data tables (`kv_strings`, `kv_hashes`, etc.) in inconsistent orders. All operations now lock `kv_meta` before data tables, eliminating circular wait conditions. This resolves cascading deadlock errors under high concurrency (e.g. GitLab Redis workloads).
+
 ## [0.20.3] - 2026-02-21
 
 ### Fixed
