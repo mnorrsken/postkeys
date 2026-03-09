@@ -113,7 +113,42 @@ func (queryOps) getKeyType(ctx context.Context, q Querier, key string) (KeyType,
 	return KeyType(keyType), nil
 }
 
-func (queryOps) setMeta(ctx context.Context, q Querier, key string, keyType KeyType, expiresAt *time.Time) error {
+// lockKey acquires a transaction-scoped advisory lock for the given key.
+// This serializes all concurrent write operations on the same key, preventing
+// deadlocks between transactions that need to lock both kv_meta and data tables.
+// The lock is automatically released when the transaction commits or rolls back.
+// Reentrant within the same transaction (safe to call multiple times for the same key).
+func (queryOps) lockKey(ctx context.Context, q Querier, key string) error {
+	_, err := q.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", key)
+	return err
+}
+
+// lockKeys acquires advisory locks for multiple keys in sorted order.
+func (o queryOps) lockKeys(ctx context.Context, q Querier, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	sorted := make([]string, len(keys))
+	copy(sorted, keys)
+	sort.Strings(sorted)
+	// Deduplicate and lock in order
+	prev := ""
+	for _, key := range sorted {
+		if key == prev {
+			continue
+		}
+		if err := o.lockKey(ctx, q, key); err != nil {
+			return err
+		}
+		prev = key
+	}
+	return nil
+}
+
+func (o queryOps) setMeta(ctx context.Context, q Querier, key string, keyType KeyType, expiresAt *time.Time) error {
+	if err := o.lockKey(ctx, q, key); err != nil {
+		return err
+	}
 	_, err := q.Exec(ctx,
 		`INSERT INTO kv_meta (key, key_type, expires_at) VALUES ($1, $2, $3)
 		 ON CONFLICT (key) DO UPDATE SET key_type = $2, expires_at = $3`,
@@ -123,9 +158,12 @@ func (queryOps) setMeta(ctx context.Context, q Querier, key string, keyType KeyT
 }
 
 // setMetaBatch sets metadata for multiple keys at once
-func (queryOps) setMetaBatch(ctx context.Context, q Querier, keys []string, keyType KeyType) error {
+func (o queryOps) setMetaBatch(ctx context.Context, q Querier, keys []string, keyType KeyType) error {
 	if len(keys) == 0 {
 		return nil
+	}
+	if err := o.lockKeys(ctx, q, keys); err != nil {
+		return err
 	}
 	_, err := q.Exec(ctx,
 		`INSERT INTO kv_meta (key, key_type)
@@ -136,9 +174,10 @@ func (queryOps) setMetaBatch(ctx context.Context, q Querier, keys []string, keyT
 	return err
 }
 
-func (queryOps) deleteKeyFromAllTables(ctx context.Context, q Querier, key string) error {
-	// Delete kv_meta first to ensure consistent lock ordering (kv_meta before data tables)
-	// and prevent deadlocks with concurrent operations that also lock kv_meta then data tables.
+func (o queryOps) deleteKeyFromAllTables(ctx context.Context, q Querier, key string) error {
+	if err := o.lockKey(ctx, q, key); err != nil {
+		return err
+	}
 	queries := []string{
 		"DELETE FROM kv_meta WHERE key = $1",
 		"DELETE FROM kv_strings WHERE key = $1",
@@ -157,11 +196,13 @@ func (queryOps) deleteKeyFromAllTables(ctx context.Context, q Querier, key strin
 }
 
 // deleteKeysFromAllTables deletes multiple keys from all tables in batch
-func (queryOps) deleteKeysFromAllTables(ctx context.Context, q Querier, keys []string) error {
+func (o queryOps) deleteKeysFromAllTables(ctx context.Context, q Querier, keys []string) error {
 	if len(keys) == 0 {
 		return nil
 	}
-	// Delete kv_meta first for consistent lock ordering (kv_meta before data tables).
+	if err := o.lockKeys(ctx, q, keys); err != nil {
+		return err
+	}
 	queries := []string{
 		"DELETE FROM kv_meta WHERE key = ANY($1)",
 		"DELETE FROM kv_strings WHERE key = ANY($1)",
@@ -222,6 +263,9 @@ func (o queryOps) set(ctx context.Context, q Querier, key, value string, ttl tim
 }
 
 func (o queryOps) setNX(ctx context.Context, q Querier, key, value string) (bool, error) {
+	if err := o.lockKey(ctx, q, key); err != nil {
+		return false, err
+	}
 	// Set meta first with DO NOTHING for consistent lock ordering (kv_meta before kv_strings).
 	// If the key already exists, this is a no-op; if the key is new, meta is created first.
 	_, err := q.Exec(ctx,
@@ -615,6 +659,9 @@ func (o queryOps) strLen(ctx context.Context, q Querier, key string) (int64, err
 }
 
 func (o queryOps) getEx(ctx context.Context, q Querier, key string, ttl time.Duration, persist bool) (string, bool, error) {
+	if err := o.lockKey(ctx, q, key); err != nil {
+		return "", false, err
+	}
 	var value []byte
 	var expiresAt *time.Time
 
@@ -664,6 +711,9 @@ func (o queryOps) getEx(ctx context.Context, q Querier, key string, ttl time.Dur
 }
 
 func (o queryOps) getDel(ctx context.Context, q Querier, key string) (string, bool, error) {
+	if err := o.lockKey(ctx, q, key); err != nil {
+		return "", false, err
+	}
 	var value []byte
 	err := q.QueryRow(ctx,
 		"SELECT value FROM kv_strings WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
@@ -801,6 +851,9 @@ func (o queryOps) exists(ctx context.Context, q Querier, keys []string) (int64, 
 }
 
 func (o queryOps) expire(ctx context.Context, q Querier, key string, ttl time.Duration) (bool, error) {
+	if err := o.lockKey(ctx, q, key); err != nil {
+		return false, err
+	}
 	expiresAt := time.Now().Add(ttl)
 
 	result, err := q.Exec(ctx,
@@ -880,6 +933,9 @@ func (o queryOps) pttl(ctx context.Context, q Querier, key string) (int64, error
 }
 
 func (o queryOps) persist(ctx context.Context, q Querier, key string) (bool, error) {
+	if err := o.lockKey(ctx, q, key); err != nil {
+		return false, err
+	}
 	result, err := q.Exec(ctx,
 		`UPDATE kv_meta SET expires_at = NULL 
 		 WHERE key = $1 AND expires_at IS NOT NULL AND expires_at > NOW()`,
@@ -933,6 +989,10 @@ func (o queryOps) keyType(ctx context.Context, q Querier, key string) (KeyType, 
 }
 
 func (o queryOps) rename(ctx context.Context, q Querier, oldKey, newKey string) error {
+	// Lock both keys in sorted order to prevent deadlocks
+	if err := o.lockKeys(ctx, q, []string{oldKey, newKey}); err != nil {
+		return err
+	}
 	keyType, err := o.getKeyType(ctx, q, oldKey)
 	if err != nil {
 		return err
@@ -1946,6 +2006,9 @@ func (o queryOps) zRemRangeByRank(ctx context.Context, q Querier, key string, st
 }
 
 func (o queryOps) zIncrBy(ctx context.Context, q Querier, key string, increment float64, member string) (float64, error) {
+	if err := o.lockKey(ctx, q, key); err != nil {
+		return 0, err
+	}
 	// Ensure meta entry exists
 	_, err := q.Exec(ctx,
 		`INSERT INTO kv_meta (key, key_type) VALUES ($1, 'zset') ON CONFLICT (key) DO NOTHING`,
@@ -2056,6 +2119,9 @@ func (o queryOps) lRem(ctx context.Context, q Querier, key string, count int64, 
 }
 
 func (o queryOps) rPopLPush(ctx context.Context, q Querier, source, destination string) (string, bool, error) {
+	if err := o.lockKeys(ctx, q, []string{source, destination}); err != nil {
+		return "", false, err
+	}
 	// Pop from source (right)
 	// Use FOR UPDATE SKIP LOCKED to prevent deadlocks when multiple clients pop concurrently
 	var value []byte
@@ -2108,6 +2174,9 @@ func (o queryOps) rPopLPush(ctx context.Context, q Querier, source, destination 
 }
 
 func (o queryOps) lTrim(ctx context.Context, q Querier, key string, start, stop int64) error {
+	if err := o.lockKey(ctx, q, key); err != nil {
+		return err
+	}
 	// Get total length
 	var length int64
 	err := q.QueryRow(ctx, "SELECT COUNT(*) FROM kv_lists WHERE key = $1", key).Scan(&length)
@@ -2824,6 +2893,9 @@ func (o queryOps) zInterStore(ctx context.Context, q Querier, destination string
 // ============== Key Extensions ==============
 
 func (o queryOps) expireAt(ctx context.Context, q Querier, key string, timestamp time.Time) (bool, error) {
+	if err := o.lockKey(ctx, q, key); err != nil {
+		return false, err
+	}
 	result, err := q.Exec(ctx,
 		`UPDATE kv_meta SET expires_at = $2 
 		 WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())`,
@@ -2853,6 +2925,9 @@ func (o queryOps) expireAt(ctx context.Context, q Querier, key string, timestamp
 }
 
 func (o queryOps) copyKey(ctx context.Context, q Querier, source, destination string, replace bool) (bool, error) {
+	if err := o.lockKeys(ctx, q, []string{source, destination}); err != nil {
+		return false, err
+	}
 	// Get source key type
 	keyType, err := o.getKeyType(ctx, q, source)
 	if err != nil {

@@ -2,8 +2,8 @@ apiVersion: v2
 name: postkeys
 description: A Redis-compatible server with PostgreSQL backend
 type: application
-version: 0.20.5
-appVersion: 0.20.5
+version: 0.20.6
+appVersion: 0.20.6
 keywords:
   - redis
   - postgresql

@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.20.6] - 2026-03-09
+
+### Fixed
+- **Deadlock elimination via per-key advisory locks**: Added `pg_advisory_xact_lock(hashtext(key))` to all write operations, serializing concurrent transactions on the same key. The previous lock-ordering fix (0.20.5) was insufficient because 3-way deadlock cycles could still form when transactions were at different stages (DELETE vs INSERT on the same tables). Advisory locks are acquired before any row locks, completely preventing deadlock cycles. Locks are transaction-scoped and automatically released on commit/rollback.
+
 ## [0.20.5] - 2026-03-09
 
 ### Fixed
