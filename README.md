@@ -120,6 +120,7 @@ Environment variables:
 | `DEBUG` | Enable debug logging (set to `1` to enable) | `` |
 | `SQLTRACE` | SQL query tracing level (0-3, see Tracing section) | `0` |
 | `TRACE` | RESP command tracing level (0-3, see Tracing section) | `0` |
+| `ENABLE_PPROF` | Enable `/debug/pprof/*` endpoints on metrics server | `false` |
 
 ### Database Connection Pool
 

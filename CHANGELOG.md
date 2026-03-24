@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.20.8] - 2026-03-24
+
+### Fixed
+- **Lua scripting sandbox**: EVAL/EVALSHA no longer expose `os`, `io`, `debug`, or `package` libraries. Only safe libraries (base, table, string, math, coroutine) are loaded, matching Redis sandbox behavior. Prevents arbitrary command execution via scripts.
+
+### Changed
+- **pprof endpoints gated behind config flag**: `/debug/pprof/*` endpoints on the metrics server are now disabled by default. Set `ENABLE_PPROF=true` to enable them.
+
 ## [0.20.7] - 2026-03-24
 
 ### Fixed
