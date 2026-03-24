@@ -96,8 +96,9 @@ type Server struct {
 	server *http.Server
 }
 
-// NewServer creates a new metrics server
-func NewServer(addr string) *Server {
+// NewServer creates a new metrics server.
+// If enablePprof is true, /debug/pprof/* endpoints are registered.
+func NewServer(addr string, enablePprof bool) *Server {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -105,17 +106,19 @@ func NewServer(addr string) *Server {
 		w.Write([]byte("OK"))
 	})
 
-	// Register pprof handlers for production profiling
-	// CPU profile: curl http://host:port/debug/pprof/profile?seconds=30 > cpu.prof
-	// Heap profile: curl http://host:port/debug/pprof/heap > heap.prof
-	// Goroutine: curl http://host:port/debug/pprof/goroutine?debug=1
-	// Block: curl http://host:port/debug/pprof/block > block.prof
-	// Mutex: curl http://host:port/debug/pprof/mutex > mutex.prof
-	mux.HandleFunc("/debug/pprof/", pprof.Index)
-	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	if enablePprof {
+		// Register pprof handlers for profiling (opt-in via ENABLE_PPROF=true)
+		// CPU profile: curl http://host:port/debug/pprof/profile?seconds=30 > cpu.prof
+		// Heap profile: curl http://host:port/debug/pprof/heap > heap.prof
+		// Goroutine: curl http://host:port/debug/pprof/goroutine?debug=1
+		// Block: curl http://host:port/debug/pprof/block > block.prof
+		// Mutex: curl http://host:port/debug/pprof/mutex > mutex.prof
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	}
 
 	return &Server{
 		server: &http.Server{

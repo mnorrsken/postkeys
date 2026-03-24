@@ -89,12 +89,38 @@ func newLuaExecutor(ctx context.Context, h *Handler, ops storage.Operations, key
 	}
 }
 
+// openSafeLibs loads only libraries that are safe for untrusted scripts.
+// This matches Redis behavior: os, io, debug, package, and loadfile/dofile are excluded.
+func openSafeLibs(L *lua.LState) {
+	for _, pair := range []struct {
+		name string
+		fn   lua.LGFunction
+	}{
+		{lua.BaseLibName, lua.OpenBase},
+		{lua.TabLibName, lua.OpenTable},
+		{lua.StringLibName, lua.OpenString},
+		{lua.MathLibName, lua.OpenMath},
+		{lua.CoroutineLibName, lua.OpenCoroutine},
+	} {
+		L.Push(L.NewFunction(pair.fn))
+		L.Push(lua.LString(pair.name))
+		L.Call(1, 0)
+	}
+
+	// Remove dangerous base functions that can access the filesystem
+	L.SetGlobal("dofile", lua.LNil)
+	L.SetGlobal("loadfile", lua.LNil)
+}
+
 // Execute runs a Lua script and returns the result
 func (le *luaExecutor) Execute(script string) (resp.Value, error) {
 	L := lua.NewState(lua.Options{
-		SkipOpenLibs: false,
+		SkipOpenLibs: true,
 	})
 	defer L.Close()
+
+	// Load only safe libraries (no os, io, debug, or package)
+	openSafeLibs(L)
 
 	// Set up the redis table with call and pcall
 	redisTable := L.NewTable()

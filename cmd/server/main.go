@@ -80,7 +80,7 @@ func main() {
 	}
 
 	// Start metrics server
-	metricsSrv := metrics.NewServer(cfg.MetricsAddr)
+	metricsSrv := metrics.NewServer(cfg.MetricsAddr, cfg.EnablePprof)
 	if err := metricsSrv.Start(); err != nil {
 		log.Fatalf("Failed to start metrics server: %v", err)
 	}

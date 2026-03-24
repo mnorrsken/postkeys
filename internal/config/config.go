@@ -53,6 +53,9 @@ type Config struct {
 	// TraceLevel controls RESP command logging verbosity
 	// 0 = off, 1 = important only (AUTH, FLUSHDB), 2 = most commands, 3 = everything (including GET/SET)
 	TraceLevel int
+
+	// EnablePprof enables /debug/pprof/* endpoints on the metrics server
+	EnablePprof bool
 }
 
 // Load loads configuration from environment variables
@@ -81,6 +84,7 @@ func Load() *Config {
 		Debug:                        getEnv("DEBUG", "") == "1",
 		SQLTraceLevel:                getEnvInt("SQLTRACE", 0),
 		TraceLevel:                   getEnvInt("TRACE", 0),
+		EnablePprof:                  getEnvBool("ENABLE_PPROF", false),
 	}
 }
 
