@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.20.7] - 2026-03-24
+
+### Fixed
+- **Multi-instance pub/sub desync**: The pub/sub system used per-channel `LISTEN/NOTIFY`, so `PSUBSCRIBE` pattern subscriptions never received cross-instance messages. Switched to a single broadcast channel (`postkeys_pubsub`) that all instances always listen on, enabling correct pattern matching across the cluster. Fixes session state desync in multi-replica deployments (e.g. Authelia).
+- **CLUSTER INFO returned `cluster_state:fail`**: Now correctly returns `cluster_state:ok`.
+
+### Added
+- **CONFIG command handler**: go-redis sends `CONFIG GET` on init; postkeys now handles it gracefully.
+- **SELECT command handler**: Returns OK for db 0, error otherwise.
+- **WAIT command handler**: Returns immediately (PostgreSQL handles durability).
+
 ## [0.20.6] - 2026-03-09
 
 ### Fixed
