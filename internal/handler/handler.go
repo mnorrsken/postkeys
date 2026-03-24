@@ -190,6 +190,12 @@ func (h *Handler) executeCommand(ctx context.Context, cmdName string, args []res
 		return h.command(args)
 	case "CLUSTER":
 		return h.cluster(args)
+	case "CONFIG":
+		return h.config(args)
+	case "SELECT":
+		return h.selectDB(args)
+	case "WAIT":
+		return h.wait(args)
 
 	// Transaction commands (handled specially in HandleTransaction)
 	case "MULTI", "EXEC", "DISCARD":
@@ -401,8 +407,8 @@ func (h *Handler) cluster(args []resp.Value) resp.Value {
 	subCmd := strings.ToUpper(args[0].Bulk)
 	switch subCmd {
 	case "INFO":
-		// Return cluster info indicating cluster mode is disabled
-		return resp.Bulk("cluster_state:fail\r\ncluster_slots_assigned:0\r\ncluster_slots_ok:0\r\ncluster_slots_pfail:0\r\ncluster_slots_fail:0\r\ncluster_known_nodes:1\r\ncluster_size:0\r\ncluster_current_epoch:0\r\ncluster_my_epoch:0\r\ncluster_stats_messages_sent:0\r\ncluster_stats_messages_received:0\r\ncluster_stats_messages_ping_sent:0\r\ncluster_stats_messages_pong_sent:0\r\ncluster_stats_messages_meet_sent:0\r\ncluster_stats_messages_ping_received:0\r\ncluster_stats_messages_pong_received:0\r\ncluster_stats_messages_meet_received:0")
+		// Return cluster info indicating cluster mode is disabled (standalone)
+		return resp.Bulk("cluster_enabled:0\r\ncluster_state:ok\r\ncluster_slots_assigned:0\r\ncluster_slots_ok:0\r\ncluster_slots_pfail:0\r\ncluster_slots_fail:0\r\ncluster_known_nodes:1\r\ncluster_size:0\r\ncluster_current_epoch:0\r\ncluster_my_epoch:0\r\ncluster_stats_messages_sent:0\r\ncluster_stats_messages_received:0\r\ncluster_stats_messages_ping_sent:0\r\ncluster_stats_messages_pong_sent:0\r\ncluster_stats_messages_meet_sent:0\r\ncluster_stats_messages_ping_received:0\r\ncluster_stats_messages_pong_received:0\r\ncluster_stats_messages_meet_received:0")
 	case "SLOTS":
 		// Return empty array - no cluster slots configured
 		return resp.Arr()
@@ -417,6 +423,61 @@ func (h *Handler) cluster(args []resp.Value) resp.Value {
 		return resp.Int(0)
 	default:
 		return resp.Err(fmt.Sprintf("ERR Unknown subcommand or wrong number of arguments for '%s'", subCmd))
+	}
+}
+
+// selectDB handles SELECT command. postkeys only supports a single database (db 0).
+func (h *Handler) selectDB(args []resp.Value) resp.Value {
+	if len(args) != 1 {
+		return resp.ErrWrongArgs("select")
+	}
+	db, err := strconv.Atoi(args[0].Bulk)
+	if err != nil {
+		return resp.Err("ERR value is not an integer or out of range")
+	}
+	if db != 0 {
+		return resp.Err("ERR DB index is out of range")
+	}
+	return resp.OK()
+}
+
+// wait handles WAIT command. In postkeys, all writes go directly to PostgreSQL
+// and are immediately durable, so WAIT always returns immediately.
+func (h *Handler) wait(args []resp.Value) resp.Value {
+	if len(args) < 2 {
+		return resp.ErrWrongArgs("wait")
+	}
+	// numreplicas is args[0], timeout is args[1]
+	// Since postkeys has no replicas (PostgreSQL handles durability),
+	// return 0 replicas immediately.
+	return resp.Int(0)
+}
+
+// config handles CONFIG commands. postkeys is not configurable at runtime,
+// but many Redis clients (including go-redis used by Authelia) send CONFIG
+// commands during initialization. Return sensible defaults to avoid errors.
+func (h *Handler) config(args []resp.Value) resp.Value {
+	if len(args) == 0 {
+		return resp.ErrWrongArgs("config")
+	}
+
+	subCmd := strings.ToUpper(args[0].Bulk)
+	switch subCmd {
+	case "GET":
+		if len(args) < 2 {
+			return resp.ErrWrongArgs("config get")
+		}
+		// Return empty array for unknown config keys (valid Redis behavior)
+		return resp.Arr()
+	case "SET":
+		// Accept but ignore CONFIG SET (not applicable for postkeys)
+		return resp.OK()
+	case "RESETSTAT":
+		return resp.OK()
+	case "REWRITE":
+		return resp.OK()
+	default:
+		return resp.Err(fmt.Sprintf("ERR Unknown subcommand or wrong number of arguments for 'CONFIG %s'", subCmd))
 	}
 }
 

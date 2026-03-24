@@ -3,9 +3,7 @@ package pubsub
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,28 +17,16 @@ import (
 	"github.com/mnorrsken/postkeys/internal/resp"
 )
 
-// PostgreSQL channel name limit is 63 bytes (NAMEDATALEN-1)
-const maxPgChannelLen = 63
+// broadcastChannel is the single PostgreSQL LISTEN/NOTIFY channel used for all
+// pub/sub messages. Using a single channel ensures all instances receive all
+// messages, which is required for PSUBSCRIBE pattern matching to work correctly
+// across multiple postkeys instances sharing one PostgreSQL database.
+const broadcastChannel = "postkeys_pubsub"
 
-// wrappedPayloadPrefix is the magic prefix for wrapped payloads (used when channel name is hashed)
-const wrappedPayloadPrefix = "\x1EPKW:"
-
-// wrappedPayload is used to encode channel + message when channel name is hashed
-type wrappedPayload struct {
+// broadcastPayload is the JSON envelope sent via pg_notify on the broadcast channel.
+type broadcastPayload struct {
 	Channel string `json:"c"`
 	Message string `json:"m"`
-}
-
-// pgChannel converts a Redis channel name to a PostgreSQL-safe channel name.
-// If the channel name is longer than 63 bytes, it's hashed to fit.
-func pgChannel(channel string) string {
-	if len(channel) <= maxPgChannelLen {
-		return channel
-	}
-	// Hash long channel names: use prefix + hash for uniqueness
-	hash := sha256.Sum256([]byte(channel))
-	// Use "h_" prefix + 40 chars of hex = 42 chars total, well under 63
-	return "h_" + hex.EncodeToString(hash[:20])
 }
 
 // Subscriber represents a client that can receive pub/sub messages
@@ -67,21 +53,11 @@ type Hub struct {
 
 	// Listener connection (dedicated for LISTEN/NOTIFY)
 	listenerConn *pgx.Conn
-	listenerMu   sync.Mutex
-	listening    map[string]bool   // pg channels we're currently LISTENing to
-	pgToRedis    map[string]string // pg channel name -> redis channel name (for hashed names)
-	listenCmds   chan listenCmd    // channel for LISTEN/UNLISTEN commands
 
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 	debug  bool
-}
-
-// listenCmd represents a LISTEN/UNLISTEN command to be executed by the listener goroutine
-type listenCmd struct {
-	channel string
-	listen  bool // true for LISTEN, false for UNLISTEN
 }
 
 // NewHub creates a new pub/sub hub
@@ -94,9 +70,6 @@ func NewHub(pool *pgxpool.Pool, connStr string) *Hub {
 		subscribers:   make(map[uint64]map[string]bool),
 		patterns:      make(map[string]map[uint64]Subscriber),
 		subPatterns:   make(map[uint64]map[string]bool),
-		listening:     make(map[string]bool),
-		pgToRedis:     make(map[string]string),
-		listenCmds:    make(chan listenCmd, 100),
 		ctx:           ctx,
 		cancel:        cancel,
 	}
@@ -115,6 +88,15 @@ func (h *Hub) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to create listener connection: %w", err)
 	}
 	h.listenerConn = listenerConn
+
+	// Listen on the single broadcast channel so we receive ALL pub/sub messages.
+	// This is critical for multi-instance correctness: every instance must see
+	// every published message so that both SUBSCRIBE and PSUBSCRIBE work.
+	_, err = listenerConn.Exec(ctx, fmt.Sprintf("LISTEN %s", pgxIdentifier(broadcastChannel)))
+	if err != nil {
+		listenerConn.Close(ctx)
+		return fmt.Errorf("failed to LISTEN on broadcast channel: %w", err)
+	}
 
 	// Start the notification listener goroutine
 	h.wg.Add(1)
@@ -150,8 +132,6 @@ func (h *Hub) Subscribe(sub Subscriber, channels ...string) []int {
 		// Initialize channel's subscriber set if needed
 		if _, exists := h.subscriptions[channel]; !exists {
 			h.subscriptions[channel] = make(map[uint64]Subscriber)
-			// Start listening on this channel in PostgreSQL
-			h.startListening(channel)
 		}
 
 		// Add subscriber to channel
@@ -191,8 +171,6 @@ func (h *Hub) Unsubscribe(sub Subscriber, channels ...string) []int {
 			delete(subs, subID)
 			if len(subs) == 0 {
 				delete(h.subscriptions, channel)
-				// Stop listening on this channel
-				h.stopListening(channel)
 			}
 		}
 
@@ -280,31 +258,27 @@ func (h *Hub) PUnsubscribe(sub Subscriber, patterns ...string) []int {
 	return counts
 }
 
-// Publish publishes a message to a channel, returns the number of subscribers that received it
+// Publish publishes a message to a channel, returns the number of local subscribers that received it.
 func (h *Hub) Publish(ctx context.Context, channel, message string) (int64, error) {
-	// Use PostgreSQL NOTIFY to broadcast the message
-	// Convert to pg-safe channel name (hash if too long)
-	pgChan := pgChannel(channel)
-	payload := message
-
-	// If channel name was hashed, we need to include the original channel in the payload
-	// so subscribers can match it. Use JSON encoding since pg_notify doesn't allow null bytes.
-	if pgChan != channel {
-		wrapped := wrappedPayload{Channel: channel, Message: message}
-		jsonBytes, err := json.Marshal(wrapped)
-		if err != nil {
-			return 0, fmt.Errorf("failed to encode payload: %w", err)
-		}
-		// Prefix with magic marker to identify wrapped payloads
-		payload = wrappedPayloadPrefix + base64.StdEncoding.EncodeToString(jsonBytes)
+	// Wrap channel + message into a JSON payload and send via the broadcast channel.
+	// All postkeys instances LISTEN on this single channel, so every instance
+	// receives every message and can match against both exact and pattern subscriptions.
+	bp := broadcastPayload{Channel: channel, Message: message}
+	jsonBytes, err := json.Marshal(bp)
+	if err != nil {
+		return 0, fmt.Errorf("failed to encode broadcast payload: %w", err)
 	}
 
-	_, err := h.pool.Exec(ctx, "SELECT pg_notify($1, $2)", pgChan, payload)
+	payload := base64.StdEncoding.EncodeToString(jsonBytes)
+
+	_, err = h.pool.Exec(ctx, "SELECT pg_notify($1, $2)", broadcastChannel, payload)
 	if err != nil {
 		return 0, fmt.Errorf("failed to publish: %w", err)
 	}
 
-	// Count subscribers (channel + pattern matches)
+	// Return local subscriber count (same semantics as Redis: count of clients
+	// on this server that received the message). The actual delivery happens
+	// asynchronously via the listenLoop when pg_notify is received.
 	count := h.countSubscribers(channel)
 	return int64(count), nil
 }
@@ -369,7 +343,6 @@ func (h *Hub) RemoveSubscriber(subID uint64) {
 				delete(subs, subID)
 				if len(subs) == 0 {
 					delete(h.subscriptions, channel)
-					h.stopListening(channel)
 				}
 			}
 		}
@@ -393,93 +366,11 @@ func (h *Hub) RemoveSubscriber(subID uint64) {
 	h.patternMu.Unlock()
 }
 
-// startListening queues a LISTEN command for the channel
-func (h *Hub) startListening(channel string) {
-	pgChan := pgChannel(channel)
-
-	h.listenerMu.Lock()
-	if h.listening[pgChan] {
-		h.listenerMu.Unlock()
-		return
-	}
-	// Mark as listening immediately to avoid duplicate commands
-	h.listening[pgChan] = true
-	// Store mapping from pg channel to redis channel
-	if pgChan != channel {
-		h.pgToRedis[pgChan] = channel
-	}
-	h.listenerMu.Unlock()
-
-	// Queue LISTEN command to be processed by the listener goroutine
-	select {
-	case h.listenCmds <- listenCmd{channel: pgChan, listen: true}:
-		if h.debug {
-			log.Printf("[DEBUG] Queued LISTEN for channel: %s", channel)
-		}
-	default:
-		log.Printf("Warning: LISTEN command queue full for channel %s", channel)
-	}
-}
-
-// stopListening queues an UNLISTEN command for the channel
-func (h *Hub) stopListening(channel string) {
-	pgChan := pgChannel(channel)
-
-	h.listenerMu.Lock()
-	if !h.listening[pgChan] {
-		h.listenerMu.Unlock()
-		return
-	}
-	delete(h.listening, pgChan)
-	delete(h.pgToRedis, pgChan)
-	h.listenerMu.Unlock()
-
-	// Queue UNLISTEN command
-	select {
-	case h.listenCmds <- listenCmd{channel: pgChan, listen: false}:
-		if h.debug {
-			log.Printf("[DEBUG] Queued UNLISTEN for channel: %s", channel)
-		}
-	default:
-		log.Printf("Warning: UNLISTEN command queue full for channel %s", channel)
-	}
-}
-
-// processListenCmds processes any pending LISTEN/UNLISTEN commands
-func (h *Hub) processListenCmds() {
-	for {
-		select {
-		case cmd := <-h.listenCmds:
-			if cmd.listen {
-				_, err := h.listenerConn.Exec(h.ctx, fmt.Sprintf("LISTEN %s", pgxIdentifier(cmd.channel)))
-				if err != nil {
-					log.Printf("Failed to LISTEN on channel %s: %v", cmd.channel, err)
-					h.listenerMu.Lock()
-					delete(h.listening, cmd.channel)
-					h.listenerMu.Unlock()
-				} else if h.debug {
-					log.Printf("[DEBUG] Started LISTEN on channel: %s", cmd.channel)
-				}
-			} else {
-				_, err := h.listenerConn.Exec(h.ctx, fmt.Sprintf("UNLISTEN %s", pgxIdentifier(cmd.channel)))
-				if err != nil {
-					log.Printf("Failed to UNLISTEN on channel %s: %v", cmd.channel, err)
-				} else if h.debug {
-					log.Printf("[DEBUG] Stopped LISTEN on channel: %s", cmd.channel)
-				}
-			}
-		default:
-			return
-		}
-	}
-}
-
-// listenLoop continuously waits for PostgreSQL notifications
+// listenLoop continuously waits for PostgreSQL notifications on the broadcast channel.
 func (h *Hub) listenLoop() {
 	defer h.wg.Done()
 
 	// Exponential backoff for idle periods
-	// Start at 50ms, double on each timeout up to 2s max
 	const (
 		minTimeout = 50 * time.Millisecond
 		maxTimeout = 2 * time.Second
@@ -499,9 +390,6 @@ func (h *Hub) listenLoop() {
 			return
 		default:
 		}
-
-		// Process any pending LISTEN/UNLISTEN commands first
-		h.processListenCmds()
 
 		// Wait for notification with exponential backoff
 		ctx, cancel := context.WithTimeout(h.ctx, currentTimeout)
@@ -545,47 +433,37 @@ func (h *Hub) listenLoop() {
 		// Got a notification - reset backoff to minimum for responsiveness
 		currentTimeout = minTimeout
 
-		if h.debug {
-			log.Printf("[DEBUG] Received notification on channel %s: %s", notification.Channel, notification.Payload)
+		// Only process messages from the broadcast channel
+		if notification.Channel != broadcastChannel {
+			continue
 		}
 
-		// Determine the original Redis channel name and extract the actual payload
-		pgChan := notification.Channel
-		redisChannel := pgChan
-		payload := notification.Payload
+		// Decode the broadcast payload
+		jsonBytes, err := base64.StdEncoding.DecodeString(notification.Payload)
+		if err != nil {
+			log.Printf("Warning: failed to decode broadcast payload: %v", err)
+			continue
+		}
 
-		// Check if this is a hashed channel (starts with "h_")
-		if strings.HasPrefix(pgChan, "h_") {
-			// Look up the original channel name from our mapping
-			h.listenerMu.Lock()
-			if origChannel, ok := h.pgToRedis[pgChan]; ok {
-				redisChannel = origChannel
-			}
-			h.listenerMu.Unlock()
+		var bp broadcastPayload
+		if err := json.Unmarshal(jsonBytes, &bp); err != nil {
+			log.Printf("Warning: failed to unmarshal broadcast payload: %v", err)
+			continue
+		}
 
-			// Check if the payload is wrapped (from publishers that hashed the channel)
-			if strings.HasPrefix(payload, wrappedPayloadPrefix) {
-				// Decode the wrapped payload
-				encoded := payload[len(wrappedPayloadPrefix):]
-				if jsonBytes, err := base64.StdEncoding.DecodeString(encoded); err == nil {
-					var wrapped wrappedPayload
-					if err := json.Unmarshal(jsonBytes, &wrapped); err == nil {
-						redisChannel = wrapped.Channel
-						payload = wrapped.Message
-					}
-				}
-			}
+		if h.debug {
+			log.Printf("[DEBUG] Received pub/sub broadcast: channel=%s", bp.Channel)
 		}
 
 		// Deliver to channel subscribers
-		h.deliverToChannel(redisChannel, payload)
+		h.deliverToChannel(bp.Channel, bp.Message)
 
 		// Deliver to pattern subscribers
-		h.deliverToPatterns(redisChannel, payload)
+		h.deliverToPatterns(bp.Channel, bp.Message)
 	}
 }
 
-// reconnect attempts to re-establish the listener connection and re-subscribe to all channels
+// reconnect attempts to re-establish the listener connection and re-subscribe to the broadcast channel
 func (h *Hub) reconnect() bool {
 	// Close old connection if it exists
 	if h.listenerConn != nil {
@@ -603,24 +481,17 @@ func (h *Hub) reconnect() bool {
 	}
 	h.listenerConn = conn
 
-	// Re-subscribe to all channels we were listening to
-	h.listenerMu.Lock()
-	channels := make([]string, 0, len(h.listening))
-	for ch := range h.listening {
-		channels = append(channels, ch)
-	}
-	h.listenerMu.Unlock()
-
-	for _, ch := range channels {
-		_, err := conn.Exec(ctx, fmt.Sprintf("LISTEN %s", pgxIdentifier(ch)))
-		if err != nil {
-			log.Printf("Failed to re-LISTEN on channel %s after reconnect: %v", ch, err)
-			// Don't fail entirely - continue with other channels
-		}
+	// Re-subscribe to the broadcast channel
+	_, err = conn.Exec(ctx, fmt.Sprintf("LISTEN %s", pgxIdentifier(broadcastChannel)))
+	if err != nil {
+		log.Printf("Failed to LISTEN on broadcast channel after reconnect: %v", err)
+		conn.Close(ctx)
+		h.listenerConn = nil
+		return false
 	}
 
 	if h.debug {
-		log.Printf("[DEBUG] Pub/sub hub reconnected successfully, re-subscribed to %d channels", len(channels))
+		log.Printf("[DEBUG] Pub/sub hub reconnected successfully")
 	}
 	return true
 }
