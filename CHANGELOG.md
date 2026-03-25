@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.20.9] - 2026-03-25
+
+### Fixed
+- **`pg_notify` crash with binary Redis keys**: `SELECT pg_notify($1, $2)` failed with `invalid byte sequence for encoding "UTF8"` when Redis keys or pub/sub messages contained non-UTF-8 binary data. All three notification paths (list push, pub/sub broadcast, cache invalidation) now base64-encode their payloads, with backward-compatible decoding for rolling updates.
+- **Binary-safe key storage**: Redis keys containing null bytes or invalid UTF-8 are now transparently encoded before storage in PostgreSQL TEXT columns. Normal UTF-8 keys (the vast majority) pass through unchanged with zero overhead. Uses the same `\x1Fb64:` prefix encoding already proven for hash field names.
+
 ## [0.20.8] - 2026-03-24
 
 ### Fixed
