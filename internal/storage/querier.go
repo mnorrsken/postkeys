@@ -24,22 +24,53 @@ type Querier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-// binaryFieldPrefix is used to identify base64-encoded binary field names
-const binaryFieldPrefix = "\x1Fb64:"
+// binaryPrefix is used to identify base64-encoded binary keys and field names.
+// The \x1F (Unit Separator) byte cannot appear in valid UTF-8 text, so this
+// prefix is unambiguous: any string starting with it was encoded by us.
+const binaryPrefix = "\x1Fb64:"
+
+// encodeKey encodes a key for PostgreSQL TEXT storage.
+// Keys with null bytes or invalid UTF-8 are base64-encoded with a marker prefix.
+// Valid UTF-8 keys are returned unchanged (zero overhead for normal keys).
+func encodeKey(key string) string {
+	if strings.ContainsRune(key, 0) || !utf8.ValidString(key) {
+		return binaryPrefix + base64.StdEncoding.EncodeToString([]byte(key))
+	}
+	return key
+}
+
+// decodeKey decodes a key from PostgreSQL TEXT storage.
+func decodeKey(key string) string {
+	if strings.HasPrefix(key, binaryPrefix) {
+		encoded := key[len(binaryPrefix):]
+		if decoded, err := base64.StdEncoding.DecodeString(encoded); err == nil {
+			return string(decoded)
+		}
+	}
+	return key
+}
+
+// encodeKeys encodes a slice of keys for PostgreSQL TEXT storage.
+func encodeKeys(keys []string) []string {
+	for i, k := range keys {
+		keys[i] = encodeKey(k)
+	}
+	return keys
+}
 
 // encodeField encodes a field name for PostgreSQL storage.
 // Field names with null bytes or invalid UTF-8 are base64-encoded.
 func encodeField(field string) string {
 	if strings.ContainsRune(field, 0) || !utf8.ValidString(field) {
-		return binaryFieldPrefix + base64.StdEncoding.EncodeToString([]byte(field))
+		return binaryPrefix + base64.StdEncoding.EncodeToString([]byte(field))
 	}
 	return field
 }
 
 // decodeField decodes a field name from PostgreSQL storage.
 func decodeField(field string) string {
-	if strings.HasPrefix(field, binaryFieldPrefix) {
-		encoded := field[len(binaryFieldPrefix):]
+	if strings.HasPrefix(field, binaryPrefix) {
+		encoded := field[len(binaryPrefix):]
 		if decoded, err := base64.StdEncoding.DecodeString(encoded); err == nil {
 			return string(decoded)
 		}
@@ -223,6 +254,7 @@ func (o queryOps) deleteKeysFromAllTables(ctx context.Context, q Querier, keys [
 // ============== String Commands ==============
 
 func (o queryOps) get(ctx context.Context, q Querier, key string) (string, bool, error) {
+	key = encodeKey(key)
 	var value []byte
 	err := q.QueryRow(ctx,
 		"SELECT value FROM kv_strings WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
@@ -239,6 +271,7 @@ func (o queryOps) get(ctx context.Context, q Querier, key string) (string, bool,
 }
 
 func (o queryOps) set(ctx context.Context, q Querier, key, value string, ttl time.Duration) error {
+	key = encodeKey(key)
 	if err := o.deleteKeyFromAllTables(ctx, q, key); err != nil {
 		return err
 	}
@@ -263,6 +296,7 @@ func (o queryOps) set(ctx context.Context, q Querier, key, value string, ttl tim
 }
 
 func (o queryOps) setNX(ctx context.Context, q Querier, key, value string) (bool, error) {
+	key = encodeKey(key)
 	if err := o.lockKey(ctx, q, key); err != nil {
 		return false, err
 	}
@@ -293,6 +327,7 @@ func (o queryOps) setNX(ctx context.Context, q Querier, key, value string) (bool
 }
 
 func (o queryOps) mGet(ctx context.Context, q Querier, keys []string) ([]interface{}, error) {
+	keys = encodeKeys(keys)
 	results := make([]interface{}, len(keys))
 
 	rows, err := q.Query(ctx,
@@ -327,6 +362,11 @@ func (o queryOps) mGet(ctx context.Context, q Querier, keys []string) ([]interfa
 }
 
 func (o queryOps) mSet(ctx context.Context, q Querier, pairs map[string]string) error {
+	encoded := make(map[string]string, len(pairs))
+	for k, v := range pairs {
+		encoded[encodeKey(k)] = v
+	}
+	pairs = encoded
 	if len(pairs) == 0 {
 		return nil
 	}
@@ -364,6 +404,7 @@ func (o queryOps) mSet(ctx context.Context, q Querier, pairs map[string]string) 
 }
 
 func (o queryOps) incr(ctx context.Context, q Querier, key string, delta int64) (int64, error) {
+	key = encodeKey(key)
 	var value []byte
 	err := q.QueryRow(ctx,
 		"SELECT value FROM kv_strings WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
@@ -401,6 +442,7 @@ func (o queryOps) incr(ctx context.Context, q Querier, key string, delta int64) 
 }
 
 func (o queryOps) appendStr(ctx context.Context, q Querier, key, value string) (int64, error) {
+	key = encodeKey(key)
 	if err := o.setMeta(ctx, q, key, TypeString, nil); err != nil {
 		return 0, err
 	}
@@ -424,6 +466,7 @@ func (o queryOps) appendStr(ctx context.Context, q Querier, key, value string) (
 }
 
 func (o queryOps) getRange(ctx context.Context, q Querier, key string, start, end int64) (string, error) {
+	key = encodeKey(key)
 	var value []byte
 	err := q.QueryRow(ctx,
 		"SELECT value FROM kv_strings WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
@@ -464,6 +507,7 @@ func (o queryOps) getRange(ctx context.Context, q Querier, key string, start, en
 }
 
 func (o queryOps) setRange(ctx context.Context, q Querier, key string, offset int64, value string) (int64, error) {
+	key = encodeKey(key)
 	// Get existing value or create empty
 	var existing []byte
 	err := q.QueryRow(ctx,
@@ -506,6 +550,7 @@ func (o queryOps) setRange(ctx context.Context, q Querier, key string, offset in
 }
 
 func (o queryOps) bitField(ctx context.Context, q Querier, key string, ops []BitFieldOp) ([]int64, error) {
+	key = encodeKey(key)
 	// Get existing value or create empty
 	var value []byte
 	err := q.QueryRow(ctx,
@@ -644,6 +689,7 @@ func setBitField(data []byte, bitOffset, bitWidth, value int64) {
 }
 
 func (o queryOps) strLen(ctx context.Context, q Querier, key string) (int64, error) {
+	key = encodeKey(key)
 	var value []byte
 	err := q.QueryRow(ctx,
 		"SELECT value FROM kv_strings WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
@@ -659,6 +705,7 @@ func (o queryOps) strLen(ctx context.Context, q Querier, key string) (int64, err
 }
 
 func (o queryOps) getEx(ctx context.Context, q Querier, key string, ttl time.Duration, persist bool) (string, bool, error) {
+	key = encodeKey(key)
 	if err := o.lockKey(ctx, q, key); err != nil {
 		return "", false, err
 	}
@@ -711,6 +758,7 @@ func (o queryOps) getEx(ctx context.Context, q Querier, key string, ttl time.Dur
 }
 
 func (o queryOps) getDel(ctx context.Context, q Querier, key string) (string, bool, error) {
+	key = encodeKey(key)
 	if err := o.lockKey(ctx, q, key); err != nil {
 		return "", false, err
 	}
@@ -737,6 +785,7 @@ func (o queryOps) getDel(ctx context.Context, q Querier, key string) (string, bo
 }
 
 func (o queryOps) getSet(ctx context.Context, q Querier, key, value string) (string, bool, error) {
+	key = encodeKey(key)
 	// Get old value
 	var oldValue []byte
 	err := q.QueryRow(ctx,
@@ -770,6 +819,7 @@ func (o queryOps) getSet(ctx context.Context, q Querier, key, value string) (str
 }
 
 func (o queryOps) incrByFloat(ctx context.Context, q Querier, key string, delta float64) (float64, error) {
+	key = encodeKey(key)
 	// Check key type
 	keyType, err := o.getKeyType(ctx, q, key)
 	if err != nil {
@@ -820,6 +870,7 @@ func (o queryOps) incrByFloat(ctx context.Context, q Querier, key string, delta 
 // ============== Key Commands ==============
 
 func (o queryOps) del(ctx context.Context, q Querier, keys []string) (int64, error) {
+	keys = encodeKeys(keys)
 	// Sort keys for consistent lock ordering to prevent deadlocks
 	sort.Strings(keys)
 	var deleted int64
@@ -841,6 +892,7 @@ func (o queryOps) del(ctx context.Context, q Querier, keys []string) (int64, err
 }
 
 func (o queryOps) exists(ctx context.Context, q Querier, keys []string) (int64, error) {
+	keys = encodeKeys(keys)
 	var count int64
 	err := q.QueryRow(ctx,
 		`SELECT COUNT(*) FROM kv_meta 
@@ -851,6 +903,7 @@ func (o queryOps) exists(ctx context.Context, q Querier, keys []string) (int64, 
 }
 
 func (o queryOps) expire(ctx context.Context, q Querier, key string, ttl time.Duration) (bool, error) {
+	key = encodeKey(key)
 	if err := o.lockKey(ctx, q, key); err != nil {
 		return false, err
 	}
@@ -885,6 +938,7 @@ func (o queryOps) expire(ctx context.Context, q Querier, key string, ttl time.Du
 }
 
 func (o queryOps) ttl(ctx context.Context, q Querier, key string) (int64, error) {
+	key = encodeKey(key)
 	var expiresAt *time.Time
 	err := q.QueryRow(ctx,
 		"SELECT expires_at FROM kv_meta WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
@@ -909,6 +963,7 @@ func (o queryOps) ttl(ctx context.Context, q Querier, key string) (int64, error)
 }
 
 func (o queryOps) pttl(ctx context.Context, q Querier, key string) (int64, error) {
+	key = encodeKey(key)
 	var expiresAt *time.Time
 	err := q.QueryRow(ctx,
 		"SELECT expires_at FROM kv_meta WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
@@ -933,6 +988,7 @@ func (o queryOps) pttl(ctx context.Context, q Querier, key string) (int64, error
 }
 
 func (o queryOps) persist(ctx context.Context, q Querier, key string) (bool, error) {
+	key = encodeKey(key)
 	if err := o.lockKey(ctx, q, key); err != nil {
 		return false, err
 	}
@@ -979,16 +1035,18 @@ func (o queryOps) keys(ctx context.Context, q Querier, pattern string) ([]string
 		if err := rows.Scan(&key); err != nil {
 			return nil, err
 		}
-		keys = append(keys, key)
+		keys = append(keys, decodeKey(key))
 	}
 	return keys, nil
 }
 
 func (o queryOps) keyType(ctx context.Context, q Querier, key string) (KeyType, error) {
+	key = encodeKey(key)
 	return o.getKeyType(ctx, q, key)
 }
 
 func (o queryOps) rename(ctx context.Context, q Querier, oldKey, newKey string) error {
+	oldKey, newKey = encodeKey(oldKey), encodeKey(newKey)
 	// Lock both keys in sorted order to prevent deadlocks
 	if err := o.lockKeys(ctx, q, []string{oldKey, newKey}); err != nil {
 		return err
@@ -1025,6 +1083,7 @@ func (o queryOps) rename(ctx context.Context, q Querier, oldKey, newKey string) 
 // ============== Hash Commands ==============
 
 func (o queryOps) hGet(ctx context.Context, q Querier, key, field string) (string, bool, error) {
+	key = encodeKey(key)
 	var value []byte
 	err := q.QueryRow(ctx,
 		"SELECT value FROM kv_hashes WHERE key = $1 AND field = $2 AND (expires_at IS NULL OR expires_at > NOW())",
@@ -1041,6 +1100,7 @@ func (o queryOps) hGet(ctx context.Context, q Querier, key, field string) (strin
 }
 
 func (o queryOps) hSet(ctx context.Context, q Querier, key string, fields map[string]string) (int64, error) {
+	key = encodeKey(key)
 	if len(fields) == 0 {
 		return 0, nil
 	}
@@ -1093,6 +1153,7 @@ func (o queryOps) hSet(ctx context.Context, q Querier, key string, fields map[st
 }
 
 func (o queryOps) hDel(ctx context.Context, q Querier, key string, fields []string) (int64, error) {
+	key = encodeKey(key)
 	// Encode field names for PostgreSQL
 	encFields := make([]string, len(fields))
 	for i, f := range fields {
@@ -1109,6 +1170,7 @@ func (o queryOps) hDel(ctx context.Context, q Querier, key string, fields []stri
 }
 
 func (o queryOps) hGetAll(ctx context.Context, q Querier, key string) (map[string]string, error) {
+	key = encodeKey(key)
 	// Check if key exists but is wrong type
 	keyType, err := o.getKeyType(ctx, q, key)
 	if err != nil {
@@ -1140,6 +1202,7 @@ func (o queryOps) hGetAll(ctx context.Context, q Querier, key string) (map[strin
 }
 
 func (o queryOps) hMGet(ctx context.Context, q Querier, key string, fields []string) ([]interface{}, error) {
+	key = encodeKey(key)
 	results := make([]interface{}, len(fields))
 
 	// Encode field names for query
@@ -1180,6 +1243,7 @@ func (o queryOps) hMGet(ctx context.Context, q Querier, key string, fields []str
 }
 
 func (o queryOps) hExists(ctx context.Context, q Querier, key, field string) (bool, error) {
+	key = encodeKey(key)
 	var count int64
 	err := q.QueryRow(ctx,
 		`SELECT COUNT(*) FROM kv_hashes 
@@ -1190,6 +1254,7 @@ func (o queryOps) hExists(ctx context.Context, q Querier, key, field string) (bo
 }
 
 func (o queryOps) hKeys(ctx context.Context, q Querier, key string) ([]string, error) {
+	key = encodeKey(key)
 	rows, err := q.Query(ctx,
 		"SELECT field FROM kv_hashes WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
 		key,
@@ -1211,6 +1276,7 @@ func (o queryOps) hKeys(ctx context.Context, q Querier, key string) ([]string, e
 }
 
 func (o queryOps) hVals(ctx context.Context, q Querier, key string) ([]string, error) {
+	key = encodeKey(key)
 	rows, err := q.Query(ctx,
 		"SELECT value FROM kv_hashes WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
 		key,
@@ -1232,6 +1298,7 @@ func (o queryOps) hVals(ctx context.Context, q Querier, key string) ([]string, e
 }
 
 func (o queryOps) hLen(ctx context.Context, q Querier, key string) (int64, error) {
+	key = encodeKey(key)
 	var count int64
 	err := q.QueryRow(ctx,
 		"SELECT COUNT(*) FROM kv_hashes WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
@@ -1241,6 +1308,7 @@ func (o queryOps) hLen(ctx context.Context, q Querier, key string) (int64, error
 }
 
 func (o queryOps) hIncrBy(ctx context.Context, q Querier, key, field string, increment int64) (int64, error) {
+	key = encodeKey(key)
 	// Check if key exists but is wrong type
 	keyType, err := o.getKeyType(ctx, q, key)
 	if err != nil {
@@ -1292,6 +1360,7 @@ func (o queryOps) hIncrBy(ctx context.Context, q Querier, key, field string, inc
 }
 
 func (o queryOps) hIncrByFloat(ctx context.Context, q Querier, key, field string, increment float64) (float64, error) {
+	key = encodeKey(key)
 	// Check if key exists but is wrong type
 	keyType, err := o.getKeyType(ctx, q, key)
 	if err != nil {
@@ -1346,6 +1415,7 @@ func (o queryOps) hIncrByFloat(ctx context.Context, q Querier, key, field string
 }
 
 func (o queryOps) hSetNX(ctx context.Context, q Querier, key, field, value string) (bool, error) {
+	key = encodeKey(key)
 	// Check if key exists but is wrong type
 	keyType, err := o.getKeyType(ctx, q, key)
 	if err != nil {
@@ -1383,6 +1453,7 @@ func (o queryOps) hSetNX(ctx context.Context, q Querier, key, field, value strin
 // ============== List Commands ==============
 
 func (o queryOps) lPush(ctx context.Context, q Querier, key string, values []string) (int64, error) {
+	key = encodeKey(key)
 	keyType, err := o.getKeyType(ctx, q, key)
 	if err != nil {
 		return 0, err
@@ -1447,6 +1518,7 @@ func (o queryOps) lPush(ctx context.Context, q Querier, key string, values []str
 }
 
 func (o queryOps) rPush(ctx context.Context, q Querier, key string, values []string) (int64, error) {
+	key = encodeKey(key)
 	keyType, err := o.getKeyType(ctx, q, key)
 	if err != nil {
 		return 0, err
@@ -1509,6 +1581,7 @@ func (o queryOps) rPush(ctx context.Context, q Querier, key string, values []str
 }
 
 func (o queryOps) lPop(ctx context.Context, q Querier, key string) (string, bool, error) {
+	key = encodeKey(key)
 	// Find and delete the leftmost element in a single query using CTE
 	// Use FOR UPDATE SKIP LOCKED to prevent deadlocks when multiple clients pop concurrently
 	var value []byte
@@ -1535,6 +1608,7 @@ func (o queryOps) lPop(ctx context.Context, q Querier, key string) (string, bool
 }
 
 func (o queryOps) rPop(ctx context.Context, q Querier, key string) (string, bool, error) {
+	key = encodeKey(key)
 	// Find and delete the rightmost element in a single query using CTE
 	// Use FOR UPDATE SKIP LOCKED to prevent deadlocks when multiple clients pop concurrently
 	var value []byte
@@ -1561,6 +1635,7 @@ func (o queryOps) rPop(ctx context.Context, q Querier, key string) (string, bool
 }
 
 func (o queryOps) lLen(ctx context.Context, q Querier, key string) (int64, error) {
+	key = encodeKey(key)
 	// Check if key exists but is wrong type
 	keyType, err := o.getKeyType(ctx, q, key)
 	if err != nil {
@@ -1579,6 +1654,7 @@ func (o queryOps) lLen(ctx context.Context, q Querier, key string) (int64, error
 }
 
 func (o queryOps) lRange(ctx context.Context, q Querier, key string, start, stop int64) ([]string, error) {
+	key = encodeKey(key)
 	// Check if key exists but is wrong type
 	keyType, err := o.getKeyType(ctx, q, key)
 	if err != nil {
@@ -1633,6 +1709,7 @@ func (o queryOps) lRange(ctx context.Context, q Querier, key string, start, stop
 }
 
 func (o queryOps) lIndex(ctx context.Context, q Querier, key string, index int64) (string, bool, error) {
+	key = encodeKey(key)
 	// Get total count
 	var total int64
 	if err := q.QueryRow(ctx, "SELECT COUNT(*) FROM kv_lists WHERE key = $1", key).Scan(&total); err != nil {
@@ -1666,6 +1743,7 @@ func (o queryOps) lIndex(ctx context.Context, q Querier, key string, index int64
 // ============== Set Commands ==============
 
 func (o queryOps) sAdd(ctx context.Context, q Querier, key string, members []string) (int64, error) {
+	key = encodeKey(key)
 	if len(members) == 0 {
 		return 0, nil
 	}
@@ -1709,6 +1787,7 @@ func (o queryOps) sAdd(ctx context.Context, q Querier, key string, members []str
 }
 
 func (o queryOps) sRem(ctx context.Context, q Querier, key string, members []string) (int64, error) {
+	key = encodeKey(key)
 	memberBytes := make([][]byte, len(members))
 	for i, m := range members {
 		memberBytes[i] = []byte(m)
@@ -1725,6 +1804,7 @@ func (o queryOps) sRem(ctx context.Context, q Querier, key string, members []str
 }
 
 func (o queryOps) sMembers(ctx context.Context, q Querier, key string) ([]string, error) {
+	key = encodeKey(key)
 	// Check if key exists but is wrong type
 	keyType, err := o.getKeyType(ctx, q, key)
 	if err != nil {
@@ -1755,6 +1835,7 @@ func (o queryOps) sMembers(ctx context.Context, q Querier, key string) ([]string
 }
 
 func (o queryOps) sIsMember(ctx context.Context, q Querier, key, member string) (bool, error) {
+	key = encodeKey(key)
 	var count int64
 	err := q.QueryRow(ctx,
 		`SELECT COUNT(*) FROM kv_sets 
@@ -1765,6 +1846,7 @@ func (o queryOps) sIsMember(ctx context.Context, q Querier, key, member string) 
 }
 
 func (o queryOps) sCard(ctx context.Context, q Querier, key string) (int64, error) {
+	key = encodeKey(key)
 	// Check if key exists but is wrong type
 	keyType, err := o.getKeyType(ctx, q, key)
 	if err != nil {
@@ -1785,6 +1867,7 @@ func (o queryOps) sCard(ctx context.Context, q Querier, key string) (int64, erro
 // ============== Sorted Set Commands ==============
 
 func (o queryOps) zAdd(ctx context.Context, q Querier, key string, members []ZMember) (int64, error) {
+	key = encodeKey(key)
 	keyType, err := o.getKeyType(ctx, q, key)
 	if err != nil {
 		return 0, err
@@ -1815,6 +1898,7 @@ func (o queryOps) zAdd(ctx context.Context, q Querier, key string, members []ZMe
 }
 
 func (o queryOps) zRange(ctx context.Context, q Querier, key string, start, stop int64, withScores bool) ([]ZMember, error) {
+	key = encodeKey(key)
 	// Get total count first to handle negative indices
 	var count int64
 	err := q.QueryRow(ctx,
@@ -1874,6 +1958,7 @@ func (o queryOps) zRange(ctx context.Context, q Querier, key string, start, stop
 }
 
 func (o queryOps) zScore(ctx context.Context, q Querier, key, member string) (float64, bool, error) {
+	key = encodeKey(key)
 	var score float64
 	err := q.QueryRow(ctx,
 		`SELECT score FROM kv_zsets 
@@ -1891,6 +1976,7 @@ func (o queryOps) zScore(ctx context.Context, q Querier, key, member string) (fl
 }
 
 func (o queryOps) zRem(ctx context.Context, q Querier, key string, members []string) (int64, error) {
+	key = encodeKey(key)
 	memberBytes := make([][]byte, len(members))
 	for i, m := range members {
 		memberBytes[i] = []byte(m)
@@ -1907,6 +1993,7 @@ func (o queryOps) zRem(ctx context.Context, q Querier, key string, members []str
 }
 
 func (o queryOps) zCard(ctx context.Context, q Querier, key string) (int64, error) {
+	key = encodeKey(key)
 	var count int64
 	err := q.QueryRow(ctx,
 		"SELECT COUNT(*) FROM kv_zsets WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
@@ -1916,6 +2003,7 @@ func (o queryOps) zCard(ctx context.Context, q Querier, key string) (int64, erro
 }
 
 func (o queryOps) zRangeByScore(ctx context.Context, q Querier, key string, min, max float64, withScores bool, offset, count int64) ([]ZMember, error) {
+	key = encodeKey(key)
 	var query string
 	var args []interface{}
 
@@ -1951,6 +2039,7 @@ func (o queryOps) zRangeByScore(ctx context.Context, q Querier, key string, min,
 }
 
 func (o queryOps) zRemRangeByScore(ctx context.Context, q Querier, key string, min, max float64) (int64, error) {
+	key = encodeKey(key)
 	result, err := q.Exec(ctx,
 		"DELETE FROM kv_zsets WHERE key = $1 AND score >= $2 AND score <= $3",
 		key, min, max,
@@ -1962,6 +2051,7 @@ func (o queryOps) zRemRangeByScore(ctx context.Context, q Querier, key string, m
 }
 
 func (o queryOps) zRemRangeByRank(ctx context.Context, q Querier, key string, start, stop int64) (int64, error) {
+	key = encodeKey(key)
 	// Get total count first to handle negative indices
 	var count int64
 	err := q.QueryRow(ctx,
@@ -2006,6 +2096,7 @@ func (o queryOps) zRemRangeByRank(ctx context.Context, q Querier, key string, st
 }
 
 func (o queryOps) zIncrBy(ctx context.Context, q Querier, key string, increment float64, member string) (float64, error) {
+	key = encodeKey(key)
 	if err := o.lockKey(ctx, q, key); err != nil {
 		return 0, err
 	}
@@ -2029,6 +2120,7 @@ func (o queryOps) zIncrBy(ctx context.Context, q Querier, key string, increment 
 }
 
 func (o queryOps) zPopMin(ctx context.Context, q Querier, key string, count int64) ([]ZMember, error) {
+	key = encodeKey(key)
 	// Get the lowest-scored members
 	rows, err := q.Query(ctx,
 		`SELECT member, score FROM kv_zsets 
@@ -2071,6 +2163,7 @@ func (o queryOps) zPopMin(ctx context.Context, q Querier, key string, count int6
 }
 
 func (o queryOps) lRem(ctx context.Context, q Querier, key string, count int64, element string) (int64, error) {
+	key = encodeKey(key)
 	// count > 0: Remove count elements from head
 	// count < 0: Remove -count elements from tail
 	// count = 0: Remove all elements
@@ -2119,6 +2212,7 @@ func (o queryOps) lRem(ctx context.Context, q Querier, key string, count int64, 
 }
 
 func (o queryOps) rPopLPush(ctx context.Context, q Querier, source, destination string) (string, bool, error) {
+	source, destination = encodeKey(source), encodeKey(destination)
 	if err := o.lockKeys(ctx, q, []string{source, destination}); err != nil {
 		return "", false, err
 	}
@@ -2174,6 +2268,7 @@ func (o queryOps) rPopLPush(ctx context.Context, q Querier, source, destination 
 }
 
 func (o queryOps) lTrim(ctx context.Context, q Querier, key string, start, stop int64) error {
+	key = encodeKey(key)
 	if err := o.lockKey(ctx, q, key); err != nil {
 		return err
 	}
@@ -2232,6 +2327,7 @@ func (o queryOps) lTrim(ctx context.Context, q Querier, key string, start, stop 
 
 // LPos finds the position of an element in a list
 func (o queryOps) lPos(ctx context.Context, q Querier, key, element string, rank, count, maxlen int64) ([]int64, error) {
+	key = encodeKey(key)
 	// Get all elements in order
 	rows, err := q.Query(ctx,
 		`SELECT ROW_NUMBER() OVER (ORDER BY idx) - 1 AS pos, value 
@@ -2281,6 +2377,7 @@ func (o queryOps) lPos(ctx context.Context, q Querier, key, element string, rank
 
 // LSet sets an element at a specific index
 func (o queryOps) lSet(ctx context.Context, q Querier, key string, index int64, element string) error {
+	key = encodeKey(key)
 	// Get total count
 	var total int64
 	if err := q.QueryRow(ctx, "SELECT COUNT(*) FROM kv_lists WHERE key = $1", key).Scan(&total); err != nil {
@@ -2319,6 +2416,7 @@ func (o queryOps) lSet(ctx context.Context, q Querier, key string, index int64, 
 
 // LInsert inserts an element before or after a pivot element
 func (o queryOps) lInsert(ctx context.Context, q Querier, key, pivot, element string, before bool) (int64, error) {
+	key = encodeKey(key)
 	// Find the pivot element
 	var pivotIdx int64
 	err := q.QueryRow(ctx,
@@ -2385,6 +2483,7 @@ func (o queryOps) lInsert(ctx context.Context, q Querier, key, pivot, element st
 // ============== Set Operation Extensions ==============
 
 func (o queryOps) sMIsMember(ctx context.Context, q Querier, key string, members []string) ([]bool, error) {
+	key = encodeKey(key)
 	result := make([]bool, len(members))
 
 	// Build a set of existing members for O(1) lookup
@@ -2413,6 +2512,7 @@ func (o queryOps) sMIsMember(ctx context.Context, q Querier, key string, members
 }
 
 func (o queryOps) sInter(ctx context.Context, q Querier, keys []string) ([]string, error) {
+	keys = encodeKeys(keys)
 	if len(keys) == 0 {
 		return []string{}, nil
 	}
@@ -2457,6 +2557,8 @@ func (o queryOps) sInter(ctx context.Context, q Querier, keys []string) ([]strin
 }
 
 func (o queryOps) sInterStore(ctx context.Context, q Querier, destination string, keys []string) (int64, error) {
+	destination = encodeKey(destination)
+	keys = encodeKeys(keys)
 	members, err := o.sInter(ctx, q, keys)
 	if err != nil {
 		return 0, err
@@ -2476,6 +2578,7 @@ func (o queryOps) sInterStore(ctx context.Context, q Querier, destination string
 }
 
 func (o queryOps) sUnion(ctx context.Context, q Querier, keys []string) ([]string, error) {
+	keys = encodeKeys(keys)
 	if len(keys) == 0 {
 		return []string{}, nil
 	}
@@ -2499,6 +2602,8 @@ func (o queryOps) sUnion(ctx context.Context, q Querier, keys []string) ([]strin
 }
 
 func (o queryOps) sUnionStore(ctx context.Context, q Querier, destination string, keys []string) (int64, error) {
+	destination = encodeKey(destination)
+	keys = encodeKeys(keys)
 	members, err := o.sUnion(ctx, q, keys)
 	if err != nil {
 		return 0, err
@@ -2518,6 +2623,7 @@ func (o queryOps) sUnionStore(ctx context.Context, q Querier, destination string
 }
 
 func (o queryOps) sDiff(ctx context.Context, q Querier, keys []string) ([]string, error) {
+	keys = encodeKeys(keys)
 	if len(keys) == 0 {
 		return []string{}, nil
 	}
@@ -2555,6 +2661,8 @@ func (o queryOps) sDiff(ctx context.Context, q Querier, keys []string) ([]string
 }
 
 func (o queryOps) sDiffStore(ctx context.Context, q Querier, destination string, keys []string) (int64, error) {
+	destination = encodeKey(destination)
+	keys = encodeKeys(keys)
 	members, err := o.sDiff(ctx, q, keys)
 	if err != nil {
 		return 0, err
@@ -2576,6 +2684,7 @@ func (o queryOps) sDiffStore(ctx context.Context, q Querier, destination string,
 // ============== Sorted Set Extensions ==============
 
 func (o queryOps) zPopMax(ctx context.Context, q Querier, key string, count int64) ([]ZMember, error) {
+	key = encodeKey(key)
 	// Get the highest-scored members
 	rows, err := q.Query(ctx,
 		`SELECT member, score FROM kv_zsets 
@@ -2618,6 +2727,7 @@ func (o queryOps) zPopMax(ctx context.Context, q Querier, key string, count int6
 }
 
 func (o queryOps) zRank(ctx context.Context, q Querier, key, member string) (int64, bool, error) {
+	key = encodeKey(key)
 	var rank int64
 	err := q.QueryRow(ctx,
 		`SELECT rank FROM (
@@ -2637,6 +2747,7 @@ func (o queryOps) zRank(ctx context.Context, q Querier, key, member string) (int
 }
 
 func (o queryOps) zRevRank(ctx context.Context, q Querier, key, member string) (int64, bool, error) {
+	key = encodeKey(key)
 	var rank int64
 	err := q.QueryRow(ctx,
 		`SELECT rank FROM (
@@ -2656,6 +2767,7 @@ func (o queryOps) zRevRank(ctx context.Context, q Querier, key, member string) (
 }
 
 func (o queryOps) zCount(ctx context.Context, q Querier, key string, min, max float64) (int64, error) {
+	key = encodeKey(key)
 	var count int64
 	err := q.QueryRow(ctx,
 		`SELECT COUNT(*) FROM kv_zsets 
@@ -2666,6 +2778,7 @@ func (o queryOps) zCount(ctx context.Context, q Querier, key string, min, max fl
 }
 
 func (o queryOps) zScan(ctx context.Context, q Querier, key string, cursor int64, pattern string, count int64) (int64, []ZMember, error) {
+	key = encodeKey(key)
 	// Get all members
 	rows, err := q.Query(ctx,
 		`SELECT member, score FROM kv_zsets 
@@ -2747,6 +2860,8 @@ func matchGlob(pattern, s string) (bool, error) {
 }
 
 func (o queryOps) zUnionStore(ctx context.Context, q Querier, destination string, keys []string, weights []float64, aggregate string) (int64, error) {
+	destination = encodeKey(destination)
+	keys = encodeKeys(keys)
 	if len(weights) == 0 {
 		weights = make([]float64, len(keys))
 		for i := range weights {
@@ -2807,6 +2922,8 @@ func (o queryOps) zUnionStore(ctx context.Context, q Querier, destination string
 }
 
 func (o queryOps) zInterStore(ctx context.Context, q Querier, destination string, keys []string, weights []float64, aggregate string) (int64, error) {
+	destination = encodeKey(destination)
+	keys = encodeKeys(keys)
 	if len(keys) == 0 {
 		return 0, nil
 	}
@@ -2893,6 +3010,7 @@ func (o queryOps) zInterStore(ctx context.Context, q Querier, destination string
 // ============== Key Extensions ==============
 
 func (o queryOps) expireAt(ctx context.Context, q Querier, key string, timestamp time.Time) (bool, error) {
+	key = encodeKey(key)
 	if err := o.lockKey(ctx, q, key); err != nil {
 		return false, err
 	}
@@ -2925,6 +3043,7 @@ func (o queryOps) expireAt(ctx context.Context, q Querier, key string, timestamp
 }
 
 func (o queryOps) copyKey(ctx context.Context, q Querier, source, destination string, replace bool) (bool, error) {
+	source, destination = encodeKey(source), encodeKey(destination)
 	if err := o.lockKeys(ctx, q, []string{source, destination}); err != nil {
 		return false, err
 	}
@@ -3099,6 +3218,7 @@ func (o queryOps) copyKey(ctx context.Context, q Querier, source, destination st
 // ============== Bitmap Commands ==============
 
 func (o queryOps) setBit(ctx context.Context, q Querier, key string, offset int64, value int) (int64, error) {
+	key = encodeKey(key)
 	// Get existing value or create empty
 	var data []byte
 	err := q.QueryRow(ctx,
@@ -3149,6 +3269,7 @@ func (o queryOps) setBit(ctx context.Context, q Querier, key string, offset int6
 }
 
 func (o queryOps) getBit(ctx context.Context, q Querier, key string, offset int64) (int64, error) {
+	key = encodeKey(key)
 	var data []byte
 	err := q.QueryRow(ctx,
 		"SELECT value FROM kv_strings WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
@@ -3171,6 +3292,7 @@ func (o queryOps) getBit(ctx context.Context, q Querier, key string, offset int6
 }
 
 func (o queryOps) bitCount(ctx context.Context, q Querier, key string, start, end int64, useBit bool) (int64, error) {
+	key = encodeKey(key)
 	var data []byte
 	err := q.QueryRow(ctx,
 		"SELECT value FROM kv_strings WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
@@ -3249,6 +3371,8 @@ func (o queryOps) bitCount(ctx context.Context, q Querier, key string, start, en
 }
 
 func (o queryOps) bitOp(ctx context.Context, q Querier, operation, destKey string, keys []string) (int64, error) {
+	destKey = encodeKey(destKey)
+	keys = encodeKeys(keys)
 	if len(keys) == 0 {
 		return 0, nil
 	}
@@ -3341,6 +3465,7 @@ func (o queryOps) bitOp(ctx context.Context, q Querier, operation, destKey strin
 }
 
 func (o queryOps) bitPos(ctx context.Context, q Querier, key string, bit int, start, end int64, useBit bool) (int64, error) {
+	key = encodeKey(key)
 	var data []byte
 	err := q.QueryRow(ctx,
 		"SELECT value FROM kv_strings WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
@@ -3426,6 +3551,7 @@ func (o queryOps) bitPos(ctx context.Context, q Querier, key string, bit int, st
 // ============== HyperLogLog Commands ==============
 
 func (o queryOps) pfAdd(ctx context.Context, q Querier, key string, elements []string) (int64, error) {
+	key = encodeKey(key)
 	// Check key type if exists
 	keyType, err := o.getKeyType(ctx, q, key)
 	if err != nil {
@@ -3481,6 +3607,7 @@ func (o queryOps) pfAdd(ctx context.Context, q Querier, key string, elements []s
 }
 
 func (o queryOps) pfCount(ctx context.Context, q Querier, keys []string) (int64, error) {
+	keys = encodeKeys(keys)
 	if len(keys) == 0 {
 		return 0, nil
 	}
@@ -3524,6 +3651,8 @@ func (o queryOps) pfCount(ctx context.Context, q Querier, keys []string) (int64,
 }
 
 func (o queryOps) pfMerge(ctx context.Context, q Querier, destKey string, sourceKeys []string) error {
+	destKey = encodeKey(destKey)
+	sourceKeys = encodeKeys(sourceKeys)
 	// Check dest key type if exists
 	keyType, err := o.getKeyType(ctx, q, destKey)
 	if err != nil {

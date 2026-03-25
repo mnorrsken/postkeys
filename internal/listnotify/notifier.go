@@ -4,6 +4,7 @@ package listnotify
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log"
@@ -84,9 +85,12 @@ func (n *Notifier) Stop() {
 	}
 }
 
-// NotifyPush sends a notification that items were pushed to a list key
+// NotifyPush sends a notification that items were pushed to a list key.
+// The key is base64-encoded because pg_notify requires valid UTF-8 payloads
+// and Redis keys can contain arbitrary binary data.
 func (n *Notifier) NotifyPush(ctx context.Context, key string) error {
-	_, err := n.pool.Exec(ctx, "SELECT pg_notify($1, $2)", listPushChannel, key)
+	encoded := base64.StdEncoding.EncodeToString([]byte(key))
+	_, err := n.pool.Exec(ctx, "SELECT pg_notify($1, $2)", listPushChannel, encoded)
 	return err
 }
 
@@ -221,7 +225,14 @@ func (n *Notifier) listenLoop() {
 		currentTimeout = minTimeout
 		reconnectBackoff = minReconnectBackoff
 
-		key := notification.Payload
+		// Decode base64-encoded key (binary-safe via pg_notify)
+		var key string
+		if keyBytes, err := base64.StdEncoding.DecodeString(notification.Payload); err == nil {
+			key = string(keyBytes)
+		} else {
+			// Fallback: treat as raw key (backward compat during rolling update)
+			key = notification.Payload
+		}
 		if n.debug {
 			log.Printf("[DEBUG] List push notification for key: %s", key)
 		}

@@ -3,6 +3,7 @@ package cache
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -18,8 +19,9 @@ const cacheInvalidateChannel = "postkeys_cache_invalidate"
 
 // invalidationPayload represents the JSON payload for cache invalidation
 type invalidationPayload struct {
-	Keys  []string `json:"keys,omitempty"`
-	Flush bool     `json:"flush,omitempty"`
+	Keys    []string `json:"keys,omitempty"`
+	Flush   bool     `json:"flush,omitempty"`
+	Encoded bool     `json:"enc,omitempty"` // when true, keys are base64-encoded (binary-safe)
 }
 
 // Invalidator broadcasts cache invalidations across instances using PostgreSQL LISTEN/NOTIFY
@@ -98,7 +100,13 @@ func (inv *Invalidator) InvalidateKeys(ctx context.Context, keys ...string) erro
 		return nil
 	}
 
-	payload := invalidationPayload{Keys: keys}
+	// Base64-encode keys because Redis keys can contain arbitrary binary data
+	// and json.Marshal replaces invalid UTF-8 with U+FFFD.
+	encodedKeys := make([]string, len(keys))
+	for i, k := range keys {
+		encodedKeys[i] = base64.StdEncoding.EncodeToString([]byte(k))
+	}
+	payload := invalidationPayload{Keys: encodedKeys, Encoded: true}
 	jsonBytes, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal invalidation payload: %w", err)
@@ -246,6 +254,11 @@ func (inv *Invalidator) processNotification(payload string) {
 	}
 
 	for _, key := range msg.Keys {
+		if msg.Encoded {
+			if keyBytes, err := base64.StdEncoding.DecodeString(key); err == nil {
+				key = string(keyBytes)
+			}
+		}
 		inv.cache.Delete(key)
 	}
 

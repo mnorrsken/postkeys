@@ -27,6 +27,7 @@ const broadcastChannel = "postkeys_pubsub"
 type broadcastPayload struct {
 	Channel string `json:"c"`
 	Message string `json:"m"`
+	Binary  bool   `json:"b,omitempty"` // when true, c and m are base64-encoded (binary-safe)
 }
 
 // Subscriber represents a client that can receive pub/sub messages
@@ -263,7 +264,13 @@ func (h *Hub) Publish(ctx context.Context, channel, message string) (int64, erro
 	// Wrap channel + message into a JSON payload and send via the broadcast channel.
 	// All postkeys instances LISTEN on this single channel, so every instance
 	// receives every message and can match against both exact and pattern subscriptions.
-	bp := broadcastPayload{Channel: channel, Message: message}
+	// Channel and message are base64-encoded because Redis pub/sub payloads can be
+	// arbitrary binary data, and json.Marshal replaces invalid UTF-8 with U+FFFD.
+	bp := broadcastPayload{
+		Channel: base64.StdEncoding.EncodeToString([]byte(channel)),
+		Message: base64.StdEncoding.EncodeToString([]byte(message)),
+		Binary:  true,
+	}
 	jsonBytes, err := json.Marshal(bp)
 	if err != nil {
 		return 0, fmt.Errorf("failed to encode broadcast payload: %w", err)
@@ -451,15 +458,27 @@ func (h *Hub) listenLoop() {
 			continue
 		}
 
+		// Decode channel and message (base64 when Binary flag is set)
+		channel := bp.Channel
+		message := bp.Message
+		if bp.Binary {
+			if chBytes, err := base64.StdEncoding.DecodeString(bp.Channel); err == nil {
+				channel = string(chBytes)
+			}
+			if msgBytes, err := base64.StdEncoding.DecodeString(bp.Message); err == nil {
+				message = string(msgBytes)
+			}
+		}
+
 		if h.debug {
-			log.Printf("[DEBUG] Received pub/sub broadcast: channel=%s", bp.Channel)
+			log.Printf("[DEBUG] Received pub/sub broadcast: channel=%s", channel)
 		}
 
 		// Deliver to channel subscribers
-		h.deliverToChannel(bp.Channel, bp.Message)
+		h.deliverToChannel(channel, message)
 
 		// Deliver to pattern subscribers
-		h.deliverToPatterns(bp.Channel, bp.Message)
+		h.deliverToPatterns(channel, message)
 	}
 }
 
