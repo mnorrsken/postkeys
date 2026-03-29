@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.21.2] - 2026-03-29
+
+### Fixed
+- **Leader election deadlock during rolling updates**: Helm chart rolling updates would deadlock because the new pod could never acquire the leader lock while the old pod was still running. Added `maxUnavailable: 1` to the deployment strategy when leader election is enabled, and reordered graceful shutdown to release the leader lock before draining connections.
+
 ## [0.21.1] - 2026-03-29
 
 ### Changed
