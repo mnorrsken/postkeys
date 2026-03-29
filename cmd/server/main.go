@@ -161,20 +161,22 @@ func main() {
 	log.Println("Stopping accepting new connections...")
 	cancel() // Cancel the main context to signal all goroutines
 
-	// Stop components in order (reverse of startup)
+	// Stop components in order: release leadership first so a standby can
+	// take over immediately, then drain connections and stop the rest.
 	done := make(chan struct{})
 	go func() {
+		// Release leader lock first — allows the new pod to become ready
+		// before we finish draining.
+		if election != nil {
+			log.Println("Releasing leader lock...")
+			election.Stop()
+		}
+
 		log.Println("Stopping Redis server...")
 		srv.Stop()
 
 		log.Println("Stopping metrics server...")
 		metricsSrv.Stop()
-
-		// Stop leader election if running
-		if election != nil {
-			log.Println("Stopping leader election...")
-			election.Stop()
-		}
 
 		// Stop cache invalidator if running
 		if cacheInvalidator != nil {
