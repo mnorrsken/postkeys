@@ -12,6 +12,7 @@ import (
 	"github.com/mnorrsken/postkeys/internal/cache"
 	"github.com/mnorrsken/postkeys/internal/config"
 	"github.com/mnorrsken/postkeys/internal/handler"
+	"github.com/mnorrsken/postkeys/internal/leader"
 	"github.com/mnorrsken/postkeys/internal/listnotify"
 	"github.com/mnorrsken/postkeys/internal/metrics"
 	"github.com/mnorrsken/postkeys/internal/pubsub"
@@ -79,8 +80,18 @@ func main() {
 		}
 	}
 
+	// Set up leader election if enabled
+	var election *leader.Election
+	readyFn := func() bool { return true }
+	if cfg.LeaderElectionEnabled {
+		election = leader.New(store.Pool())
+		election.Start(ctx)
+		readyFn = election.IsLeader
+		log.Printf("Leader election enabled (LEADER_ELECTION_ENABLED=true)")
+	}
+
 	// Start metrics server
-	metricsSrv := metrics.NewServer(cfg.MetricsAddr, cfg.EnablePprof)
+	metricsSrv := metrics.NewServer(cfg.MetricsAddr, cfg.EnablePprof, readyFn)
 	if err := metricsSrv.Start(); err != nil {
 		log.Fatalf("Failed to start metrics server: %v", err)
 	}
@@ -158,6 +169,12 @@ func main() {
 
 		log.Println("Stopping metrics server...")
 		metricsSrv.Stop()
+
+		// Stop leader election if running
+		if election != nil {
+			log.Println("Stopping leader election...")
+			election.Stop()
+		}
 
 		// Stop cache invalidator if running
 		if cacheInvalidator != nil {

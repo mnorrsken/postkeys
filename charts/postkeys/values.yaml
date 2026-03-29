@@ -87,6 +87,13 @@ sqlTraceLevel: 0
 # WARNING: Higher levels output more commands to logs - use only for debugging
 traceLevel: 0
 
+# Leader election — when enabled, only one instance becomes the leader and reports
+# ready on /ready (HTTP 200). All other instances return HTTP 503 on /ready so
+# Kubernetes routes traffic exclusively to the leader, ensuring full cache coherency.
+# Requires metrics.enabled=true for the /ready endpoint to be reachable.
+leaderElection:
+  enabled: false
+
 # Redis server configuration
 redis:
   # Address to listen on (inside the container)
