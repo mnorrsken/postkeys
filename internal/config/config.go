@@ -58,9 +58,14 @@ type Config struct {
 	EnablePprof bool
 
 	// LeaderElectionEnabled enables PostgreSQL advisory lock based leader election.
-	// When enabled, only the leader instance reports ready on /ready; standbys return 503.
-	// Use this to achieve cache coherency in multi-instance Kubernetes deployments.
+	// The leader labels its own pod via the Kubernetes API so a Service selector
+	// routes traffic exclusively to it, ensuring full cache coherency.
 	LeaderElectionEnabled bool
+
+	// PodName and PodNamespace identify this pod for Kubernetes label patching.
+	// Set via the downward API (fieldRef: metadata.name / metadata.namespace).
+	PodName      string
+	PodNamespace string
 }
 
 // Load loads configuration from environment variables
@@ -91,6 +96,8 @@ func Load() *Config {
 		TraceLevel:                   getEnvInt("TRACE", 0),
 		EnablePprof:                  getEnvBool("ENABLE_PPROF", false),
 		LeaderElectionEnabled:        getEnvBool("LEADER_ELECTION_ENABLED", false),
+		PodName:                      getEnv("POD_NAME", ""),
+		PodNamespace:                 getEnv("POD_NAMESPACE", ""),
 	}
 }
 

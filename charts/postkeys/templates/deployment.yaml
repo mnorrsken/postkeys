@@ -8,13 +8,6 @@ spec:
   {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
   {{- end }}
-  {{- if .Values.leaderElection.enabled }}
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxUnavailable: 1
-      maxSurge: 1
-  {{- end }}
   selector:
     matchLabels:
       {{- include "postkeys.selectorLabels" . | nindent 6 }}
@@ -55,14 +48,8 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
           readinessProbe:
-            {{- if and .Values.leaderElection.enabled .Values.metrics.enabled }}
-            httpGet:
-              path: /ready
-              port: metrics
-            {{- else }}
             tcpSocket:
               port: redis
-            {{- end }}
             initialDelaySeconds: 5
             periodSeconds: 5
             failureThreshold: 2
@@ -174,6 +161,14 @@ spec:
             {{- if .Values.leaderElection.enabled }}
             - name: LEADER_ELECTION_ENABLED
               value: "true"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}

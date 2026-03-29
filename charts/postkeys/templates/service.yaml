@@ -13,3 +13,6 @@ spec:
       name: redis
   selector:
     {{- include "postkeys.selectorLabels" . | nindent 4 }}
+    {{- if .Values.leaderElection.enabled }}
+    postkeys/role: leader
+    {{- end }}

@@ -82,16 +82,14 @@ func main() {
 
 	// Set up leader election if enabled
 	var election *leader.Election
-	readyFn := func() bool { return true }
 	if cfg.LeaderElectionEnabled {
-		election = leader.New(store.Pool())
+		election = leader.New(store.Pool(), cfg.PodName, cfg.PodNamespace)
 		election.Start(ctx)
-		readyFn = election.IsLeader
 		log.Printf("Leader election enabled (LEADER_ELECTION_ENABLED=true)")
 	}
 
 	// Start metrics server
-	metricsSrv := metrics.NewServer(cfg.MetricsAddr, cfg.EnablePprof, readyFn)
+	metricsSrv := metrics.NewServer(cfg.MetricsAddr, cfg.EnablePprof, nil)
 	if err := metricsSrv.Start(); err != nil {
 		log.Fatalf("Failed to start metrics server: %v", err)
 	}

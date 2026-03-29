@@ -1,7 +1,8 @@
 // Package leader provides PostgreSQL-based leader election for multi-instance deployments.
 // Only one instance holds the leader role at a time; all others are standbys.
-// Leadership is signalled via the /ready HTTP endpoint so Kubernetes can route
-// traffic exclusively to the leader.
+// When running in Kubernetes with pod name/namespace configured, the leader labels
+// its own pod with postkeys/role=leader so a Service selector can route traffic
+// exclusively to the leader.
 package leader
 
 import (
@@ -28,6 +29,7 @@ const heartbeatInterval = 30 * time.Second
 type Election struct {
 	pool     *pgxpool.Pool
 	isLeader atomic.Bool
+	labeler  *k8sLabeler
 
 	mu   sync.Mutex
 	conn *pgxpool.Conn // held by the leader to keep the session lock alive
@@ -37,11 +39,25 @@ type Election struct {
 }
 
 // New creates a new Election using the given connection pool.
-func New(pool *pgxpool.Pool) *Election {
-	return &Election{
+// If podName and namespace are non-empty, the election will label the pod
+// via the Kubernetes API when leadership changes.
+func New(pool *pgxpool.Pool, podName, namespace string) *Election {
+	e := &Election{
 		pool:   pool,
 		stopCh: make(chan struct{}),
 	}
+
+	if podName != "" && namespace != "" {
+		labeler, err := newK8sLabeler(podName, namespace)
+		if err != nil {
+			log.Printf("Leader election: pod labeling disabled (%v)", err)
+		} else {
+			e.labeler = labeler
+			log.Printf("Leader election: will label pod %s/%s on leadership changes", namespace, podName)
+		}
+	}
+
+	return e
 }
 
 // Start attempts to acquire the leader lock immediately, then launches a background
@@ -118,6 +134,12 @@ func (e *Election) tryAcquire(ctx context.Context) {
 
 	e.isLeader.Store(true)
 	log.Println("Leader election: became leader")
+
+	if e.labeler != nil {
+		if err := e.labeler.setLeaderLabel(true); err != nil {
+			log.Printf("Leader election: failed to set leader label: %v", err)
+		}
+	}
 }
 
 // heartbeat pings the held connection to keep it alive. If it fails, leadership is lost.
@@ -148,7 +170,13 @@ func (e *Election) release() {
 		return
 	}
 
-	e.isLeader.Store(false)
+	wasLeader := e.isLeader.Swap(false)
+
+	if wasLeader && e.labeler != nil {
+		if err := e.labeler.setLeaderLabel(false); err != nil {
+			log.Printf("Leader election: failed to remove leader label: %v", err)
+		}
+	}
 
 	// Best-effort explicit unlock before releasing the connection back to the pool.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
