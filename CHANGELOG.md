@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.21.1] - 2026-03-29
+
+### Changed
+- **BITFIELD performance optimization**: Skip redundant `kv_meta` upsert for existing keys, reducing SQL round trips from 4 to 2 on the hot path. Read-only BITFIELD calls (GET-only) no longer trigger cache invalidation.
+
 ## [0.21.0] - 2026-03-29
 
 ### Added
