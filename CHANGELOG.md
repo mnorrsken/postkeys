@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.22.0] - 2026-03-29
+
+### Changed
+- **Leader election uses pod labels instead of readiness probes**: The leader now patches its own pod with `postkeys/role=leader` via the Kubernetes API, and the Service selector routes traffic only to the labeled pod. All pods report ready via TCP probe, so Deployments and ArgoCD show healthy status. Replaces the previous approach of returning 503 on `/ready` for standby pods, which caused stuck rollouts and permanent "Progressing" state. Requires `serviceAccount.create=true` (RBAC for pod label patching is created automatically).
+
 ## [0.21.2] - 2026-03-29
 
 ### Fixed
