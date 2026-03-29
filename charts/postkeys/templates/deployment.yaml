@@ -48,10 +48,17 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
           readinessProbe:
+            {{- if and .Values.leaderElection.enabled .Values.metrics.enabled }}
+            httpGet:
+              path: /ready
+              port: metrics
+            {{- else }}
             tcpSocket:
               port: redis
+            {{- end }}
             initialDelaySeconds: 5
-            periodSeconds: 10
+            periodSeconds: 5
+            failureThreshold: 2
           env:
             - name: REDIS_ADDR
               value: {{ .Values.redis.addr | quote }}
@@ -156,6 +163,10 @@ spec:
             {{- if gt (int .Values.traceLevel) 0 }}
             - name: TRACE
               value: {{ .Values.traceLevel | quote }}
+            {{- end }}
+            {{- if .Values.leaderElection.enabled }}
+            - name: LEADER_ELECTION_ENABLED
+              value: "true"
             {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}

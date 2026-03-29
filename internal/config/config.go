@@ -56,6 +56,11 @@ type Config struct {
 
 	// EnablePprof enables /debug/pprof/* endpoints on the metrics server
 	EnablePprof bool
+
+	// LeaderElectionEnabled enables PostgreSQL advisory lock based leader election.
+	// When enabled, only the leader instance reports ready on /ready; standbys return 503.
+	// Use this to achieve cache coherency in multi-instance Kubernetes deployments.
+	LeaderElectionEnabled bool
 }
 
 // Load loads configuration from environment variables
@@ -85,6 +90,7 @@ func Load() *Config {
 		SQLTraceLevel:                getEnvInt("SQLTRACE", 0),
 		TraceLevel:                   getEnvInt("TRACE", 0),
 		EnablePprof:                  getEnvBool("ENABLE_PPROF", false),
+		LeaderElectionEnabled:        getEnvBool("LEADER_ELECTION_ENABLED", false),
 	}
 }
 

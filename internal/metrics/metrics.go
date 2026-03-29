@@ -98,10 +98,21 @@ type Server struct {
 
 // NewServer creates a new metrics server.
 // If enablePprof is true, /debug/pprof/* endpoints are registered.
-func NewServer(addr string, enablePprof bool) *Server {
+// readyFn is called on each /ready request; return true to indicate readiness (HTTP 200),
+// false for not-ready (HTTP 503). Pass nil to always report ready.
+func NewServer(addr string, enablePprof bool, readyFn func() bool) *Server {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
+	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
+		if readyFn != nil && !readyFn() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte("standby"))
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
 	})
