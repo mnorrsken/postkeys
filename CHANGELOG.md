@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.21.0] - 2026-03-29
+
+### Added
+- **Leader election for cache coherency**: When running multiple instances, set `LEADER_ELECTION_ENABLED=true` to elect a single leader via a PostgreSQL session advisory lock. Only the leader returns HTTP 200 on the new `/ready` endpoint; standbys return 503. Kubernetes readiness probes use `/ready` to ensure all traffic is routed to the leader, giving full in-memory cache coherency without distributed invalidation overhead. The standby automatically takes over within ~2 seconds if the leader disconnects. Helm chart: `leaderElection.enabled: true`.
+- **`/ready` HTTP endpoint**: New readiness endpoint on the metrics server (`:9090/ready`). Always returns 200 when leader election is disabled; returns 200/503 based on leader status when enabled. The existing `/health` endpoint is unchanged (always 200, for liveness probes).
+
 ## [0.20.9] - 2026-03-25
 
 ### Fixed

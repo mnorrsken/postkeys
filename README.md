@@ -121,6 +121,7 @@ Environment variables:
 | `SQLTRACE` | SQL query tracing level (0-3, see Tracing section) | `0` |
 | `TRACE` | RESP command tracing level (0-3, see Tracing section) | `0` |
 | `ENABLE_PPROF` | Enable `/debug/pprof/*` endpoints on metrics server | `false` |
+| `LEADER_ELECTION_ENABLED` | Enable PostgreSQL advisory lock based leader election. Only the leader returns HTTP 200 on `/ready`; standbys return 503. Use with Kubernetes readiness probes to route all traffic to a single instance for full cache coherency. | `false` |
 
 ### Database Connection Pool
 
@@ -261,7 +262,8 @@ Prometheus metrics are exposed on a separate HTTP server (default port `:9090`).
 ### Available Endpoints
 
 - `GET /metrics` - Prometheus metrics
-- `GET /health` - Health check endpoint
+- `GET /health` - Liveness check (always 200)
+- `GET /ready` - Readiness check (always 200 unless leader election is enabled, in which case standbys return 503)
 
 ### Metrics Exposed
 
@@ -433,6 +435,12 @@ The following table lists the configurable parameters of the postkeys chart and 
 | `metrics.serviceMonitor.metricRelabelings` | Metric relabel configs | `[]` |
 | `metrics.serviceMonitor.relabelings` | Relabel configs | `[]` |
 | `metrics.serviceMonitor.honorLabels` | Honor labels | `false` |
+
+#### Leader Election
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `leaderElection.enabled` | Enable PostgreSQL advisory lock based leader election. Only the leader reports ready on `/ready`; standbys return 503. Requires `metrics.enabled=true`. Use with multiple replicas to guarantee cache coherency — all traffic routes to a single instance at a time. | `false` |
 
 #### Additional Configuration
 
