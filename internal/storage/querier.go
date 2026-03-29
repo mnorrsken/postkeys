@@ -553,12 +553,14 @@ func (o queryOps) bitField(ctx context.Context, q Querier, key string, ops []Bit
 	key = encodeKey(key)
 	// Get existing value or create empty
 	var value []byte
+	isNewKey := false
 	err := q.QueryRow(ctx,
 		"SELECT value FROM kv_strings WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
 		key,
 	).Scan(&value)
 	if err == pgx.ErrNoRows {
 		value = []byte{}
+		isNewKey = true
 	} else if err != nil {
 		return nil, err
 	}
@@ -634,9 +636,16 @@ func (o queryOps) bitField(ctx context.Context, q Querier, key string, ops []Bit
 	}
 
 	if modified {
-		// Set meta before data table for consistent lock ordering (kv_meta before kv_strings).
-		if err := o.setMeta(ctx, q, key, TypeString, nil); err != nil {
-			return nil, err
+		if isNewKey {
+			// Only upsert meta for new keys; existing keys already have the correct meta row.
+			if err := o.setMeta(ctx, q, key, TypeString, nil); err != nil {
+				return nil, err
+			}
+		} else {
+			// Still need the advisory lock for write serialization on existing keys.
+			if err := o.lockKey(ctx, q, key); err != nil {
+				return nil, err
+			}
 		}
 
 		_, err = q.Exec(ctx,

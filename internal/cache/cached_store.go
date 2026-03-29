@@ -216,8 +216,19 @@ func (s *CachedStore) BitField(ctx context.Context, key string, ops []storage.Bi
 	if err != nil {
 		return nil, err
 	}
-	s.invalidate(ctx, key)
+	if bitFieldHasWrites(ops) {
+		s.invalidate(ctx, key)
+	}
 	return result, nil
+}
+
+func bitFieldHasWrites(ops []storage.BitFieldOp) bool {
+	for _, op := range ops {
+		if op.OpType != "GET" && op.OpType != "OVERFLOW" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *CachedStore) StrLen(ctx context.Context, key string) (int64, error) {
@@ -548,10 +559,17 @@ func (s *CachedStore) FlushDB(ctx context.Context) error {
 
 // ============== Transaction Support ==============
 
-// BeginTx starts a transaction on the underlying backend
-// Note: Transactions bypass the cache and operate directly on the backend
+// BeginTx starts a transaction on the underlying backend wrapped in a CachingTx.
+// The CachingTx records which keys are written; on a successful Commit those keys
+// are invalidated so the in-memory cache does not serve stale data after MULTI/EXEC.
+// Reads inside the transaction always go to PostgreSQL (correct for write-then-read
+// within the same EXEC block).
 func (s *CachedStore) BeginTx(ctx context.Context) (storage.Transaction, error) {
-	return s.backend.BeginTx(ctx)
+	tx, err := s.backend.BeginTx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return newCachingTx(tx, s.invalidateMulti), nil
 }
 
 // ============== Hash Extensions ==============
