@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.22.1] - 2026-03-30
+
+### Fixed
+- **Graceful shutdown during rolling restarts** — Restructured the shutdown sequence to prevent connection errors when pods are restarted. Previously, all client connections were terminated immediately on SIGTERM via context cancellation; now connections are drained with a 10-second read deadline. The shutdown order is: mark not-ready (`/ready` returns 503), close TCP listener, wait for endpoint propagation, release leader lock, drain connections, then clean up. Added a configurable preStop hook (`gracefulShutdown.preStopSleepSeconds`, default 5s) to allow kube-proxy time to remove endpoints before the pod starts refusing connections. Switched the readiness probe from TCP to HTTP `/ready` on the metrics port for faster shutdown detection.
+
 ## [0.22.0] - 2026-03-29
 
 ### Changed

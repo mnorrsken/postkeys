@@ -212,10 +212,15 @@ postkeys handles shutdown signals gracefully:
 - A second signal during shutdown forces immediate exit
 
 During graceful shutdown:
-1. Stop accepting new connections
-2. Wait for in-flight requests to complete (up to 30 seconds)
-3. Close database connections
-4. Exit cleanly
+1. Mark as not ready (`/ready` returns 503)
+2. Close TCP listener (stops accepting new connections)
+3. Wait for endpoint removal to propagate (2 seconds)
+4. Release leader lock if leader election is enabled (standby takes over)
+5. Drain existing connections with a 10-second read deadline
+6. Stop background goroutines and close database connections
+7. Exit cleanly
+
+In Kubernetes, a preStop hook (`sleep 5` by default) runs before SIGTERM, giving kube-proxy time to remove the pod from Service endpoints before shutdown begins. This prevents traffic from being routed to a pod that is already shutting down.
 
 ## Running
 
@@ -441,6 +446,12 @@ The following table lists the configurable parameters of the postkeys chart and 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `leaderElection.enabled` | Enable PostgreSQL advisory lock based leader election. Only the leader reports ready on `/ready`; standbys return 503. Requires `metrics.enabled=true`. Use with multiple replicas to guarantee cache coherency — all traffic routes to a single instance at a time. | `false` |
+
+#### Graceful Shutdown
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `gracefulShutdown.preStopSleepSeconds` | Seconds to sleep in preStop hook before SIGTERM is processed. Allows kube-proxy time to remove endpoints before the pod starts refusing connections. | `5` |
 
 #### Additional Configuration
 
