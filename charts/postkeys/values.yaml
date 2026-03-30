@@ -68,6 +68,13 @@ tolerations: []
 
 affinity: {}
 
+# Graceful shutdown configuration
+gracefulShutdown:
+  # Seconds to sleep in preStop hook before SIGTERM is processed.
+  # Allows kube-proxy time to remove endpoints before the pod starts
+  # refusing connections. Typical values: 3-5 seconds.
+  preStopSleepSeconds: 5
+
 # Enable debug logging (sets DEBUG=1)
 debug: false
 

@@ -9,6 +9,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -28,6 +29,10 @@ type Server struct {
 	debug      bool
 	traceLevel int // 0=off, 1=important only, 2=most commands, 3=everything
 	pubsub     *pubsub.Hub
+
+	// Connection tracking for graceful drain
+	connsMu sync.Mutex
+	conns   map[net.Conn]struct{}
 }
 
 // New creates a new server
@@ -37,6 +42,7 @@ func New(addr string, h *handler.Handler) *Server {
 		handler: h,
 		quit:    make(chan struct{}),
 		debug:   false,
+		conns:   make(map[net.Conn]struct{}),
 	}
 }
 
@@ -47,6 +53,7 @@ func NewWithDebug(addr string, h *handler.Handler, debug bool) *Server {
 		handler: h,
 		quit:    make(chan struct{}),
 		debug:   debug,
+		conns:   make(map[net.Conn]struct{}),
 	}
 }
 
@@ -58,6 +65,7 @@ func NewWithOptions(addr string, h *handler.Handler, debug bool, traceLevel int)
 		quit:       make(chan struct{}),
 		debug:      debug,
 		traceLevel: traceLevel,
+		conns:      make(map[net.Conn]struct{}),
 	}
 }
 
@@ -97,7 +105,7 @@ func (s *Server) Close() {
 	s.Stop()
 }
 
-// Stop gracefully stops the server
+// Stop immediately stops the server (closes listener, stops pub/sub, waits for handlers).
 func (s *Server) Stop() {
 	close(s.quit)
 	if s.listener != nil {
@@ -106,6 +114,31 @@ func (s *Server) Stop() {
 	if s.pubsub != nil {
 		s.pubsub.Stop()
 	}
+	s.wg.Wait()
+}
+
+// CloseListener closes the TCP listener so no new connections are accepted.
+// Existing connections remain active until drained.
+func (s *Server) CloseListener() {
+	if s.listener != nil {
+		s.listener.Close()
+	}
+}
+
+// DrainConnections sets a read deadline on all active connections, stops
+// the pub/sub hub, and waits for all connection handlers to finish.
+func (s *Server) DrainConnections(timeout time.Duration) {
+	if s.pubsub != nil {
+		s.pubsub.Stop()
+	}
+
+	deadline := time.Now().Add(timeout)
+	s.connsMu.Lock()
+	for c := range s.conns {
+		c.SetReadDeadline(deadline) //nolint:errcheck
+	}
+	s.connsMu.Unlock()
+
 	s.wg.Wait()
 }
 
@@ -134,6 +167,16 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 	defer metrics.ActiveConnections.Dec()
 
+	// Track connection for graceful drain
+	s.connsMu.Lock()
+	s.conns[conn] = struct{}{}
+	s.connsMu.Unlock()
+	defer func() {
+		s.connsMu.Lock()
+		delete(s.conns, conn)
+		s.connsMu.Unlock()
+	}()
+
 	reader := resp.NewReaderWithDebug(conn, s.debug)
 	writer := resp.NewWriter(conn)
 
@@ -155,18 +198,15 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 	authenticated := !s.handler.RequiresAuth()
 
 	for {
-		select {
-		case <-s.quit:
-			return
-		case <-ctx.Done():
-			return
-		default:
-		}
 
 		// Read command
 		cmd, err := reader.Read()
 		if err != nil {
 			if err == io.EOF {
+				return
+			}
+			// During graceful shutdown, read deadline timeouts are expected
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				return
 			}
 			if s.debug {

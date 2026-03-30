@@ -24,6 +24,7 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      terminationGracePeriodSeconds: {{ add (int (.Values.gracefulShutdown.preStopSleepSeconds | default 5)) 25 }}
       serviceAccountName: {{ include "postkeys.serviceAccountName" . }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
@@ -37,22 +38,28 @@ spec:
             - name: redis
               containerPort: 6379
               protocol: TCP
-            {{- if .Values.metrics.enabled }}
             - name: metrics
               containerPort: 9090
               protocol: TCP
-            {{- end }}
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - sleep {{ .Values.gracefulShutdown.preStopSleepSeconds | default 5 }}
           livenessProbe:
             tcpSocket:
               port: redis
             initialDelaySeconds: 5
             periodSeconds: 10
           readinessProbe:
-            tcpSocket:
-              port: redis
+            httpGet:
+              path: /ready
+              port: metrics
             initialDelaySeconds: 5
-            periodSeconds: 5
-            failureThreshold: 2
+            periodSeconds: 2
+            failureThreshold: 1
           env:
             - name: REDIS_ADDR
               value: {{ .Values.redis.addr | quote }}

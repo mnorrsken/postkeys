@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -88,8 +89,11 @@ func main() {
 		log.Printf("Leader election enabled (LEADER_ELECTION_ENABLED=true)")
 	}
 
-	// Start metrics server
-	metricsSrv := metrics.NewServer(cfg.MetricsAddr, cfg.EnablePprof, nil)
+	// Start metrics server with readiness callback for graceful shutdown
+	var shuttingDown atomic.Bool
+	metricsSrv := metrics.NewServer(cfg.MetricsAddr, cfg.EnablePprof, func() bool {
+		return !shuttingDown.Load()
+	})
 	if err := metricsSrv.Start(); err != nil {
 		log.Fatalf("Failed to start metrics server: %v", err)
 	}
@@ -155,23 +159,39 @@ func main() {
 		os.Exit(1)
 	}()
 
-	// Graceful shutdown sequence
-	log.Println("Stopping accepting new connections...")
-	cancel() // Cancel the main context to signal all goroutines
-
-	// Stop components in order: release leadership first so a standby can
-	// take over immediately, then drain connections and stop the rest.
+	// Graceful shutdown sequence:
+	// 1. Mark not-ready so /ready returns 503
+	// 2. Close listener so TCP readiness probe fails and no new connections are accepted
+	// 3. Brief pause for kube-proxy endpoint removal propagation
+	// 4. Release leader lock so a standby can take over
+	// 5. Drain existing connections with a read deadline
+	// 6. Cancel context and stop remaining components
 	done := make(chan struct{})
 	go func() {
-		// Release leader lock first — allows the new pod to become ready
-		// before we finish draining.
+		// Step 1: Mark as not ready
+		log.Println("Marking as not ready...")
+		shuttingDown.Store(true)
+
+		// Step 2: Close TCP listener
+		log.Println("Closing TCP listener...")
+		srv.CloseListener()
+
+		// Step 3: Wait for endpoint removal to propagate through kube-proxy
+		log.Println("Waiting for endpoint removal to propagate...")
+		time.Sleep(2 * time.Second)
+
+		// Step 4: Release leader lock (standby can now acquire and get labeled)
 		if election != nil {
 			log.Println("Releasing leader lock...")
 			election.Stop()
 		}
 
-		log.Println("Stopping Redis server...")
-		srv.Stop()
+		// Step 5: Drain existing connections (10s deadline for idle connections)
+		log.Println("Draining connections...")
+		srv.DrainConnections(10 * time.Second)
+
+		// Step 6: Cancel context for background goroutines (list notifier, etc.)
+		cancel()
 
 		log.Println("Stopping metrics server...")
 		metricsSrv.Stop()
