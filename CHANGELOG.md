@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.23.0] - 2026-04-12
+
+### Changed
+- **Leader election backed by Kubernetes Lease** — replaces the PostgreSQL session-scoped advisory lock. Leadership is now unaffected by CNPG failovers, eliminating the Service-endpoint gap that could briefly drop traffic when the database primary switched over while leader-label routing was in use. The leader maintains a `coordination.k8s.io/v1` Lease named `postkeys-leader` (15s duration, 10s renew grace window, 2s retry period); standbys take over within a few seconds if the leader fails to renew. The Helm chart automatically adds the required RBAC on `coordination.k8s.io/leases` when `leaderElection.enabled=true`. No configuration changes required — existing deployments pick up the new mechanism on upgrade.
+
 ## [0.22.1] - 2026-03-30
 
 ### Fixed

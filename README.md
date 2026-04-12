@@ -121,7 +121,7 @@ Environment variables:
 | `SQLTRACE` | SQL query tracing level (0-3, see Tracing section) | `0` |
 | `TRACE` | RESP command tracing level (0-3, see Tracing section) | `0` |
 | `ENABLE_PPROF` | Enable `/debug/pprof/*` endpoints on metrics server | `false` |
-| `LEADER_ELECTION_ENABLED` | Enable PostgreSQL advisory lock based leader election. Only the leader returns HTTP 200 on `/ready`; standbys return 503. Use with Kubernetes readiness probes to route all traffic to a single instance for full cache coherency. | `false` |
+| `LEADER_ELECTION_ENABLED` | Enable Kubernetes Lease based leader election. The leader labels its own pod with `postkeys/role=leader` so the Service selector routes traffic exclusively to it, giving full cache coherency without distributed invalidation. Requires pod name/namespace env vars and RBAC on `coordination.k8s.io/leases` (added automatically by the Helm chart). | `false` |
 
 ### Database Connection Pool
 
@@ -268,7 +268,7 @@ Prometheus metrics are exposed on a separate HTTP server (default port `:9090`).
 
 - `GET /metrics` - Prometheus metrics
 - `GET /health` - Liveness check (always 200)
-- `GET /ready` - Readiness check (always 200 unless leader election is enabled, in which case standbys return 503)
+- `GET /ready` - Readiness check (returns 200; returns 503 only during graceful shutdown)
 
 ### Metrics Exposed
 
@@ -445,7 +445,7 @@ The following table lists the configurable parameters of the postkeys chart and 
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `leaderElection.enabled` | Enable PostgreSQL advisory lock based leader election. Only the leader reports ready on `/ready`; standbys return 503. Requires `metrics.enabled=true`. Use with multiple replicas to guarantee cache coherency — all traffic routes to a single instance at a time. | `false` |
+| `leaderElection.enabled` | Enable Kubernetes Lease based leader election. The leader patches its own pod with `postkeys/role=leader`; the Service selector routes traffic exclusively to that pod, guaranteeing cache coherency with multiple replicas. Automatically creates the required RBAC on pods and `coordination.k8s.io/leases`. | `false` |
 
 #### Graceful Shutdown
 
