@@ -84,9 +84,14 @@ func main() {
 	// Set up leader election if enabled
 	var election *leader.Election
 	if cfg.LeaderElectionEnabled {
-		election = leader.New(store.Pool(), cfg.PodName, cfg.PodNamespace)
-		election.Start(ctx)
-		log.Printf("Leader election enabled (LEADER_ELECTION_ENABLED=true)")
+		el, err := leader.New(cfg.PodName, cfg.PodNamespace)
+		if err != nil {
+			log.Printf("Leader election disabled (initialization failed: %v)", err)
+		} else {
+			election = el
+			election.Start(ctx)
+			log.Printf("Leader election enabled (LEADER_ELECTION_ENABLED=true)")
+		}
 	}
 
 	// Start metrics server with readiness callback for graceful shutdown
