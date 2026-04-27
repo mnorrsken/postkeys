@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.23.1] - 2026-04-27
+
+### Fixed
+- **List notifier panic on subscriber cleanup race** — `WaitForKeys` closed its receive channel in a defer when a waiter timed out or was cancelled, but the listener goroutine could already be holding a snapshot of that channel taken under read-lock and about to send on it, producing `panic: send on closed channel` and crashing the process. The receive channel is now never closed (it is only ever read by the registering goroutine and is reclaimed by GC once unreferenced), and the listener now copies the subscriber slice under the read-lock to avoid an additional latent data race with cleanup mutating the backing array via append-shift. Added unit tests with `-race` coverage for the dispatch race, happy-path delivery, and timeout cleanup.
+
 ## [0.23.0] - 2026-04-12
 
 ### Changed
