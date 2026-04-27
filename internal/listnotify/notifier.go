@@ -107,7 +107,10 @@ func (n *Notifier) WaitForKeys(ctx context.Context, keys []string, timeout time.
 		return ""
 	}
 
-	// Single channel to receive notifications from any key
+	// Single channel to receive notifications from any key.
+	// Intentionally never closed: listenLoop may hold a snapshotted reference
+	// after we deregister, and sending on a closed channel would panic even
+	// with select+default. GC reclaims it once listenLoop drops the reference.
 	ch := make(chan string, 1)
 
 	// Register the subscriber for all keys
@@ -133,7 +136,6 @@ func (n *Notifier) WaitForKeys(ctx context.Context, keys []string, timeout time.
 			}
 		}
 		n.mu.Unlock()
-		close(ch)
 	}()
 
 	// Wait for notification or timeout
@@ -237,17 +239,23 @@ func (n *Notifier) listenLoop() {
 			log.Printf("[DEBUG] List push notification for key: %s", key)
 		}
 
-		// Notify all subscribers waiting for this key
-		n.mu.RLock()
-		channels := n.subscribers[key]
-		n.mu.RUnlock()
+		n.notifySubscribers(key)
+	}
+}
 
-		for _, ch := range channels {
-			select {
-			case ch <- key:
-			default:
-				// Channel full or closed, skip
-			}
+// notifySubscribers delivers a key notification to every registered subscriber.
+// Sends are non-blocking: a full buffer is treated as "subscriber already woken."
+// The subscriber slice is copied under the lock because WaitForKeys cleanup
+// mutates the backing array via append-shift on the same slice.
+func (n *Notifier) notifySubscribers(key string) {
+	n.mu.RLock()
+	channels := append([]chan string(nil), n.subscribers[key]...)
+	n.mu.RUnlock()
+
+	for _, ch := range channels {
+		select {
+		case ch <- key:
+		default:
 		}
 	}
 }
