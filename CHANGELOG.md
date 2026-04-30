@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.23.2] - 2026-04-30
+
+### Fixed
+- **Crash-loop on PostgreSQL unavailability at startup** — All four PG-dependent startup steps (`storage.New`, cache invalidator `Start`, list notifier `Start`, pub/sub hub `Start`) previously called `log.Fatalf` on connection failure, so a pod that booted while the database was briefly unavailable (e.g. during a CNPG primary switchover, where the `-rw` service has no endpoints for ~15-45s) would crash and be restarted by the kubelet, then fail again, looping until the new primary was reachable. Each call site is now wrapped in a `retryStartup` helper that retries forever with exponential backoff (1s → 15s capped). Signal handling is installed at the top of `main` so a SIGTERM during the retry loop cancels the context and exits cleanly. The post-startup wait now selects on either the signal channel or `ctx.Done()` to handle a narrow race where the startup-watcher goroutine consumes the signal at the moment startup completes. The `metrics.NewServer` `log.Fatalf` is unchanged — it only binds a TCP port and retrying does not help.
+- **Accept-loop log spam during graceful shutdown** — `CloseListener` (called as step 2 of the graceful shutdown sequence) closes the TCP listener but does not close the server's `quit` channel, so `Accept` returned with `use of closed network connection`, the `select` in `acceptLoop` fell through to the `default` branch, and the loop spun in a tight loop logging the same error every iteration until the process exited. Between `CloseListener` and the final `cancel()` this could produce over a million log lines per shutdown. The accept loop now detects `net.ErrClosed` directly and exits cleanly — the canonical Go signal that we closed the listener ourselves, avoiding any juggling of `s.quit` (which `Stop` and `CloseListener` treat differently — tests use `Stop`, main uses `CloseListener`).
+
 ## [0.23.1] - 2026-04-27
 
 ### Fixed
