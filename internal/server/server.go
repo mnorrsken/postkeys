@@ -3,6 +3,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -146,6 +147,12 @@ func (s *Server) acceptLoop(ctx context.Context) {
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
+			// Listener closed via Stop or CloseListener — exit cleanly.
+			// Without this check, a CloseListener (which doesn't close s.quit)
+			// would spin the loop logging "use of closed network connection".
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
 			select {
 			case <-s.quit:
 				return
