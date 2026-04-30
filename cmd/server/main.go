@@ -24,30 +24,87 @@ import (
 // shutdownTimeout is the maximum time to wait for graceful shutdown
 const shutdownTimeout = 30 * time.Second
 
+// startupRetryMaxBackoff caps the per-attempt wait when retrying PG-dependent
+// startup steps. Startup retries forever (with this cap) so a pod that boots
+// during a CNPG switchover waits the outage out instead of crash-looping.
+const startupRetryMaxBackoff = 15 * time.Second
+
+// retryStartup repeatedly invokes fn until it succeeds or ctx is cancelled.
+// Used to absorb transient PG unavailability at boot (e.g. a switchover in
+// progress). Backoff doubles from 1s up to startupRetryMaxBackoff.
+func retryStartup(ctx context.Context, name string, fn func(context.Context) error) error {
+	backoff := 1 * time.Second
+	for {
+		err := fn(ctx)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		log.Printf("%s failed (will retry in %v): %v", name, backoff, err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		if backoff > startupRetryMaxBackoff {
+			backoff = startupRetryMaxBackoff
+		}
+	}
+}
+
 func main() {
 	cfg := config.Load()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Set up signal handling early so PG-dependent startup retries can be
+	// interrupted by SIGTERM (e.g. if a pod is killed mid-startup during a
+	// long DB outage). After startup completes, the same channel drives
+	// graceful shutdown below.
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+
+	startupComplete := make(chan struct{})
+	go func() {
+		select {
+		case <-startupComplete:
+			return
+		case sig := <-sigChan:
+			log.Printf("Received signal %v during startup, aborting", sig)
+			cancel()
+		}
+	}()
+
 	// Connect to PostgreSQL
 	log.Printf("Connecting to PostgreSQL at %s:%d...", cfg.PGHost, cfg.PGPort)
-	store, err := storage.New(ctx, storage.Config{
-		Host:              cfg.PGHost,
-		Port:              cfg.PGPort,
-		User:              cfg.PGUser,
-		Password:          cfg.PGPassword,
-		Database:          cfg.PGDatabase,
-		SSLMode:           cfg.PGSSLMode,
-		SQLTraceLevel:     cfg.SQLTraceLevel,
-		MaxConns:          cfg.PGMaxConns,
-		MinConns:          cfg.PGMinConns,
-		MaxConnLifetime:   cfg.PGMaxConnLifetime,
-		MaxConnIdleTime:   cfg.PGMaxConnIdleTime,
-		HealthCheckPeriod: cfg.PGHealthCheckPeriod,
-	})
-	if err != nil {
-		log.Fatalf("Failed to connect to PostgreSQL: %v", err)
+	var store *storage.Store
+	if err := retryStartup(ctx, "PostgreSQL connect", func(ctx context.Context) error {
+		s, err := storage.New(ctx, storage.Config{
+			Host:              cfg.PGHost,
+			Port:              cfg.PGPort,
+			User:              cfg.PGUser,
+			Password:          cfg.PGPassword,
+			Database:          cfg.PGDatabase,
+			SSLMode:           cfg.PGSSLMode,
+			SQLTraceLevel:     cfg.SQLTraceLevel,
+			MaxConns:          cfg.PGMaxConns,
+			MinConns:          cfg.PGMinConns,
+			MaxConnLifetime:   cfg.PGMaxConnLifetime,
+			MaxConnIdleTime:   cfg.PGMaxConnIdleTime,
+			HealthCheckPeriod: cfg.PGHealthCheckPeriod,
+		})
+		if err != nil {
+			return err
+		}
+		store = s
+		return nil
+	}); err != nil {
+		log.Printf("Startup aborted before PostgreSQL connect: %v", err)
+		os.Exit(1)
 	}
 	log.Printf("Connected to PostgreSQL (pool: min=%d, max=%d, lifetime=%v, health_check=%v)",
 		cfg.PGMinConns, cfg.PGMaxConns, cfg.PGMaxConnLifetime, cfg.PGHealthCheckPeriod)
@@ -71,8 +128,9 @@ func main() {
 		if cfg.CacheDistributedInvalidation {
 			cacheInvalidator = cache.NewInvalidator(store.Pool(), store.ConnString(), cachedStore.GetCache())
 			cacheInvalidator.SetDebug(cfg.Debug)
-			if err := cacheInvalidator.Start(ctx); err != nil {
-				log.Fatalf("Failed to start cache invalidator: %v", err)
+			if err := retryStartup(ctx, "cache invalidator", cacheInvalidator.Start); err != nil {
+				log.Printf("Startup aborted before cache invalidator: %v", err)
+				os.Exit(1)
 			}
 			cachedStore.SetInvalidator(cacheInvalidator)
 			log.Printf("In-memory cache enabled with distributed invalidation (TTL: %v, MaxSize: %d)", cfg.CacheTTL, cfg.CacheMaxSize)
@@ -110,8 +168,9 @@ func main() {
 	// Initialize list notifier for BRPOP/BLPOP
 	listNotifier := listnotify.New(store.Pool(), store.ConnString())
 	listNotifier.SetDebug(cfg.Debug)
-	if err := listNotifier.Start(ctx); err != nil {
-		log.Fatalf("Failed to start list notifier: %v", err)
+	if err := retryStartup(ctx, "list notifier", listNotifier.Start); err != nil {
+		log.Printf("Startup aborted before list notifier: %v", err)
+		os.Exit(1)
 	}
 	h.SetListNotifier(listNotifier)
 	log.Println("List notification support enabled (BRPOP/BLPOP)")
@@ -121,8 +180,9 @@ func main() {
 
 	// Initialize pub/sub hub
 	hub := pubsub.NewHub(store.Pool(), store.ConnString())
-	if err := hub.Start(ctx); err != nil {
-		log.Fatalf("Failed to start pub/sub hub: %v", err)
+	if err := retryStartup(ctx, "pub/sub hub", hub.Start); err != nil {
+		log.Printf("Startup aborted before pub/sub hub: %v", err)
+		os.Exit(1)
 	}
 	srv.SetPubSubHub(hub)
 	log.Println("Pub/sub support enabled")
@@ -145,13 +205,20 @@ func main() {
 	}
 	log.Printf("postkeys is ready to accept connections on %s", cfg.RedisAddr)
 
-	// Set up signal handling for graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	// Startup is done. Release the startup-watcher goroutine so the main flow
+	// owns sigChan from here on. The watcher's select races with this close,
+	// so a signal arriving right now may still be consumed by the watcher
+	// (which cancels ctx) — the wait below covers both cases.
+	close(startupComplete)
 
-	// Wait for first shutdown signal
-	sig := <-sigChan
-	log.Printf("Received signal %v, initiating graceful shutdown...", sig)
+	// Wait for shutdown: either a signal arrives on sigChan, or ctx was
+	// cancelled (the startup-watcher consumed the signal during the close race).
+	select {
+	case sig := <-sigChan:
+		log.Printf("Received signal %v, initiating graceful shutdown...", sig)
+	case <-ctx.Done():
+		log.Println("Shutdown signal received, initiating graceful shutdown...")
+	}
 
 	// Create shutdown context with timeout
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
