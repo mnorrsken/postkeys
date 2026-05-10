@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.23.3] - 2026-05-11
+
+### Fixed
+- **Nil pointer panic in listener reconnect path** — `reconnect()` in the list notifier, pub/sub hub, and cache invalidator each set `listenerConn = nil` before calling `pgx.Connect`. If the database was still unreachable (e.g. mid-CNPG failover where the connection had just been reset and the new primary was not yet accepting connections), `Connect` returned an error, the function returned `false`, and `listenerConn` stayed nil. The loop slept for backoff and then `continue`d straight back into `listenerConn.WaitForNotification(...)`, dereferencing the nil receiver and crashing the pod with SIGSEGV. The reconnect step now lives at the top of each `listenLoop` and is gated on `listenerConn == nil`; the error path just closes the conn, nils it, and continues, so failed reconnects retry with backoff instead of crashing.
+
 ## [0.23.2] - 2026-04-30
 
 ### Fixed
