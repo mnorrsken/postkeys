@@ -162,6 +162,26 @@ func (inv *Invalidator) listenLoop() {
 		default:
 		}
 
+		// If the listener has no connection (initial start failure or a prior
+		// failed reconnect), establish one before waiting. WaitForNotification
+		// would NPE on a nil receiver.
+		if inv.listenerConn == nil {
+			if inv.reconnect() {
+				backoff = minBackoff
+			} else {
+				select {
+				case <-time.After(backoff):
+				case <-inv.ctx.Done():
+					return
+				}
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+			}
+			continue
+		}
+
 		// Wait for notification with a timeout for graceful shutdown
 		ctx, cancel := context.WithTimeout(inv.ctx, 5*time.Second)
 		notification, err := inv.listenerConn.WaitForNotification(ctx)
@@ -174,20 +194,9 @@ func (inv *Invalidator) listenLoop() {
 			// Check if this is a connection error (not just timeout)
 			if !isTimeoutError(err) {
 				log.Printf("Cache invalidator listener error (will reconnect): %v", err)
-				if inv.reconnect() {
-					backoff = minBackoff // Reset backoff on successful reconnect
-				} else {
-					// Exponential backoff on failed reconnect
-					select {
-					case <-time.After(backoff):
-					case <-inv.ctx.Done():
-						return
-					}
-					backoff *= 2
-					if backoff > maxBackoff {
-						backoff = maxBackoff
-					}
-				}
+				// Drop the connection; the top of the loop will reconnect.
+				inv.listenerConn.Close(context.Background())
+				inv.listenerConn = nil
 			}
 			continue
 		}

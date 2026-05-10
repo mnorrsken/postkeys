@@ -398,6 +398,27 @@ func (h *Hub) listenLoop() {
 		default:
 		}
 
+		// If the listener has no connection (initial start failure or a prior
+		// failed reconnect), establish one before waiting. WaitForNotification
+		// would NPE on a nil receiver.
+		if h.listenerConn == nil {
+			if h.reconnect() {
+				reconnectBackoff = minReconnectBackoff
+				currentTimeout = minTimeout
+			} else {
+				select {
+				case <-time.After(reconnectBackoff):
+				case <-h.ctx.Done():
+					return
+				}
+				reconnectBackoff *= 2
+				if reconnectBackoff > maxReconnectBackoff {
+					reconnectBackoff = maxReconnectBackoff
+				}
+			}
+			continue
+		}
+
 		// Wait for notification with exponential backoff
 		ctx, cancel := context.WithTimeout(h.ctx, currentTimeout)
 		notification, err := h.listenerConn.WaitForNotification(ctx)
@@ -410,21 +431,9 @@ func (h *Hub) listenLoop() {
 			// Check if this is a connection error (not just timeout)
 			if !isTimeoutError(err) {
 				log.Printf("Pub/sub listener error (will reconnect): %v", err)
-				if h.reconnect() {
-					reconnectBackoff = minReconnectBackoff // Reset backoff on successful reconnect
-					currentTimeout = minTimeout
-				} else {
-					// Exponential backoff on failed reconnect
-					select {
-					case <-time.After(reconnectBackoff):
-					case <-h.ctx.Done():
-						return
-					}
-					reconnectBackoff *= 2
-					if reconnectBackoff > maxReconnectBackoff {
-						reconnectBackoff = maxReconnectBackoff
-					}
-				}
+				// Drop the connection; the top of the loop will reconnect.
+				h.listenerConn.Close(context.Background())
+				h.listenerConn = nil
 				continue
 			}
 			// Timeout - increase backoff (up to max)
