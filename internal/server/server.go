@@ -106,7 +106,9 @@ func (s *Server) Close() {
 	s.Stop()
 }
 
-// Stop immediately stops the server (closes listener, stops pub/sub, waits for handlers).
+// Stop immediately stops the server (closes listener, stops pub/sub, force-closes
+// active client connections, waits for handlers). Use DrainConnections for graceful
+// shutdown that lets in-flight commands complete.
 func (s *Server) Stop() {
 	close(s.quit)
 	if s.listener != nil {
@@ -115,6 +117,14 @@ func (s *Server) Stop() {
 	if s.pubsub != nil {
 		s.pubsub.Stop()
 	}
+	// Force-close active client connections so handler goroutines blocked in
+	// Read return promptly. Without this, a client that holds a connection
+	// open (or a client-library bug that leaks one) would make Stop hang.
+	s.connsMu.Lock()
+	for c := range s.conns {
+		c.Close() //nolint:errcheck
+	}
+	s.connsMu.Unlock()
 	s.wg.Wait()
 }
 
@@ -185,11 +195,10 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 	}()
 
 	reader := resp.NewReaderWithDebug(conn, s.debug)
-	writer := resp.NewWriter(conn)
 
 	// Create client state for this connection
 	client := NewClientState(conn, s.debug)
-	client.SetWriter(writer)
+	client.SetWriter(resp.NewWriter(conn))
 
 	// Clean up subscriptions when connection closes
 	defer func() {
@@ -364,33 +373,21 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 			s.traceResponse(conn, cmd, response)
 		}
 
-		// Write response(s) - pub/sub commands may have multiple responses
+		// Write response(s) under the client's writer lock so command responses
+		// cannot interleave with pub/sub messages delivered from the hub goroutine.
+		// Pub/sub commands may produce multiple responses (e.g. SUBSCRIBE returns
+		// one ack per channel) — write them as one atomic batch.
+		var writeErr error
 		if len(multiResponse) > 0 {
-			for _, r := range multiResponse {
-				if err := writer.WriteValue(r); err != nil {
-					if s.debug {
-						log.Printf("[DEBUG] Write error to %s: %v", conn.RemoteAddr(), err)
-					} else {
-						log.Printf("Write error: %v", err)
-					}
-					return
-				}
-			}
+			writeErr = client.WriteResponses(multiResponse...)
 		} else {
-			if err := writer.WriteValue(response); err != nil {
-				if s.debug {
-					log.Printf("[DEBUG] Write error to %s: %v", conn.RemoteAddr(), err)
-				} else {
-					log.Printf("Write error: %v", err)
-				}
-				return
-			}
+			writeErr = client.WriteResponses(response)
 		}
-		if err := writer.Flush(); err != nil {
+		if writeErr != nil {
 			if s.debug {
-				log.Printf("[DEBUG] Flush error to %s: %v", conn.RemoteAddr(), err)
+				log.Printf("[DEBUG] Write error to %s: %v", conn.RemoteAddr(), writeErr)
 			} else {
-				log.Printf("Flush error: %v", err)
+				log.Printf("Write error: %v", writeErr)
 			}
 			return
 		}

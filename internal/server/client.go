@@ -211,6 +211,25 @@ func (c *ClientState) InPubSubMode() bool {
 	return c.inPubSubMode
 }
 
+// WriteResponses writes one or more RESP values to the client and flushes,
+// holding the writer lock so command responses cannot interleave with pub/sub
+// messages delivered from the hub goroutine.
+func (c *ClientState) WriteResponses(values ...resp.Value) error {
+	c.writerMu.Lock()
+	defer c.writerMu.Unlock()
+
+	if c.writer == nil {
+		return fmt.Errorf("no writer set for client")
+	}
+
+	for _, v := range values {
+		if err := c.writer.WriteValue(v); err != nil {
+			return err
+		}
+	}
+	return c.writer.Flush()
+}
+
 // SendPubSubMessage sends a pub/sub message to the client
 // This implements the pubsub.Subscriber interface
 func (c *ClientState) SendPubSubMessage(msgType, channel, payload string) error {
