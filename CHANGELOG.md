@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.23.4] - 2026-05-11
+
+### Fixed
+- **`Server.Stop()` hangs when a client leaks a connection** — `Stop` closed the listener and then called `wg.Wait()` on the handler-goroutine WaitGroup, but did not close the already-accepted TCP connections. Any client that held a connection open (or any client-library bug that leaked one) made `Stop` block forever. This surfaced after the dependabot bump to `go-redis/v9 v9.19.0`, which leaks the underlying TCP connection on the failed-AUTH path even when `client.Close()` is called: the integration test `TestAuthWrongPassword` then hung indefinitely on its `defer ts.Close()`. `Stop` now iterates the connection map already maintained for graceful drain and force-closes every entry, which causes the blocked `Read` in each handler goroutine to return so `wg.Wait()` can complete. Graceful shutdown (`CloseListener` + `DrainConnections`) is unchanged and still the production path; this only hardens the "immediately stops" path that `Stop` already promised in its comment.
+- **Pub/sub writer data race** — `handleConnection` wrote command responses directly to the per-connection `bufio.Writer` without holding `ClientState.writerMu`, while `ClientState.SendPubSubMessage` (invoked from the pub/sub hub's listener goroutine on every broadcast) wrote pub/sub frames to the same writer while holding that mutex. With one goroutine writing under the lock and the other ignoring it, `bufio.(*Writer).WriteString` and `Flush` could race, producing the `WARNING: DATA RACE` reports that started failing CI once `-race` was added. Worse than the race report itself: nothing prevented a command response and a pub/sub message from interleaving on the wire, so a subscribed client could see corrupted RESP frames. Introduced `ClientState.WriteResponses(values ...resp.Value)` which acquires `writerMu`, writes every value, and flushes as one atomic batch under the lock. `handleConnection` now routes all response writes through it (both the single-response and the multi-response pub/sub paths), and the local `writer` variable is gone because the writer is owned by the client state.
+
 ## [0.23.3] - 2026-05-11
 
 ### Fixed
