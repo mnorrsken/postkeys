@@ -442,6 +442,40 @@ The following table lists the configurable parameters of the postkeys chart and 
 | `metrics.serviceMonitor.relabelings` | Relabel configs | `[]` |
 | `metrics.serviceMonitor.honorLabels` | Honor labels | `false` |
 
+#### Grafana Dashboard
+
+Renders a ConfigMap containing [`dashboards/postkeys.json`](charts/postkeys/dashboards/postkeys.json) that the Grafana dashboard sidecar (e.g. [kiwigrid/k8s-sidecar](https://github.com/kiwigrid/k8s-sidecar), used by the [Grafana Helm chart](https://github.com/grafana/helm-charts/tree/main/charts/grafana)) discovers via label selector and imports automatically.
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `grafana.dashboard.enabled` | Render the dashboard ConfigMap | `false` |
+| `grafana.dashboard.namespace` | Namespace to render into (defaults to the release namespace) | `""` |
+| `grafana.dashboard.labelKey` | Label the sidecar watches for | `grafana_dashboard` |
+| `grafana.dashboard.labelValue` | Value of the discovery label | `"1"` |
+| `grafana.dashboard.folderAnnotation` | Annotation the sidecar reads to place the dashboard in a folder | `grafana_folder` |
+| `grafana.dashboard.folder` | Grafana folder to place the dashboard in (empty = root) | `""` |
+| `grafana.dashboard.extraLabels` | Additional labels on the ConfigMap | `{}` |
+| `grafana.dashboard.extraAnnotations` | Additional annotations on the ConfigMap | `{}` |
+
+#### Prometheus Alerting Rules
+
+Renders a `PrometheusRule` CRD (requires `prometheus-operator`). All alerts are off by default until both the top-level switch and the individual rule are enabled. Add `release: prometheus` (or whatever label your operator uses for rule discovery) under `prometheusRule.labels`.
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `prometheusRule.enabled` | Render the `PrometheusRule` CRD | `false` |
+| `prometheusRule.namespace` | Namespace to render into (defaults to release namespace) | `""` |
+| `prometheusRule.labels` | Labels on the `PrometheusRule` resource (e.g. `release: prometheus` for operator rule discovery) | `{}` |
+| `prometheusRule.alertLabels` | Labels applied to every alert in the group | `{ severity: warning }` |
+| `prometheusRule.annotations` | Annotations merged into every alert | `{}` |
+| `prometheusRule.interval` | Rule group evaluation interval (empty = Prometheus default) | `""` |
+| `prometheusRule.rules.podDown.enabled` / `.for` | Alert when Prometheus stops scraping a pod | `true` / `5m` |
+| `prometheusRule.rules.highErrorRate.enabled` / `.threshold` / `.for` | Alert when error-fraction > threshold sustained for `for` | `true` / `0.05` / `10m` |
+| `prometheusRule.rules.highLatencyP99.enabled` / `.threshold` / `.excludeCommands` / `.for` | p99 latency over `threshold` seconds; `excludeCommands` is a regex of commands to ignore (default excludes blocking ops) | `true` / `0.1` / `BRPOP\|BLPOP` / `10m` |
+| `prometheusRule.rules.stuckBlockingCalls.enabled` / `.commands` / `.threshold` / `.for` | Average concurrent blocking calls (seconds-waited per second) above `threshold` — usually means LISTEN/NOTIFY broke and clients hit the poll fallback | `true` / `BRPOP\|BLPOP` / `50` / `15m` |
+| `prometheusRule.rules.lowCacheHitRate.enabled` / `.threshold` / `.minTrafficOps` / `.for` | Cache hit-rate percent dropped below `threshold` on pods with non-trivial cache traffic. Only meaningful when `cache.enabled=true`. | `false` / `50` / `1` / `30m` |
+| `prometheusRule.extraRules` | Free-form list of additional alerts appended to the group | `[]` |
+
 #### Leader Election
 
 | Parameter | Description | Default |

@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.25.0] - 2026-05-14
+
+### Added
+- **Grafana dashboard provisioning via Helm** — the dashboard JSON moved from `grafana/dashboard.json` to `charts/postkeys/dashboards/postkeys.json` (single source of truth, embedded into the chart via `.Files.Get`). A new ConfigMap template renders when `grafana.dashboard.enabled=true` (off by default) and ships labels matching the Grafana sidecar's defaults (`grafana_dashboard: "1"`). Folder, label key/value, and extra labels/annotations are all configurable. Verified the embedded JSON round-trips through Helm templating intact (28 panels, uid preserved) — `{{command}}`/`{{pod}}` legend formats are not consumed by Helm because `.Files.Get` returns the raw file content as a string.
+- **Prometheus alerting rules via `PrometheusRule` CRD** — new template gated on `prometheusRule.enabled` (off by default). Five built-in alerts, each individually toggleable with tunable thresholds and `for` durations: `PostkeysPodDown` (scrape stopped 5m), `PostkeysHighErrorRate` (>5% errors 10m), `PostkeysHighP99Latency` (>100ms p99 10m, excludes `BRPOP|BLPOP`), `PostkeysBlockingCallsAccumulating` (>50 concurrent blocking calls 15m — catches LISTEN/NOTIFY breakage where clients hit the poll fallback), and `PostkeysLowCacheHitRate` (off by default, only meaningful with `cache.enabled=true`). `prometheusRule.alertLabels` applies labels to every alert in the group (default `severity: warning`); per-rule `labels:` overrides for individual promotion (e.g. `severity: critical` on `PostkeysPodDown`). `prometheusRule.extraRules` is a free-form list appended to the group for additional alerts without forking the chart.
+
+### Changed
+- **Dashboard JSON location** — was `grafana/dashboard.json`, now `charts/postkeys/dashboards/postkeys.json`. The `grafana/` directory has been removed. Standalone consumers (e.g. importing the JSON manually into Grafana without the chart) should update their path; the file content is unchanged.
+
 ## [0.24.0] - 2026-05-14
 
 ### Added
