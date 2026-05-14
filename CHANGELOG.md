@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.26.0] - 2026-05-14
+
+### Added
+Curated set of Redis 7.x commands that drop in cleanly on top of existing primitives (per the 1.0 plan, Workstream A — subset+quick-wins scope):
+
+- **`EXPIRE` / `PEXPIRE` / `EXPIREAT` / `PEXPIREAT` NX/XX/GT/LT flags** (Redis 7.0) — `NX` only when no TTL is set, `XX` only when one is, `GT`/`LT` only when the new expiration is greater/less than the current (a key with no TTL is treated as infinity, so `GT` never wins against it and `LT` always does). Mutually exclusive combinations are rejected at parse time.
+- **`RANDOMKEY`** — returns a random non-expired key, or nil when the keyspace is empty.
+- **`SINTERCARD numkeys key [key ...] [LIMIT n]`** (Redis 7.0) — cardinality of the intersection, with optional cap.
+- **`ZREVRANGE` / `ZREVRANGEBYSCORE`** — descending variants mirroring `ZRANGE` / `ZRANGEBYSCORE` with `ORDER BY ... DESC` in the storage layer (the ZRANGE `REV` flag was previously emulated by reversing the result in the handler — these are first-class).
+- **`ZRANGEBYLEX` / `ZREVRANGEBYLEX` / `ZLEXCOUNT`** — bytea-lex comparisons via a `LexBound` type (`-`, `+`, `[member`, `(member` parse paths supported).
+- **`ZRANGESTORE dst src min max [BYSCORE | BYLEX] [REV] [LIMIT offset count]`** (Redis 6.2) — copies the result of a ZRANGE-style query into dst in a single transaction. INDEX, BYSCORE, and BYLEX modes all use one SQL with a CTE wrapping the source SELECT, an INSERT … RETURNING for the count, and `setMeta` for the destination type.
+- **`HRANDFIELD` / `SRANDMEMBER` (with COUNT) / `ZRANDMEMBER`** — distinct sampling via `ORDER BY random() LIMIT n` on the positive-count path; negative count fetches the full collection and bootstraps with replacement in Go.
+- **`OBJECT ENCODING`** — returns synthetic encoding names per type (`raw` / `listpack` / `quicklist` / `skiplist`). Cosmetic — we only store one canonical representation per type — but keeps Redis admin tooling happy. `OBJECT FREQ` / `IDLETIME` / `REFCOUNT` return the canonical "policy not selected" error.
+- **`RESET`** (Redis 6.2) — discards a pending `MULTI`, drops all pub/sub subscriptions for the connection, reverts to RESP2, clears the client name, and (if auth is required) de-authenticates the connection. Replies `+RESET`.
+- **`LMPOP` / `BLMPOP` / `ZMPOP` / `BZMPOP`** (Redis 7.0) — pop up to `count` elements from the first non-empty key (in caller order) in a single SQL round-trip. Generalizes the `popMulti` CTE (`array_position` for precedence + `FOR UPDATE SKIP LOCKED`) to N-at-a-time. The blocking variants share a `blockingMPop` helper that mirrors the existing `blockingPop` loop and respects `BLOCKING_POLL_INTERVAL`. `BLMPOP` benefits from the list LISTEN/NOTIFY path; `BZMPOP` always uses the poll fallback since there's no zset notifier.
+
+### Changed
+- **`storage.Operations` interface** gained: `RandomKey`, `SInterCard`, `ZRevRange`, `ZRevRangeByScore`, `ZRangeByLex`, `ZRevRangeByLex`, `ZLexCount`, `ZRangeStore`, `HRandField`, `SRandMember`, `ZRandMember`, `LMPop`, `RMPop`, `ZMPopMin`, `ZMPopMax`. **`Expire` / `ExpireAt` signatures changed** to take an `ExpireOptions` value (NX/XX/GT/LT). Downstream stores (`Store`, `TxStore`, `CachedStore`, `CachingTx`) were updated.
+- **`Querier` is unchanged**; the new commands all use the existing `Exec`/`Query`/`QueryRow`/`SendBatch` surface.
+
+### Note
+12 integration tests added in `tests/integration_test.go` covering the happy paths and edge cases for every new command (NX/XX/GT/LT semantics, lex bound parsing, negative-count duplicates, empty-keyspace returns, BLMPOP timeout behaviour, etc.). Full `-race` suite passes.
+
 ## [0.25.0] - 2026-05-14
 
 ### Added
