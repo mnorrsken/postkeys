@@ -1,0 +1,27 @@
+{{- if .Values.grafana.dashboard.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "postkeys.fullname" . }}-grafana-dashboard
+  {{- with .Values.grafana.dashboard.namespace }}
+  namespace: {{ . }}
+  {{- end }}
+  labels:
+    {{- include "postkeys.labels" . | nindent 4 }}
+    {{ .Values.grafana.dashboard.labelKey }}: {{ .Values.grafana.dashboard.labelValue | quote }}
+    {{- with .Values.grafana.dashboard.extraLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- if or .Values.grafana.dashboard.folder .Values.grafana.dashboard.extraAnnotations }}
+  annotations:
+    {{- if .Values.grafana.dashboard.folder }}
+    {{ .Values.grafana.dashboard.folderAnnotation }}: {{ .Values.grafana.dashboard.folder | quote }}
+    {{- end }}
+    {{- with .Values.grafana.dashboard.extraAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+data:
+  postkeys.json: |
+{{ .Files.Get "dashboards/postkeys.json" | indent 4 }}
+{{- end }}

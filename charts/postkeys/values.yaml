@@ -192,6 +192,87 @@ extraEnvFrom: []
   # - configMapRef:
   #     name: my-configmap
 
+# Grafana dashboard provisioning. Renders a ConfigMap that the Grafana
+# sidecar (e.g. kiwigrid/k8s-sidecar) discovers via labelSelector and imports.
+# The dashboard JSON lives at charts/postkeys/dashboards/postkeys.json and is
+# embedded verbatim — edit that file and re-render to update.
+grafana:
+  dashboard:
+    # Disabled by default. Set to true if you run Grafana with the dashboard
+    # sidecar enabled and want this dashboard provisioned automatically.
+    enabled: false
+    # Namespace to render the ConfigMap into. Defaults to the release namespace.
+    namespace: ""
+    # Label the sidecar matches on. Defaults align with the Grafana Helm chart
+    # default (sidecar.dashboards.label / labelValue).
+    labelKey: grafana_dashboard
+    labelValue: "1"
+    # Annotation the sidecar reads to place the dashboard in a Grafana folder.
+    # Leave folder empty to use the root folder.
+    folderAnnotation: grafana_folder
+    folder: ""
+    # Additional labels / annotations to add to the ConfigMap.
+    extraLabels: {}
+    extraAnnotations: {}
+
+# Prometheus alerting rules (PrometheusRule CRD). Requires prometheus-operator.
+# All rules are disabled by default; toggle individually under rules:*.enabled.
+prometheusRule:
+  # Master switch — when false the CRD is not rendered at all.
+  enabled: false
+  # Namespace to render the PrometheusRule into. Defaults to release namespace.
+  namespace: ""
+  # Labels on the PrometheusRule CR itself. Prometheus operators usually filter
+  # rule pickup with something like `release: prometheus` — add that here.
+  labels: {}
+  # Labels applied to every alert in the rule group (severity, team, etc).
+  alertLabels:
+    severity: warning
+  # Annotations merged into every alert (runbook URLs, dashboards, etc).
+  annotations: {}
+  # Rule group evaluation interval. Empty = use Prometheus default.
+  interval: ""
+  # Per-alert tuning. Each rule can be disabled or have thresholds/`for`
+  # tuned. Add `labels:` to a rule to override the group's alertLabels for
+  # that one alert (e.g. raise severity: critical).
+  rules:
+    podDown:
+      enabled: true
+      for: 5m
+    highErrorRate:
+      enabled: true
+      # Fraction of commands returning an error, sustained for `for`.
+      threshold: 0.05
+      for: 10m
+    highLatencyP99:
+      enabled: true
+      # p99 command latency in seconds, sustained for `for`. Blocking
+      # commands matching excludeCommands are excluded — they're slow by
+      # design and are covered by stuckBlockingCalls instead.
+      threshold: 0.1
+      excludeCommands: "BRPOP|BLPOP"
+      for: 10m
+    stuckBlockingCalls:
+      enabled: true
+      # Average concurrent blocking calls per pod (seconds-waited per
+      # second). Climbing without traffic growth usually means
+      # LISTEN/NOTIFY broke and clients are hitting the poll fallback.
+      commands: "BRPOP|BLPOP"
+      threshold: 50
+      for: 15m
+    lowCacheHitRate:
+      # Only meaningful when cache.enabled=true. Off by default.
+      enabled: false
+      # Percent (0-100).
+      threshold: 50
+      # Skip pods that aren't actually serving cache traffic, to avoid
+      # alerting on dev/idle replicas.
+      minTrafficOps: 1
+      for: 30m
+  # Free-form list of extra rule entries appended to the group. Each item
+  # is a full Prometheus alerting rule (alert, expr, for, labels, annotations).
+  extraRules: []
+
 # Metrics configuration
 metrics:
   # Enable metrics endpoint

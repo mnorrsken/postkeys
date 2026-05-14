@@ -1,0 +1,118 @@
+{{- if .Values.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "postkeys.fullname" . }}
+  {{- with .Values.prometheusRule.namespace }}
+  namespace: {{ . }}
+  {{- end }}
+  labels:
+    {{- include "postkeys.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: postkeys.rules
+      {{- with .Values.prometheusRule.interval }}
+      interval: {{ . }}
+      {{- end }}
+      rules:
+        {{- $alertLabels := .Values.prometheusRule.alertLabels | default dict }}
+        {{- $annotations := .Values.prometheusRule.annotations | default dict }}
+        {{- with .Values.prometheusRule.rules.podDown }}
+        {{- if .enabled }}
+        - alert: PostkeysPodDown
+          expr: up{job=~".*postkeys.*"} == 0
+          for: {{ .for | default "5m" }}
+          labels:
+            {{- toYaml $alertLabels | nindent 12 }}
+            {{- with .labels }}{{- toYaml . | nindent 12 }}{{- end }}
+          annotations:
+            summary: "postkeys pod is not being scraped"
+            description: "Prometheus has not scraped {{`{{ $labels.namespace }}/{{ $labels.pod }}`}} for at least {{ .for | default "5m" }}. Pod may be crash-looping or the metrics endpoint may be unreachable."
+            {{- if not (empty $annotations) }}{{- toYaml $annotations | nindent 12 }}{{- end }}
+        {{- end }}
+        {{- end }}
+        {{- with .Values.prometheusRule.rules.highErrorRate }}
+        {{- if .enabled }}
+        - alert: PostkeysHighErrorRate
+          expr: |
+            sum(rate(postkeys_command_errors_total[5m])) by (namespace, pod)
+              /
+            sum(rate(postkeys_commands_total[5m])) by (namespace, pod)
+              > {{ .threshold | default 0.05 }}
+          for: {{ .for | default "10m" }}
+          labels:
+            {{- toYaml $alertLabels | nindent 12 }}
+            {{- with .labels }}{{- toYaml . | nindent 12 }}{{- end }}
+          annotations:
+            summary: "postkeys error rate above {{ .threshold | default 0.05 | mulf 100.0 }}%"
+            description: "{{`{{ $labels.namespace }}/{{ $labels.pod }}`}} is returning errors on {{`{{ printf \"%.1f\" (mulf $value 100.0) }}`}}% of commands over the last 5m. Inspect 'Error Rate by Command' on the dashboard."
+            {{- if not (empty $annotations) }}{{- toYaml $annotations | nindent 12 }}{{- end }}
+        {{- end }}
+        {{- end }}
+        {{- with .Values.prometheusRule.rules.highLatencyP99 }}
+        {{- if .enabled }}
+        - alert: PostkeysHighP99Latency
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le, namespace, pod) (
+                rate(postkeys_command_duration_seconds_bucket{command!~"{{ .excludeCommands | default "BRPOP|BLPOP" }}"}[5m])
+              )
+            ) > {{ .threshold | default 0.1 }}
+          for: {{ .for | default "10m" }}
+          labels:
+            {{- toYaml $alertLabels | nindent 12 }}
+            {{- with .labels }}{{- toYaml . | nindent 12 }}{{- end }}
+          annotations:
+            summary: "postkeys p99 latency above {{ .threshold | default 0.1 }}s"
+            description: "Non-blocking command p99 latency on {{`{{ $labels.namespace }}/{{ $labels.pod }}`}} is {{`{{ printf \"%.3f\" $value }}`}}s (excluding {{ .excludeCommands | default "BRPOP|BLPOP" }})."
+            {{- if not (empty $annotations) }}{{- toYaml $annotations | nindent 12 }}{{- end }}
+        {{- end }}
+        {{- end }}
+        {{- with .Values.prometheusRule.rules.stuckBlockingCalls }}
+        {{- if .enabled }}
+        - alert: PostkeysBlockingCallsAccumulating
+          expr: |
+            sum by (namespace, pod) (
+              rate(postkeys_command_duration_seconds_sum{command=~"{{ .commands | default "BRPOP|BLPOP" }}"}[5m])
+            ) > {{ .threshold | default 50 }}
+          for: {{ .for | default "15m" }}
+          labels:
+            {{- toYaml $alertLabels | nindent 12 }}
+            {{- with .labels }}{{- toYaml . | nindent 12 }}{{- end }}
+          annotations:
+            summary: "Concurrent blocking calls above {{ .threshold | default 50 }}"
+            description: "Average concurrent blocking calls on {{`{{ $labels.namespace }}/{{ $labels.pod }}`}} is {{`{{ printf \"%.0f\" $value }}`}}. Either traffic legitimately grew, or LISTEN/NOTIFY broke and the poll fallback is keeping clients waiting longer."
+            {{- if not (empty $annotations) }}{{- toYaml $annotations | nindent 12 }}{{- end }}
+        {{- end }}
+        {{- end }}
+        {{- with .Values.prometheusRule.rules.lowCacheHitRate }}
+        {{- if .enabled }}
+        - alert: PostkeysLowCacheHitRate
+          expr: |
+            100 *
+              sum by (namespace, pod) (rate(postkeys_cache_hits_total[10m]))
+              /
+              (
+                sum by (namespace, pod) (rate(postkeys_cache_hits_total[10m]))
+                + sum by (namespace, pod) (rate(postkeys_cache_misses_total[10m]))
+              )
+              < {{ .threshold | default 50 }}
+            and on(namespace, pod)
+              sum by (namespace, pod) (rate(postkeys_cache_hits_total[10m]) + rate(postkeys_cache_misses_total[10m])) > {{ .minTrafficOps | default 1 }}
+          for: {{ .for | default "30m" }}
+          labels:
+            {{- toYaml $alertLabels | nindent 12 }}
+            {{- with .labels }}{{- toYaml . | nindent 12 }}{{- end }}
+          annotations:
+            summary: "postkeys cache hit rate below {{ .threshold | default 50 }}%"
+            description: "Cache hit rate on {{`{{ $labels.namespace }}/{{ $labels.pod }}`}} dropped to {{`{{ printf \"%.1f\" $value }}`}}% over the last 10m. Likely causes: keyspace shifted, distributed invalidation broken, or cache size too small."
+            {{- if not (empty $annotations) }}{{- toYaml $annotations | nindent 12 }}{{- end }}
+        {{- end }}
+        {{- end }}
+        {{- with .Values.prometheusRule.extraRules }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+{{- end }}
