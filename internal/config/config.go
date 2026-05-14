@@ -66,6 +66,10 @@ type Config struct {
 	// Set via the downward API (fieldRef: metadata.name / metadata.namespace).
 	PodName      string
 	PodNamespace string
+
+	// BlockingPollInterval is the fallback poll interval for BLPOP/BRPOP when
+	// no LISTEN/NOTIFY notifier is available. Ignored on the notify path.
+	BlockingPollInterval time.Duration
 }
 
 // Load loads configuration from environment variables
@@ -98,6 +102,7 @@ func Load() *Config {
 		LeaderElectionEnabled:        getEnvBool("LEADER_ELECTION_ENABLED", false),
 		PodName:                      getEnv("POD_NAME", ""),
 		PodNamespace:                 getEnv("POD_NAMESPACE", ""),
+		BlockingPollInterval:         getEnvDuration("BLOCKING_POLL_INTERVAL", 100*time.Millisecond),
 	}
 }
 

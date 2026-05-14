@@ -164,6 +164,7 @@ func main() {
 
 	// Create handler
 	h := handler.New(backend, cfg.RedisPassword)
+	h.SetBlockingPollInterval(cfg.BlockingPollInterval)
 
 	// Initialize list notifier for BRPOP/BLPOP
 	listNotifier := listnotify.New(store.Pool(), store.ConnString())

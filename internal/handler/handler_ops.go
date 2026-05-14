@@ -1350,60 +1350,7 @@ func (h *Handler) brpopOp(ctx context.Context, ops storage.Operations, args []re
 		keys[i] = args[i].Bulk
 	}
 
-	// Calculate deadline and remaining time
-	var deadline time.Time
-	if timeout > 0 {
-		deadline = time.Now().Add(time.Duration(timeout * float64(time.Second)))
-	}
-
-	for {
-		// Try each key in order
-		for _, key := range keys {
-			value, found, err := ops.RPop(ctx, key)
-			if err != nil {
-				return resp.Err(err.Error())
-			}
-			if found {
-				return resp.Arr(resp.Bulk(key), resp.Bulk(value))
-			}
-		}
-
-		// Check if timeout expired (0 means block forever)
-		if timeout > 0 && time.Now().After(deadline) {
-			return resp.NullBulk()
-		}
-
-		// Calculate wait time
-		waitTime := 100 * time.Millisecond // fallback poll interval
-		if timeout > 0 {
-			remaining := time.Until(deadline)
-			if remaining < waitTime {
-				waitTime = remaining
-			}
-		}
-
-		// Use LISTEN/NOTIFY if available, otherwise fall back to polling
-		if h.listNotifier != nil {
-			// Wait for notification on any of the keys
-			if h.listNotifier.WaitForKeys(ctx, keys, waitTime) != "" {
-				continue // Got notification, try to pop again
-			}
-		} else {
-			// Fallback: poll-based waiting
-			select {
-			case <-ctx.Done():
-				return resp.NullBulk()
-			case <-time.After(waitTime):
-			}
-		}
-
-		// Check context and timeout after waiting
-		select {
-		case <-ctx.Done():
-			return resp.NullBulk()
-		default:
-		}
-	}
+	return h.blockingPop(ctx, ops, keys, timeout, ops.RPopMulti)
 }
 
 // blpopOp implements BLPOP - blocking left pop from list(s)
@@ -1424,31 +1371,34 @@ func (h *Handler) blpopOp(ctx context.Context, ops storage.Operations, args []re
 		keys[i] = args[i].Bulk
 	}
 
-	// Calculate deadline and remaining time
+	return h.blockingPop(ctx, ops, keys, timeout, ops.LPopMulti)
+}
+
+// popFn pops from the first non-empty key among keys and returns
+// (poppedKey, value, found, err). Used to share BLPOP and BRPOP loops.
+type popFn func(ctx context.Context, keys []string) (string, string, bool, error)
+
+func (h *Handler) blockingPop(ctx context.Context, _ storage.Operations, keys []string, timeout float64, pop popFn) resp.Value {
 	var deadline time.Time
 	if timeout > 0 {
 		deadline = time.Now().Add(time.Duration(timeout * float64(time.Second)))
 	}
 
 	for {
-		// Try each key in order
-		for _, key := range keys {
-			value, found, err := ops.LPop(ctx, key)
-			if err != nil {
-				return resp.Err(err.Error())
-			}
-			if found {
-				return resp.Arr(resp.Bulk(key), resp.Bulk(value))
-			}
+		// One round-trip across all keys; SQL picks the first non-empty list.
+		poppedKey, value, found, err := pop(ctx, keys)
+		if err != nil {
+			return resp.Err(err.Error())
+		}
+		if found {
+			return resp.Arr(resp.Bulk(poppedKey), resp.Bulk(value))
 		}
 
-		// Check if timeout expired (0 means block forever)
 		if timeout > 0 && time.Now().After(deadline) {
 			return resp.NullBulk()
 		}
 
-		// Calculate wait time
-		waitTime := 100 * time.Millisecond // fallback poll interval
+		waitTime := h.blockingPollInterval
 		if timeout > 0 {
 			remaining := time.Until(deadline)
 			if remaining < waitTime {
@@ -1456,14 +1406,11 @@ func (h *Handler) blpopOp(ctx context.Context, ops storage.Operations, args []re
 			}
 		}
 
-		// Use LISTEN/NOTIFY if available, otherwise fall back to polling
 		if h.listNotifier != nil {
-			// Wait for notification on any of the keys
 			if h.listNotifier.WaitForKeys(ctx, keys, waitTime) != "" {
-				continue // Got notification, try to pop again
+				continue
 			}
 		} else {
-			// Fallback: poll-based waiting
 			select {
 			case <-ctx.Done():
 				return resp.NullBulk()
@@ -1471,7 +1418,6 @@ func (h *Handler) blpopOp(ctx context.Context, ops storage.Operations, args []re
 			}
 		}
 
-		// Check context and timeout after waiting
 		select {
 		case <-ctx.Done():
 			return resp.NullBulk()

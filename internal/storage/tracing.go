@@ -200,3 +200,13 @@ func (t *TracingQuerier) QueryRow(ctx context.Context, sql string, args ...any) 
 
 	return row
 }
+
+// SendBatch forwards the batch to the underlying Querier. Tracing of individual
+// queries inside the batch is left to the caller (the batch wrapper is a thin
+// passthrough; per-query timing is not meaningful here).
+func (t *TracingQuerier) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	if t.level >= 2 {
+		log.Printf("[SQLTRACE] SendBatch (%d queries)", b.Len())
+	}
+	return t.q.SendBatch(ctx, b)
+}

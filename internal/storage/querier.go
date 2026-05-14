@@ -22,6 +22,7 @@ type Querier interface {
 	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults
 }
 
 // binaryPrefix is used to identify base64-encoded binary keys and field names.
@@ -142,6 +143,37 @@ func (queryOps) getKeyType(ctx context.Context, q Querier, key string) (KeyType,
 		return TypeNone, err
 	}
 	return KeyType(keyType), nil
+}
+
+// errWrongType is returned by typed read helpers when a key exists with a
+// non-matching type. Matches the error string used elsewhere in this file.
+var errWrongType = fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
+
+// queueTypeCheck queues a kv_meta lookup into batch. Use readTypeCheck to read
+// the result and verify the key is missing or of the expected type. This is
+// the read-side companion to the data query queued alongside it.
+func (queryOps) queueTypeCheck(batch *pgx.Batch, key string) {
+	batch.Queue(
+		"SELECT key_type FROM kv_meta WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
+		key,
+	)
+}
+
+// readTypeCheck reads the result queued by queueTypeCheck and returns
+// errWrongType if the stored type doesn't match expected (missing key is OK).
+func (queryOps) readTypeCheck(br pgx.BatchResults, expected KeyType) error {
+	var keyType string
+	err := br.QueryRow().Scan(&keyType)
+	if err == pgx.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if KeyType(keyType) != expected {
+		return errWrongType
+	}
+	return nil
 }
 
 // lockKey acquires a transaction-scoped advisory lock for the given key.
@@ -1180,19 +1212,22 @@ func (o queryOps) hDel(ctx context.Context, q Querier, key string, fields []stri
 
 func (o queryOps) hGetAll(ctx context.Context, q Querier, key string) (map[string]string, error) {
 	key = encodeKey(key)
-	// Check if key exists but is wrong type
-	keyType, err := o.getKeyType(ctx, q, key)
-	if err != nil {
-		return nil, err
-	}
-	if keyType != TypeNone && keyType != TypeHash {
-		return nil, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
-	}
 
-	rows, err := q.Query(ctx,
+	// Batch the WRONGTYPE check and the data fetch into a single round-trip.
+	batch := &pgx.Batch{}
+	o.queueTypeCheck(batch, key)
+	batch.Queue(
 		"SELECT field, value FROM kv_hashes WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
 		key,
 	)
+	br := q.SendBatch(ctx, batch)
+	defer br.Close()
+
+	if err := o.readTypeCheck(br, TypeHash); err != nil {
+		return nil, err
+	}
+
+	rows, err := br.Query()
 	if err != nil {
 		return nil, err
 	}
@@ -1207,7 +1242,7 @@ func (o queryOps) hGetAll(ctx context.Context, q Querier, key string) (map[strin
 		}
 		result[decodeField(field)] = string(value)
 	}
-	return result, nil
+	return result, rows.Err()
 }
 
 func (o queryOps) hMGet(ctx context.Context, q Querier, key string, fields []string) ([]interface{}, error) {
@@ -1643,41 +1678,96 @@ func (o queryOps) rPop(ctx context.Context, q Querier, key string) (string, bool
 	return string(value), true, nil
 }
 
+// popMulti pops a single element from the first non-empty list among keys
+// (in caller order) using one SQL round-trip. order is "ASC" for LPop
+// semantics (leftmost element of the first non-empty key) or "DESC" for RPop.
+func (o queryOps) popMulti(ctx context.Context, q Querier, keys []string, order string) (string, string, bool, error) {
+	if len(keys) == 0 {
+		return "", "", false, nil
+	}
+	// Copy before encoding — encodeKeys mutates its input.
+	encoded := make([]string, len(keys))
+	copy(encoded, keys)
+	encoded = encodeKeys(encoded)
+
+	// array_position orders candidate rows by the caller's key order so we
+	// always pop from the earliest non-empty list. Within that list, idx ASC
+	// gives the leftmost element (LPOP) and idx DESC gives the rightmost (RPOP).
+	// SKIP LOCKED keeps concurrent poppers from deadlocking on the same row.
+	sql := `WITH candidate AS (
+		SELECT key, idx FROM kv_lists
+		WHERE key = ANY($1::text[]) AND (expires_at IS NULL OR expires_at > NOW())
+		ORDER BY array_position($1::text[], key), idx ` + order + `
+		LIMIT 1 FOR UPDATE SKIP LOCKED
+	),
+	deleted AS (
+		DELETE FROM kv_lists
+		WHERE (key, idx) = (SELECT key, idx FROM candidate)
+		RETURNING key, value
+	)
+	SELECT key, value FROM deleted`
+
+	var poppedKey string
+	var value []byte
+	err := q.QueryRow(ctx, sql, encoded).Scan(&poppedKey, &value)
+	if err == pgx.ErrNoRows {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	return decodeKey(poppedKey), string(value), true, nil
+}
+
+func (o queryOps) lPopMulti(ctx context.Context, q Querier, keys []string) (string, string, bool, error) {
+	return o.popMulti(ctx, q, keys, "ASC")
+}
+
+func (o queryOps) rPopMulti(ctx context.Context, q Querier, keys []string) (string, string, bool, error) {
+	return o.popMulti(ctx, q, keys, "DESC")
+}
+
 func (o queryOps) lLen(ctx context.Context, q Querier, key string) (int64, error) {
 	key = encodeKey(key)
-	// Check if key exists but is wrong type
-	keyType, err := o.getKeyType(ctx, q, key)
-	if err != nil {
+
+	batch := &pgx.Batch{}
+	o.queueTypeCheck(batch, key)
+	batch.Queue(
+		"SELECT COUNT(*) FROM kv_lists WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
+		key,
+	)
+	br := q.SendBatch(ctx, batch)
+	defer br.Close()
+
+	if err := o.readTypeCheck(br, TypeList); err != nil {
 		return 0, err
-	}
-	if keyType != TypeNone && keyType != TypeList {
-		return 0, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
 
 	var count int64
-	err = q.QueryRow(ctx,
-		"SELECT COUNT(*) FROM kv_lists WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
-		key,
-	).Scan(&count)
+	err := br.QueryRow().Scan(&count)
 	return count, err
 }
 
 func (o queryOps) lRange(ctx context.Context, q Querier, key string, start, stop int64) ([]string, error) {
 	key = encodeKey(key)
-	// Check if key exists but is wrong type
-	keyType, err := o.getKeyType(ctx, q, key)
-	if err != nil {
+
+	// Batch the WRONGTYPE check and the count query into a single round-trip.
+	batch := &pgx.Batch{}
+	o.queueTypeCheck(batch, key)
+	batch.Queue("SELECT COUNT(*) FROM kv_lists WHERE key = $1", key)
+	br := q.SendBatch(ctx, batch)
+
+	if err := o.readTypeCheck(br, TypeList); err != nil {
+		br.Close()
 		return nil, err
 	}
-	if keyType != TypeNone && keyType != TypeList {
-		return nil, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
-	}
 
-	// Get total count
 	var total int64
-	if err := q.QueryRow(ctx, "SELECT COUNT(*) FROM kv_lists WHERE key = $1", key).Scan(&total); err != nil {
+	if err := br.QueryRow().Scan(&total); err != nil {
+		br.Close()
 		return nil, fmt.Errorf("failed to get list count: %w", err)
 	}
+	br.Close()
 
 	// Convert negative indices
 	if start < 0 {
@@ -1719,27 +1809,42 @@ func (o queryOps) lRange(ctx context.Context, q Querier, key string, start, stop
 
 func (o queryOps) lIndex(ctx context.Context, q Querier, key string, index int64) (string, bool, error) {
 	key = encodeKey(key)
-	// Get total count
-	var total int64
-	if err := q.QueryRow(ctx, "SELECT COUNT(*) FROM kv_lists WHERE key = $1", key).Scan(&total); err != nil {
-		return "", false, fmt.Errorf("failed to get list count: %w", err)
+
+	if index >= 0 {
+		// Positive index: no count needed. OFFSET past end just returns no rows.
+		var value []byte
+		err := q.QueryRow(ctx,
+			`SELECT value FROM kv_lists
+			 WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())
+			 ORDER BY idx ASC LIMIT 1 OFFSET $2`,
+			key, index,
+		).Scan(&value)
+		if err == pgx.ErrNoRows {
+			return "", false, nil
+		}
+		if err != nil {
+			return "", false, err
+		}
+		return string(value), true, nil
 	}
 
-	// Convert negative index
-	if index < 0 {
-		index = total + index
-	}
-	if index < 0 || index >= total {
-		return "", false, nil
-	}
-
+	// Negative index: fold the count + select into one round-trip via CTE.
+	// The WHERE filter on `total + idx >= 0` suppresses rows when |index|
+	// exceeds the list length; otherwise GREATEST would clamp the OFFSET to
+	// 0 and we'd incorrectly return row 0.
 	var value []byte
 	err := q.QueryRow(ctx,
-		`SELECT value FROM kv_lists WHERE key = $1 
-		 ORDER BY idx ASC LIMIT 1 OFFSET $2`,
+		`WITH cnt AS (
+			SELECT COUNT(*)::bigint AS total FROM kv_lists
+			WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())
+		)
+		SELECT value FROM kv_lists, cnt
+		WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())
+		  AND cnt.total + $2::bigint >= 0
+		ORDER BY idx ASC
+		LIMIT 1 OFFSET GREATEST((SELECT total FROM cnt) + $2::bigint, 0)`,
 		key, index,
 	).Scan(&value)
-
 	if err == pgx.ErrNoRows {
 		return "", false, nil
 	}
@@ -1814,19 +1919,21 @@ func (o queryOps) sRem(ctx context.Context, q Querier, key string, members []str
 
 func (o queryOps) sMembers(ctx context.Context, q Querier, key string) ([]string, error) {
 	key = encodeKey(key)
-	// Check if key exists but is wrong type
-	keyType, err := o.getKeyType(ctx, q, key)
-	if err != nil {
-		return nil, err
-	}
-	if keyType != TypeNone && keyType != TypeSet {
-		return nil, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
-	}
 
-	rows, err := q.Query(ctx,
+	batch := &pgx.Batch{}
+	o.queueTypeCheck(batch, key)
+	batch.Queue(
 		"SELECT member FROM kv_sets WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
 		key,
 	)
+	br := q.SendBatch(ctx, batch)
+	defer br.Close()
+
+	if err := o.readTypeCheck(br, TypeSet); err != nil {
+		return nil, err
+	}
+
+	rows, err := br.Query()
 	if err != nil {
 		return nil, err
 	}
@@ -1840,7 +1947,7 @@ func (o queryOps) sMembers(ctx context.Context, q Querier, key string) ([]string
 		}
 		members = append(members, string(member))
 	}
-	return members, nil
+	return members, rows.Err()
 }
 
 func (o queryOps) sIsMember(ctx context.Context, q Querier, key, member string) (bool, error) {
@@ -1856,20 +1963,22 @@ func (o queryOps) sIsMember(ctx context.Context, q Querier, key, member string) 
 
 func (o queryOps) sCard(ctx context.Context, q Querier, key string) (int64, error) {
 	key = encodeKey(key)
-	// Check if key exists but is wrong type
-	keyType, err := o.getKeyType(ctx, q, key)
-	if err != nil {
+
+	batch := &pgx.Batch{}
+	o.queueTypeCheck(batch, key)
+	batch.Queue(
+		"SELECT COUNT(*) FROM kv_sets WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
+		key,
+	)
+	br := q.SendBatch(ctx, batch)
+	defer br.Close()
+
+	if err := o.readTypeCheck(br, TypeSet); err != nil {
 		return 0, err
-	}
-	if keyType != TypeNone && keyType != TypeSet {
-		return 0, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
 
 	var count int64
-	err = q.QueryRow(ctx,
-		"SELECT COUNT(*) FROM kv_sets WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
-		key,
-	).Scan(&count)
+	err := br.QueryRow().Scan(&count)
 	return count, err
 }
 
@@ -1908,46 +2017,32 @@ func (o queryOps) zAdd(ctx context.Context, q Querier, key string, members []ZMe
 
 func (o queryOps) zRange(ctx context.Context, q Querier, key string, start, stop int64, withScores bool) ([]ZMember, error) {
 	key = encodeKey(key)
-	// Get total count first to handle negative indices
-	var count int64
-	err := q.QueryRow(ctx,
-		"SELECT COUNT(*) FROM kv_zsets WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
-		key,
-	).Scan(&count)
-	if err != nil {
-		return nil, err
-	}
 
-	if count == 0 {
-		return []ZMember{}, nil
-	}
-
-	// Convert negative indices
-	if start < 0 {
-		start = count + start
-	}
-	if stop < 0 {
-		stop = count + stop
-	}
-
-	// Clamp to valid range
-	if start < 0 {
-		start = 0
-	}
-	if stop >= count {
-		stop = count - 1
-	}
-	if start > stop {
-		return []ZMember{}, nil
-	}
-
-	limit := stop - start + 1
+	// Fold the count, negative-index normalization, and the SELECT into one
+	// round-trip via a CTE. `bounds` performs the same clamping that the Go
+	// code used to do; the join with kv_zsets is a 1×N cross product (bounds
+	// has exactly one row). The WHERE guard rejects all rows when the range
+	// is empty (total=0 or start_pos > stop_pos after clamping).
 	rows, err := q.Query(ctx,
-		`SELECT member, score FROM kv_zsets 
-		 WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())
-		 ORDER BY score ASC, member ASC
-		 LIMIT $2 OFFSET $3`,
-		key, limit, start,
+		`WITH cnt AS (
+			SELECT COUNT(*)::bigint AS total FROM kv_zsets
+			WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())
+		),
+		bounds AS (
+			SELECT
+				GREATEST(CASE WHEN $2::bigint < 0 THEN total + $2::bigint ELSE $2::bigint END, 0) AS start_pos,
+				LEAST(CASE WHEN $3::bigint < 0 THEN total + $3::bigint ELSE $3::bigint END, total - 1) AS stop_pos,
+				total
+			FROM cnt
+		)
+		SELECT member, score FROM kv_zsets, bounds
+		WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())
+		  AND bounds.total > 0
+		  AND bounds.start_pos <= bounds.stop_pos
+		ORDER BY score ASC, member ASC
+		LIMIT (SELECT GREATEST(stop_pos - start_pos + 1, 0) FROM bounds)
+		OFFSET (SELECT start_pos FROM bounds)`,
+		key, start, stop,
 	)
 	if err != nil {
 		return nil, err
@@ -1963,7 +2058,7 @@ func (o queryOps) zRange(ctx context.Context, q Querier, key string, start, stop
 		}
 		members = append(members, ZMember{Member: string(member), Score: score})
 	}
-	return members, nil
+	return members, rows.Err()
 }
 
 func (o queryOps) zScore(ctx context.Context, q Querier, key, member string) (float64, bool, error) {

@@ -64,20 +64,34 @@ type ListNotifier interface {
 	WaitForKeys(ctx context.Context, keys []string, timeout time.Duration) string
 }
 
+// defaultBlockingPollInterval is the fallback poll interval for BLPOP/BRPOP
+// when no LISTEN/NOTIFY notifier is configured.
+const defaultBlockingPollInterval = 100 * time.Millisecond
+
 // Handler processes Redis commands
 type Handler struct {
-	store        storage.Backend
-	password     string
-	startTime    time.Time
-	listNotifier ListNotifier
+	store               storage.Backend
+	password            string
+	startTime           time.Time
+	listNotifier        ListNotifier
+	blockingPollInterval time.Duration
 }
 
 // New creates a new command handler
 func New(store storage.Backend, password string) *Handler {
 	return &Handler{
-		store:     store,
-		password:  password,
-		startTime: time.Now(),
+		store:                store,
+		password:             password,
+		startTime:            time.Now(),
+		blockingPollInterval: defaultBlockingPollInterval,
+	}
+}
+
+// SetBlockingPollInterval configures the BLPOP/BRPOP poll fallback interval.
+// Values <= 0 are ignored (default is kept).
+func (h *Handler) SetBlockingPollInterval(d time.Duration) {
+	if d > 0 {
+		h.blockingPollInterval = d
 	}
 }
 

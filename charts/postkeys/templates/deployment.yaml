@@ -165,6 +165,10 @@ spec:
             - name: TRACE
               value: {{ .Values.traceLevel | quote }}
             {{- end }}
+            {{- if .Values.blocking }}{{- if .Values.blocking.pollInterval }}
+            - name: BLOCKING_POLL_INTERVAL
+              value: {{ .Values.blocking.pollInterval | quote }}
+            {{- end }}{{- end }}
             {{- if .Values.leaderElection.enabled }}
             - name: LEADER_ELECTION_ENABLED
               value: "true"

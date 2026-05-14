@@ -89,6 +89,12 @@ type Operations interface {
 	RPush(ctx context.Context, key string, values []string) (int64, error)
 	LPop(ctx context.Context, key string) (string, bool, error)
 	RPop(ctx context.Context, key string) (string, bool, error)
+	// LPopMulti / RPopMulti scan the supplied keys in order and pop one element
+	// from the first non-empty list in a single SQL round-trip. Used to
+	// implement multi-key BLPOP/BRPOP without N sequential queries.
+	// Returns the key popped from, the popped value, and found=true on success.
+	LPopMulti(ctx context.Context, keys []string) (key, value string, found bool, err error)
+	RPopMulti(ctx context.Context, keys []string) (key, value string, found bool, err error)
 	LLen(ctx context.Context, key string) (int64, error)
 	LRange(ctx context.Context, key string, start, stop int64) ([]string, error)
 	LIndex(ctx context.Context, key string, index int64) (string, bool, error)

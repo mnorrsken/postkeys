@@ -697,6 +697,28 @@ func (s *Store) RPop(ctx context.Context, key string) (string, bool, error) {
 	return value, found, err
 }
 
+func (s *Store) LPopMulti(ctx context.Context, keys []string) (string, string, bool, error) {
+	var k, v string
+	var found bool
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		k, v, found, err = s.ops.lPopMulti(ctx, s.txQuerier(tx), keys)
+		return err
+	})
+	return k, v, found, err
+}
+
+func (s *Store) RPopMulti(ctx context.Context, keys []string) (string, string, bool, error) {
+	var k, v string
+	var found bool
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		k, v, found, err = s.ops.rPopMulti(ctx, s.txQuerier(tx), keys)
+		return err
+	})
+	return k, v, found, err
+}
+
 func (s *Store) LLen(ctx context.Context, key string) (int64, error) {
 	return s.ops.lLen(ctx, s.querier(), key)
 }

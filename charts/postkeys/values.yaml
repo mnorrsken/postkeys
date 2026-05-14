@@ -225,6 +225,14 @@ metrics:
     # Honor labels
     honorLabels: false
 
+# Blocking command tuning (BLPOP / BRPOP)
+blocking:
+  # Fallback poll interval when no LISTEN/NOTIFY notifier is wired up.
+  # Ignored on the notify path (which is the default in this chart).
+  # Lower values reduce worst-case wakeup latency; higher values reduce DB load.
+  # Default matches the in-code default (100ms).
+  pollInterval: "100ms"
+
 # Cache configuration (for string GET operations)
 cache:
   # Enable in-memory cache (opt-in, disabled by default)

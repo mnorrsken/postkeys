@@ -395,6 +395,14 @@ func (s *CachedStore) RPop(ctx context.Context, key string) (string, bool, error
 	return s.backend.RPop(ctx, key)
 }
 
+func (s *CachedStore) LPopMulti(ctx context.Context, keys []string) (string, string, bool, error) {
+	return s.backend.LPopMulti(ctx, keys)
+}
+
+func (s *CachedStore) RPopMulti(ctx context.Context, keys []string) (string, string, bool, error) {
+	return s.backend.RPopMulti(ctx, keys)
+}
+
 func (s *CachedStore) LLen(ctx context.Context, key string) (int64, error) {
 	return s.backend.LLen(ctx, key)
 }

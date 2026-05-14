@@ -241,6 +241,14 @@ func (t *TxStore) RPop(ctx context.Context, key string) (string, bool, error) {
 	return t.ops.rPop(ctx, t.querier(), key)
 }
 
+func (t *TxStore) LPopMulti(ctx context.Context, keys []string) (string, string, bool, error) {
+	return t.ops.lPopMulti(ctx, t.querier(), keys)
+}
+
+func (t *TxStore) RPopMulti(ctx context.Context, keys []string) (string, string, bool, error) {
+	return t.ops.rPopMulti(ctx, t.querier(), keys)
+}
+
 func (t *TxStore) LLen(ctx context.Context, key string) (int64, error) {
 	return t.ops.lLen(ctx, t.querier(), key)
 }

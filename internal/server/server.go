@@ -225,6 +225,14 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				return
 			}
+			// Stop() force-closes connections, which surfaces here as
+			// net.ErrClosed. Not an error worth logging at info level.
+			if errors.Is(err, net.ErrClosed) {
+				if s.debug {
+					log.Printf("[DEBUG] Read error from %s: %v", conn.RemoteAddr(), err)
+				}
+				return
+			}
 			if s.debug {
 				log.Printf("[DEBUG] Read error from %s: %v", conn.RemoteAddr(), err)
 			} else {
