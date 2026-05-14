@@ -122,6 +122,7 @@ Environment variables:
 | `TRACE` | RESP command tracing level (0-3, see Tracing section) | `0` |
 | `ENABLE_PPROF` | Enable `/debug/pprof/*` endpoints on metrics server | `false` |
 | `LEADER_ELECTION_ENABLED` | Enable Kubernetes Lease based leader election. The leader labels its own pod with `postkeys/role=leader` so the Service selector routes traffic exclusively to it, giving full cache coherency without distributed invalidation. Requires pod name/namespace env vars and RBAC on `coordination.k8s.io/leases` (added automatically by the Helm chart). | `false` |
+| `BLOCKING_POLL_INTERVAL` | Fallback poll interval for BLPOP/BRPOP when no LISTEN/NOTIFY notifier is wired up. Ignored on the notify path (the production default). Lower = faster wakeup, higher = less DB load. | `100ms` |
 
 ### Database Connection Pool
 

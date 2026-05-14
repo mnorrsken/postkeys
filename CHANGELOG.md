@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.24.0] - 2026-05-14
+
+### Added
+- **Single-query multi-key BLPOP/BRPOP** — new `LPopMulti`/`RPopMulti` on `storage.Operations`, implemented as one CTE that picks the leftmost (LPOP) or rightmost (RPOP) element from the first non-empty key (ordered by the caller's key sequence via `array_position`) under `FOR UPDATE SKIP LOCKED`. Multi-key blocking-pop wakeups now do one DB round-trip regardless of how many keys are watched, instead of N sequential round-trips. Single-key calls hit the same path with negligible overhead. The BLPOP and BRPOP handler loops collapsed into one shared `blockingPop` helper.
+- **`BLOCKING_POLL_INTERVAL` env var (default 100ms)** — configurable fallback poll interval for BLPOP/BRPOP when no LISTEN/NOTIFY notifier is wired up. Exposed as `blocking.pollInterval` in the Helm chart; emitted only when set.
+
+### Changed
+- **One-round-trip type check for hot reads** — `Querier` now exposes `SendBatch`, and `hGetAll`, `lLen`, `sMembers`, `sCard` now batch the `kv_meta` WRONGTYPE check and the data query into a single round-trip instead of two sequential queries. `lRange` batches the type check with its count query (2 round-trips instead of 3 — the offset/limit fetch still depends on the count).
+- **`lIndex` is now one round-trip on the hot path** — positive indices skip the count query entirely and rely on `OFFSET ... LIMIT 1`; negative indices fold the count and select into a single CTE with a `total + idx >= 0` guard so an over-negative index correctly returns nothing instead of clamping to row 0.
+- **`zRange` is now one round-trip** — the count, negative-index normalization, clamping, and SELECT collapsed into one CTE. The `bounds` CTE produces a single row with `start_pos`/`stop_pos`/`total`, joined with `kv_zsets`; the WHERE guard rejects everything when the range is empty (total=0 or start>stop). Was previously two round-trips (count, then SELECT).
+
+### Fixed
+- **`net.ErrClosed` no longer logs at info level** — when `Stop()` force-closes connections, the in-flight `reader.Read()` returns `net.ErrClosed` ("use of closed network connection"), which the handler only special-cased for `io.EOF` and timeouts. Tests like `TestRenameZSet` emitted a "Read error" line per closed connection even though they passed. Now treated as a clean exit and logged only when `s.debug` is set.
+
 ## [0.23.4] - 2026-05-11
 
 ### Fixed
