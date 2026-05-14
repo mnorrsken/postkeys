@@ -286,13 +286,15 @@ func (s *CachedStore) Exists(ctx context.Context, keys []string) (int64, error) 
 	return s.backend.Exists(ctx, keys)
 }
 
-func (s *CachedStore) Expire(ctx context.Context, key string, ttl time.Duration) (bool, error) {
-	ok, err := s.backend.Expire(ctx, key, ttl)
+func (s *CachedStore) Expire(ctx context.Context, key string, ttl time.Duration, opts storage.ExpireOptions) (bool, error) {
+	ok, err := s.backend.Expire(ctx, key, ttl, opts)
 	if err != nil {
 		return false, err
 	}
 	// Invalidate on TTL change (distributed)
-	s.invalidate(ctx, key)
+	if ok {
+		s.invalidate(ctx, key)
+	}
 	return ok, nil
 }
 
@@ -315,6 +317,10 @@ func (s *CachedStore) Persist(ctx context.Context, key string) (bool, error) {
 
 func (s *CachedStore) Keys(ctx context.Context, pattern string) ([]string, error) {
 	return s.backend.Keys(ctx, pattern)
+}
+
+func (s *CachedStore) RandomKey(ctx context.Context) (string, bool, error) {
+	return s.backend.RandomKey(ctx)
 }
 
 func (s *CachedStore) Type(ctx context.Context, key string) (storage.KeyType, error) {
@@ -403,6 +409,22 @@ func (s *CachedStore) RPopMulti(ctx context.Context, keys []string) (string, str
 	return s.backend.RPopMulti(ctx, keys)
 }
 
+func (s *CachedStore) LMPop(ctx context.Context, keys []string, count int64) (string, []string, bool, error) {
+	return s.backend.LMPop(ctx, keys, count)
+}
+
+func (s *CachedStore) RMPop(ctx context.Context, keys []string, count int64) (string, []string, bool, error) {
+	return s.backend.RMPop(ctx, keys, count)
+}
+
+func (s *CachedStore) ZMPopMin(ctx context.Context, keys []string, count int64) (string, []storage.ZMember, bool, error) {
+	return s.backend.ZMPopMin(ctx, keys, count)
+}
+
+func (s *CachedStore) ZMPopMax(ctx context.Context, keys []string, count int64) (string, []storage.ZMember, bool, error) {
+	return s.backend.ZMPopMax(ctx, keys, count)
+}
+
 func (s *CachedStore) LLen(ctx context.Context, key string) (int64, error) {
 	return s.backend.LLen(ctx, key)
 }
@@ -457,6 +479,37 @@ func (s *CachedStore) ZRem(ctx context.Context, key string, members []string) (i
 
 func (s *CachedStore) ZCard(ctx context.Context, key string) (int64, error) {
 	return s.backend.ZCard(ctx, key)
+}
+
+func (s *CachedStore) ZRevRange(ctx context.Context, key string, start, stop int64, withScores bool) ([]storage.ZMember, error) {
+	return s.backend.ZRevRange(ctx, key, start, stop, withScores)
+}
+
+func (s *CachedStore) ZRevRangeByScore(ctx context.Context, key string, min, max float64, withScores bool, offset, count int64) ([]storage.ZMember, error) {
+	return s.backend.ZRevRangeByScore(ctx, key, min, max, withScores, offset, count)
+}
+
+func (s *CachedStore) ZRangeByLex(ctx context.Context, key string, min, max storage.LexBound, offset, count int64) ([]string, error) {
+	return s.backend.ZRangeByLex(ctx, key, min, max, offset, count)
+}
+
+func (s *CachedStore) ZRevRangeByLex(ctx context.Context, key string, min, max storage.LexBound, offset, count int64) ([]string, error) {
+	return s.backend.ZRevRangeByLex(ctx, key, min, max, offset, count)
+}
+
+func (s *CachedStore) ZLexCount(ctx context.Context, key string, min, max storage.LexBound) (int64, error) {
+	return s.backend.ZLexCount(ctx, key, min, max)
+}
+
+func (s *CachedStore) ZRangeStore(ctx context.Context, dst, src string, spec storage.ZRangeStoreSpec) (int64, error) {
+	n, err := s.backend.ZRangeStore(ctx, dst, src, spec)
+	if err != nil {
+		return 0, err
+	}
+	// dst is a zset; not subject to caching, but we still invalidate to be
+	// safe if a string with the same name was cached previously.
+	s.invalidate(ctx, dst)
+	return n, nil
 }
 
 func (s *CachedStore) ZRangeByScore(ctx context.Context, key string, min, max float64, withScores bool, offset, count int64) ([]storage.ZMember, error) {
@@ -662,6 +715,22 @@ func (s *CachedStore) SDiff(ctx context.Context, keys []string) ([]string, error
 	return s.backend.SDiff(ctx, keys)
 }
 
+func (s *CachedStore) SInterCard(ctx context.Context, keys []string, limit int64) (int64, error) {
+	return s.backend.SInterCard(ctx, keys, limit)
+}
+
+func (s *CachedStore) HRandField(ctx context.Context, key string, count int64, withValues bool) ([]string, error) {
+	return s.backend.HRandField(ctx, key, count, withValues)
+}
+
+func (s *CachedStore) SRandMember(ctx context.Context, key string, count int64) ([]string, error) {
+	return s.backend.SRandMember(ctx, key, count)
+}
+
+func (s *CachedStore) ZRandMember(ctx context.Context, key string, count int64) ([]storage.ZMember, error) {
+	return s.backend.ZRandMember(ctx, key, count)
+}
+
 func (s *CachedStore) SDiffStore(ctx context.Context, destination string, keys []string) (int64, error) {
 	result, err := s.backend.SDiffStore(ctx, destination, keys)
 	if err != nil {
@@ -720,8 +789,8 @@ func (s *CachedStore) ZInterStore(ctx context.Context, destination string, keys 
 
 // ============== Key Extensions ==============
 
-func (s *CachedStore) ExpireAt(ctx context.Context, key string, expireTime time.Time) (bool, error) {
-	result, err := s.backend.ExpireAt(ctx, key, expireTime)
+func (s *CachedStore) ExpireAt(ctx context.Context, key string, expireTime time.Time, opts storage.ExpireOptions) (bool, error) {
+	result, err := s.backend.ExpireAt(ctx, key, expireTime, opts)
 	if err != nil {
 		return false, err
 	}

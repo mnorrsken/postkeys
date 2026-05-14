@@ -340,6 +340,22 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 					}
 					response = resp.Err("only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context")
 				}
+			} else if cmdName == "RESET" {
+				// Reset client state to initial: clear MULTI, drop pub/sub
+				// subscriptions, revert to RESP2, clear name. If auth is
+				// required the connection becomes unauthenticated again.
+				if client.InTransaction() {
+					_ = client.DiscardTransaction()
+				}
+				if s.pubsub != nil {
+					s.pubsub.RemoveSubscriber(client.GetID())
+				}
+				client.SetProtocolVersion(2)
+				client.SetName("")
+				if s.handler.RequiresAuth() {
+					authenticated = false
+				}
+				response = resp.Value{Type: resp.SimpleString, Str: "RESET"}
 			} else if cmdName == "MULTI" {
 				// Start a transaction
 				response = s.handler.HandleMulti(client)

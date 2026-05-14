@@ -162,16 +162,16 @@ func (t *CachingTx) Del(ctx context.Context, keys []string) (int64, error) {
 	return v, err
 }
 
-func (t *CachingTx) Expire(ctx context.Context, key string, ttl time.Duration) (bool, error) {
-	ok, err := t.Transaction.Expire(ctx, key, ttl)
-	if err == nil {
+func (t *CachingTx) Expire(ctx context.Context, key string, ttl time.Duration, opts storage.ExpireOptions) (bool, error) {
+	ok, err := t.Transaction.Expire(ctx, key, ttl, opts)
+	if err == nil && ok {
 		t.mark(key)
 	}
 	return ok, err
 }
 
-func (t *CachingTx) ExpireAt(ctx context.Context, key string, ts time.Time) (bool, error) {
-	ok, err := t.Transaction.ExpireAt(ctx, key, ts)
+func (t *CachingTx) ExpireAt(ctx context.Context, key string, ts time.Time, opts storage.ExpireOptions) (bool, error) {
+	ok, err := t.Transaction.ExpireAt(ctx, key, ts, opts)
 	if err == nil && ok {
 		t.mark(key)
 	}

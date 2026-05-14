@@ -5661,3 +5661,440 @@ func TestExpireMultipleTypesCleanup(t *testing.T) {
 		t.Errorf("Expected 0 orphaned rows in kv_meta, got %d", metaCount)
 	}
 }
+
+// ============== Redis 7.x Quick Wins ==============
+
+func TestExpireFlags(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+
+	// NX: only set when no TTL exists.
+	ts.client.Set(ctx, "k", "v", 0)
+	got, _ := ts.client.Do(ctx, "EXPIRE", "k", "100", "NX").Int64()
+	if got != 1 {
+		t.Errorf("EXPIRE NX on no-TTL key: want 1, got %d", got)
+	}
+	got, _ = ts.client.Do(ctx, "EXPIRE", "k", "50", "NX").Int64()
+	if got != 0 {
+		t.Errorf("EXPIRE NX when TTL already set: want 0, got %d", got)
+	}
+
+	// XX: only set when TTL already exists.
+	ts.client.Set(ctx, "k2", "v", 0)
+	got, _ = ts.client.Do(ctx, "EXPIRE", "k2", "100", "XX").Int64()
+	if got != 0 {
+		t.Errorf("EXPIRE XX on no-TTL key: want 0, got %d", got)
+	}
+	ts.client.Do(ctx, "EXPIRE", "k2", "200")
+	got, _ = ts.client.Do(ctx, "EXPIRE", "k2", "100", "XX").Int64()
+	if got != 1 {
+		t.Errorf("EXPIRE XX after TTL set: want 1, got %d", got)
+	}
+
+	// GT: new must exceed current (NULL = infinity, can't exceed).
+	ts.client.Set(ctx, "k3", "v", 0)
+	ts.client.Do(ctx, "EXPIRE", "k3", "100")
+	got, _ = ts.client.Do(ctx, "EXPIRE", "k3", "50", "GT").Int64()
+	if got != 0 {
+		t.Errorf("EXPIRE GT with lower TTL: want 0, got %d", got)
+	}
+	got, _ = ts.client.Do(ctx, "EXPIRE", "k3", "500", "GT").Int64()
+	if got != 1 {
+		t.Errorf("EXPIRE GT with higher TTL: want 1, got %d", got)
+	}
+
+	// LT: new must be less than current (NULL = infinity, anything is less).
+	ts.client.Set(ctx, "k4", "v", 0)
+	got, _ = ts.client.Do(ctx, "EXPIRE", "k4", "100", "LT").Int64()
+	if got != 1 {
+		t.Errorf("EXPIRE LT against no TTL (infinity): want 1, got %d", got)
+	}
+	got, _ = ts.client.Do(ctx, "EXPIRE", "k4", "1000", "LT").Int64()
+	if got != 0 {
+		t.Errorf("EXPIRE LT with higher TTL: want 0, got %d", got)
+	}
+
+	// Mutually exclusive combinations are rejected.
+	if _, err := ts.client.Do(ctx, "EXPIRE", "k", "10", "NX", "XX").Result(); err == nil {
+		t.Errorf("EXPIRE NX XX: expected error, got nil")
+	}
+	if _, err := ts.client.Do(ctx, "EXPIRE", "k", "10", "GT", "LT").Result(); err == nil {
+		t.Errorf("EXPIRE GT LT: expected error, got nil")
+	}
+}
+
+func TestRandomKey(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+
+	// Empty keyspace returns nil.
+	v, err := ts.client.RandomKey(ctx).Result()
+	if err != redis.Nil {
+		t.Errorf("RANDOMKEY on empty db: want redis.Nil, got %q err=%v", v, err)
+	}
+
+	ts.client.Set(ctx, "rk1", "v", 0)
+	ts.client.Set(ctx, "rk2", "v", 0)
+	ts.client.Set(ctx, "rk3", "v", 0)
+	allowed := map[string]bool{"rk1": true, "rk2": true, "rk3": true}
+	for i := 0; i < 20; i++ {
+		k, err := ts.client.RandomKey(ctx).Result()
+		if err != nil {
+			t.Fatalf("RANDOMKEY: %v", err)
+		}
+		if !allowed[k] {
+			t.Errorf("RANDOMKEY returned unexpected key %q", k)
+		}
+	}
+}
+
+func TestSInterCard(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+
+	ts.client.SAdd(ctx, "s1", "a", "b", "c", "d")
+	ts.client.SAdd(ctx, "s2", "b", "c", "d", "e")
+	ts.client.SAdd(ctx, "s3", "c", "d", "x")
+
+	n, err := ts.client.SInterCard(ctx, 0, "s1", "s2", "s3").Result()
+	if err != nil {
+		t.Fatalf("SINTERCARD: %v", err)
+	}
+	if n != 2 { // c,d
+		t.Errorf("SINTERCARD: want 2, got %d", n)
+	}
+	// LIMIT caps the result
+	n, _ = ts.client.SInterCard(ctx, 1, "s1", "s2", "s3").Result()
+	if n != 1 {
+		t.Errorf("SINTERCARD LIMIT 1: want 1, got %d", n)
+	}
+	// Negative numkeys: client rejects this; raw command rejects 0 too.
+	if _, err := ts.client.Do(ctx, "SINTERCARD", "0", "s1").Result(); err == nil {
+		t.Errorf("SINTERCARD numkeys=0: expected error")
+	}
+}
+
+func TestZRevRange(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+
+	ts.client.ZAdd(ctx, "z",
+		redis.Z{Score: 1, Member: "a"},
+		redis.Z{Score: 2, Member: "b"},
+		redis.Z{Score: 3, Member: "c"},
+	)
+	out, err := ts.client.ZRevRange(ctx, "z", 0, -1).Result()
+	if err != nil {
+		t.Fatalf("ZREVRANGE: %v", err)
+	}
+	if strings.Join(out, ",") != "c,b,a" {
+		t.Errorf("ZREVRANGE: want c,b,a got %v", out)
+	}
+
+	withScores, err := ts.client.ZRevRangeWithScores(ctx, "z", 0, 1).Result()
+	if err != nil {
+		t.Fatalf("ZREVRANGE WITHSCORES: %v", err)
+	}
+	if len(withScores) != 2 || withScores[0].Member != "c" || withScores[1].Member != "b" {
+		t.Errorf("ZREVRANGE WITHSCORES: unexpected %v", withScores)
+	}
+}
+
+func TestZRevRangeByScore(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+
+	ts.client.ZAdd(ctx, "z",
+		redis.Z{Score: 1, Member: "a"},
+		redis.Z{Score: 2, Member: "b"},
+		redis.Z{Score: 3, Member: "c"},
+	)
+	out, err := ts.client.ZRevRangeByScore(ctx, "z", &redis.ZRangeBy{Min: "1", Max: "3"}).Result()
+	if err != nil {
+		t.Fatalf("ZREVRANGEBYSCORE: %v", err)
+	}
+	if strings.Join(out, ",") != "c,b,a" {
+		t.Errorf("ZREVRANGEBYSCORE: want c,b,a got %v", out)
+	}
+}
+
+func TestZLexAndZRangeStore(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+
+	// Equal scores so lex ordering applies.
+	for _, m := range []string{"a", "b", "c", "d", "e"} {
+		ts.client.ZAdd(ctx, "z", redis.Z{Score: 0, Member: m})
+	}
+
+	out, err := ts.client.ZRangeByLex(ctx, "z", &redis.ZRangeBy{Min: "[b", Max: "[d"}).Result()
+	if err != nil {
+		t.Fatalf("ZRANGEBYLEX: %v", err)
+	}
+	if strings.Join(out, ",") != "b,c,d" {
+		t.Errorf("ZRANGEBYLEX [b,d]: want b,c,d got %v", out)
+	}
+
+	out, err = ts.client.ZRangeByLex(ctx, "z", &redis.ZRangeBy{Min: "(b", Max: "(d"}).Result()
+	if err != nil {
+		t.Fatalf("ZRANGEBYLEX (b,d): %v", err)
+	}
+	if strings.Join(out, ",") != "c" {
+		t.Errorf("ZRANGEBYLEX (b,d): want c got %v", out)
+	}
+
+	out, err = ts.client.ZRangeByLex(ctx, "z", &redis.ZRangeBy{Min: "-", Max: "+"}).Result()
+	if err != nil || len(out) != 5 {
+		t.Errorf("ZRANGEBYLEX [-,+]: want all 5 got %v err=%v", out, err)
+	}
+
+	// ZREVRANGEBYLEX reverses, with max first.
+	out, err = ts.client.ZRevRangeByLex(ctx, "z", &redis.ZRangeBy{Max: "[d", Min: "[b"}).Result()
+	if err != nil {
+		t.Fatalf("ZREVRANGEBYLEX: %v", err)
+	}
+	if strings.Join(out, ",") != "d,c,b" {
+		t.Errorf("ZREVRANGEBYLEX: want d,c,b got %v", out)
+	}
+
+	n, err := ts.client.ZLexCount(ctx, "z", "[b", "[d").Result()
+	if err != nil {
+		t.Fatalf("ZLEXCOUNT: %v", err)
+	}
+	if n != 3 {
+		t.Errorf("ZLEXCOUNT: want 3, got %d", n)
+	}
+
+	// ZRANGESTORE — INDEX mode
+	n, err = ts.client.Do(ctx, "ZRANGESTORE", "dst", "z", "0", "2").Int64()
+	if err != nil {
+		t.Fatalf("ZRANGESTORE INDEX: %v", err)
+	}
+	if n != 3 {
+		t.Errorf("ZRANGESTORE INDEX: want 3, got %d", n)
+	}
+	stored, _ := ts.client.ZRange(ctx, "dst", 0, -1).Result()
+	if strings.Join(stored, ",") != "a,b,c" {
+		t.Errorf("ZRANGESTORE INDEX result: want a,b,c got %v", stored)
+	}
+
+	// ZRANGESTORE — BYSCORE mode with REV
+	n, _ = ts.client.Do(ctx, "ZRANGESTORE", "dst2", "z", "+inf", "-inf", "BYSCORE", "REV").Int64()
+	if n != 5 {
+		t.Errorf("ZRANGESTORE BYSCORE REV: want 5, got %d", n)
+	}
+}
+
+func TestHRandFieldSRandMemberZRandMember(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+
+	ts.client.HSet(ctx, "h", "f1", "v1", "f2", "v2", "f3", "v3")
+	field, err := ts.client.HRandField(ctx, "h", 1).Result()
+	if err != nil {
+		t.Fatalf("HRANDFIELD: %v", err)
+	}
+	if len(field) != 1 {
+		t.Errorf("HRANDFIELD 1: want 1 field, got %v", field)
+	}
+	fields, err := ts.client.HRandFieldWithValues(ctx, "h", 2).Result()
+	if err != nil {
+		t.Fatalf("HRANDFIELD WITHVALUES: %v", err)
+	}
+	if len(fields) != 2 {
+		t.Errorf("HRANDFIELD 2 WITHVALUES: want 2 pairs, got %d", len(fields))
+	}
+	// Negative count: duplicates allowed, returns exactly |count|.
+	fields2, err := ts.client.HRandField(ctx, "h", -5).Result()
+	if err != nil {
+		t.Fatalf("HRANDFIELD -5: %v", err)
+	}
+	if len(fields2) != 5 {
+		t.Errorf("HRANDFIELD -5: want 5, got %d", len(fields2))
+	}
+
+	ts.client.SAdd(ctx, "s", "a", "b", "c")
+	mems, err := ts.client.SRandMemberN(ctx, "s", 2).Result()
+	if err != nil {
+		t.Fatalf("SRANDMEMBER 2: %v", err)
+	}
+	if len(mems) != 2 {
+		t.Errorf("SRANDMEMBER 2: want 2, got %d", len(mems))
+	}
+	mems, err = ts.client.SRandMemberN(ctx, "s", -10).Result()
+	if err != nil {
+		t.Fatalf("SRANDMEMBER -10: %v", err)
+	}
+	if len(mems) != 10 {
+		t.Errorf("SRANDMEMBER -10: want 10, got %d", len(mems))
+	}
+
+	ts.client.ZAdd(ctx, "z", redis.Z{Score: 1, Member: "a"}, redis.Z{Score: 2, Member: "b"}, redis.Z{Score: 3, Member: "c"})
+	zmems, err := ts.client.ZRandMember(ctx, "z", 2).Result()
+	if err != nil {
+		t.Fatalf("ZRANDMEMBER 2: %v", err)
+	}
+	if len(zmems) != 2 {
+		t.Errorf("ZRANDMEMBER 2: want 2, got %d", len(zmems))
+	}
+}
+
+func TestObjectEncoding(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+
+	ts.client.Set(ctx, "s", "v", 0)
+	ts.client.HSet(ctx, "h", "f", "v")
+	ts.client.LPush(ctx, "l", "v")
+	ts.client.SAdd(ctx, "set", "v")
+	ts.client.ZAdd(ctx, "z", redis.Z{Score: 1, Member: "v"})
+
+	for _, tc := range []struct {
+		key, want string
+	}{
+		{"s", "raw"},
+		{"h", "listpack"},
+		{"l", "quicklist"},
+		{"set", "listpack"},
+		{"z", "skiplist"},
+	} {
+		got, err := ts.client.ObjectEncoding(ctx, tc.key).Result()
+		if err != nil {
+			t.Errorf("OBJECT ENCODING %s: %v", tc.key, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("OBJECT ENCODING %s: want %s got %s", tc.key, tc.want, got)
+		}
+	}
+
+	// Missing key errors.
+	if _, err := ts.client.ObjectEncoding(ctx, "nope").Result(); err == nil {
+		t.Errorf("OBJECT ENCODING missing key: expected error")
+	}
+}
+
+func TestReset(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+
+	// RESET responds with +RESET. We don't validate post-reset state here
+	// because go-redis pools connections — the RESET happens on whichever
+	// pooled conn handles the call. The bare smoke test of "is the command
+	// accepted and replied to" is enough to catch dispatch regressions.
+	res, err := ts.client.Do(ctx, "RESET").Text()
+	if err != nil {
+		t.Fatalf("RESET: %v", err)
+	}
+	if res != "RESET" {
+		t.Errorf("RESET: want RESET, got %q", res)
+	}
+}
+
+func TestLMPop(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+
+	ts.client.RPush(ctx, "l1") // empty
+	ts.client.RPush(ctx, "l2", "a", "b", "c")
+
+	// LEFT: pop from the first non-empty key from the left.
+	res, err := ts.client.Do(ctx, "LMPOP", "2", "l1", "l2", "LEFT", "COUNT", "2").Result()
+	if err != nil {
+		t.Fatalf("LMPOP: %v", err)
+	}
+	arr, ok := res.([]interface{})
+	if !ok || len(arr) != 2 {
+		t.Fatalf("LMPOP: unexpected shape %T %v", res, res)
+	}
+	if arr[0].(string) != "l2" {
+		t.Errorf("LMPOP: want key=l2 got %v", arr[0])
+	}
+	values := arr[1].([]interface{})
+	if len(values) != 2 || values[0].(string) != "a" || values[1].(string) != "b" {
+		t.Errorf("LMPOP LEFT COUNT 2: want [a,b] got %v", values)
+	}
+
+	// RIGHT remains: just c
+	res, _ = ts.client.Do(ctx, "LMPOP", "1", "l2", "RIGHT").Result()
+	arr = res.([]interface{})
+	values = arr[1].([]interface{})
+	if values[0].(string) != "c" {
+		t.Errorf("LMPOP RIGHT: want c got %v", values[0])
+	}
+
+	// All empty → null.
+	if _, err := ts.client.Do(ctx, "LMPOP", "2", "x", "y", "LEFT").Result(); err != redis.Nil {
+		t.Errorf("LMPOP empty: want redis.Nil got %v", err)
+	}
+}
+
+func TestBLMPopTimeout(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+
+	start := time.Now()
+	_, err := ts.client.Do(ctx, "BLMPOP", "1.0", "1", "missing", "LEFT").Result()
+	if err != redis.Nil {
+		t.Errorf("BLMPOP timeout: want redis.Nil, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 900*time.Millisecond {
+		t.Errorf("BLMPOP returned too fast: %v", elapsed)
+	}
+}
+
+func TestZMPop(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+
+	ts.client.ZAdd(ctx, "z1") // empty
+	ts.client.ZAdd(ctx, "z2",
+		redis.Z{Score: 1, Member: "a"},
+		redis.Z{Score: 2, Member: "b"},
+		redis.Z{Score: 3, Member: "c"},
+	)
+
+	res, err := ts.client.Do(ctx, "ZMPOP", "2", "z1", "z2", "MIN", "COUNT", "2").Result()
+	if err != nil {
+		t.Fatalf("ZMPOP: %v", err)
+	}
+	arr := res.([]interface{})
+	if arr[0].(string) != "z2" {
+		t.Errorf("ZMPOP: want key=z2 got %v", arr[0])
+	}
+	pairs := arr[1].([]interface{})
+	if len(pairs) != 2 {
+		t.Fatalf("ZMPOP MIN COUNT 2: want 2 pairs, got %d", len(pairs))
+	}
+	// Each pair is [member, score]
+	p0 := pairs[0].([]interface{})
+	if p0[0].(string) != "a" {
+		t.Errorf("ZMPOP MIN: first member should be 'a', got %v", p0[0])
+	}
+
+	// MAX direction
+	res, _ = ts.client.Do(ctx, "ZMPOP", "1", "z2", "MAX").Result()
+	arr = res.([]interface{})
+	pairs = arr[1].([]interface{})
+	p0 = pairs[0].([]interface{})
+	if p0[0].(string) != "c" {
+		t.Errorf("ZMPOP MAX: want c got %v", p0[0])
+	}
+
+	// Empty
+	if _, err := ts.client.Do(ctx, "ZMPOP", "1", "nope", "MIN").Result(); err != redis.Nil {
+		t.Errorf("ZMPOP empty: want redis.Nil got %v", err)
+	}
+}

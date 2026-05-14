@@ -115,8 +115,8 @@ func (t *TxStore) Exists(ctx context.Context, keys []string) (int64, error) {
 	return t.ops.exists(ctx, t.querier(), keys)
 }
 
-func (t *TxStore) Expire(ctx context.Context, key string, ttl time.Duration) (bool, error) {
-	return t.ops.expire(ctx, t.querier(), key, ttl)
+func (t *TxStore) Expire(ctx context.Context, key string, ttl time.Duration, opts ExpireOptions) (bool, error) {
+	return t.ops.expire(ctx, t.querier(), key, ttl, opts)
 }
 
 func (t *TxStore) TTL(ctx context.Context, key string) (int64, error) {
@@ -135,6 +135,10 @@ func (t *TxStore) Keys(ctx context.Context, pattern string) ([]string, error) {
 	return t.ops.keys(ctx, t.querier(), pattern)
 }
 
+func (t *TxStore) RandomKey(ctx context.Context) (string, bool, error) {
+	return t.ops.randomKey(ctx, t.querier())
+}
+
 func (t *TxStore) Type(ctx context.Context, key string) (KeyType, error) {
 	return t.ops.keyType(ctx, t.querier(), key)
 }
@@ -143,8 +147,8 @@ func (t *TxStore) Rename(ctx context.Context, oldKey, newKey string) error {
 	return t.ops.rename(ctx, t.querier(), oldKey, newKey)
 }
 
-func (t *TxStore) ExpireAt(ctx context.Context, key string, timestamp time.Time) (bool, error) {
-	return t.ops.expireAt(ctx, t.querier(), key, timestamp)
+func (t *TxStore) ExpireAt(ctx context.Context, key string, timestamp time.Time, opts ExpireOptions) (bool, error) {
+	return t.ops.expireAt(ctx, t.querier(), key, timestamp, opts)
 }
 
 func (t *TxStore) Copy(ctx context.Context, source, destination string, replace bool) (bool, error) {
@@ -249,6 +253,22 @@ func (t *TxStore) RPopMulti(ctx context.Context, keys []string) (string, string,
 	return t.ops.rPopMulti(ctx, t.querier(), keys)
 }
 
+func (t *TxStore) LMPop(ctx context.Context, keys []string, count int64) (string, []string, bool, error) {
+	return t.ops.lMPop(ctx, t.querier(), keys, count)
+}
+
+func (t *TxStore) RMPop(ctx context.Context, keys []string, count int64) (string, []string, bool, error) {
+	return t.ops.rMPop(ctx, t.querier(), keys, count)
+}
+
+func (t *TxStore) ZMPopMin(ctx context.Context, keys []string, count int64) (string, []ZMember, bool, error) {
+	return t.ops.zMPopMin(ctx, t.querier(), keys, count)
+}
+
+func (t *TxStore) ZMPopMax(ctx context.Context, keys []string, count int64) (string, []ZMember, bool, error) {
+	return t.ops.zMPopMax(ctx, t.querier(), keys, count)
+}
+
 func (t *TxStore) LLen(ctx context.Context, key string) (int64, error) {
 	return t.ops.lLen(ctx, t.querier(), key)
 }
@@ -331,6 +351,22 @@ func (t *TxStore) SDiff(ctx context.Context, keys []string) ([]string, error) {
 	return t.ops.sDiff(ctx, t.querier(), keys)
 }
 
+func (t *TxStore) SInterCard(ctx context.Context, keys []string, limit int64) (int64, error) {
+	return t.ops.sInterCard(ctx, t.querier(), keys, limit)
+}
+
+func (t *TxStore) HRandField(ctx context.Context, key string, count int64, withValues bool) ([]string, error) {
+	return t.ops.hRandField(ctx, t.querier(), key, count, withValues)
+}
+
+func (t *TxStore) SRandMember(ctx context.Context, key string, count int64) ([]string, error) {
+	return t.ops.sRandMember(ctx, t.querier(), key, count)
+}
+
+func (t *TxStore) ZRandMember(ctx context.Context, key string, count int64) ([]ZMember, error) {
+	return t.ops.zRandMember(ctx, t.querier(), key, count)
+}
+
 func (t *TxStore) SDiffStore(ctx context.Context, destination string, keys []string) (int64, error) {
 	return t.ops.sDiffStore(ctx, t.querier(), destination, keys)
 }
@@ -355,6 +391,30 @@ func (t *TxStore) ZRem(ctx context.Context, key string, members []string) (int64
 
 func (t *TxStore) ZCard(ctx context.Context, key string) (int64, error) {
 	return t.ops.zCard(ctx, t.querier(), key)
+}
+
+func (t *TxStore) ZRevRange(ctx context.Context, key string, start, stop int64, withScores bool) ([]ZMember, error) {
+	return t.ops.zRevRange(ctx, t.querier(), key, start, stop, withScores)
+}
+
+func (t *TxStore) ZRevRangeByScore(ctx context.Context, key string, min, max float64, withScores bool, offset, count int64) ([]ZMember, error) {
+	return t.ops.zRevRangeByScore(ctx, t.querier(), key, min, max, withScores, offset, count)
+}
+
+func (t *TxStore) ZRangeByLex(ctx context.Context, key string, min, max LexBound, offset, count int64) ([]string, error) {
+	return t.ops.zRangeByLex(ctx, t.querier(), key, min, max, offset, count)
+}
+
+func (t *TxStore) ZRevRangeByLex(ctx context.Context, key string, min, max LexBound, offset, count int64) ([]string, error) {
+	return t.ops.zRevRangeByLex(ctx, t.querier(), key, min, max, offset, count)
+}
+
+func (t *TxStore) ZLexCount(ctx context.Context, key string, min, max LexBound) (int64, error) {
+	return t.ops.zLexCount(ctx, t.querier(), key, min, max)
+}
+
+func (t *TxStore) ZRangeStore(ctx context.Context, dst, src string, spec ZRangeStoreSpec) (int64, error) {
+	return t.ops.zRangeStore(ctx, t.querier(), dst, src, spec)
 }
 
 func (t *TxStore) ZRangeByScore(ctx context.Context, key string, min, max float64, withScores bool, offset, count int64) ([]ZMember, error) {

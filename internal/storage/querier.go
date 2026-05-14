@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"math/rand"
 	"sort"
 	"strconv"
 	"strings"
@@ -943,7 +944,32 @@ func (o queryOps) exists(ctx context.Context, q Querier, keys []string) (int64, 
 	return count, err
 }
 
-func (o queryOps) expire(ctx context.Context, q Querier, key string, ttl time.Duration) (bool, error) {
+// expireWhereClause builds the WHERE filter that determines whether the
+// EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT update is applied, based on the Redis
+// 7.0 NX/XX/GT/LT flags. The clause always references $1 (key) and $2 (new
+// expires_at), and inherits the base existence check so already-expired keys
+// are not resurrected.
+func expireWhereClause(opts ExpireOptions) string {
+	switch {
+	case opts.NX:
+		// Only when no TTL is set. The base existence check is implied because
+		// expires_at IS NULL also means "no TTL", and we don't need the
+		// "or expires_at > NOW()" branch.
+		return "key = $1 AND expires_at IS NULL"
+	case opts.XX:
+		return "key = $1 AND expires_at IS NOT NULL AND expires_at > NOW()"
+	case opts.GT:
+		// A key with no TTL is conceptually infinite; nothing can be greater.
+		return "key = $1 AND expires_at IS NOT NULL AND expires_at > NOW() AND $2 > expires_at"
+	case opts.LT:
+		// A key with no TTL is conceptually infinite; anything is less.
+		return "key = $1 AND (expires_at IS NULL OR (expires_at > NOW() AND $2 < expires_at))"
+	default:
+		return "key = $1 AND (expires_at IS NULL OR expires_at > NOW())"
+	}
+}
+
+func (o queryOps) expire(ctx context.Context, q Querier, key string, ttl time.Duration, opts ExpireOptions) (bool, error) {
 	key = encodeKey(key)
 	if err := o.lockKey(ctx, q, key); err != nil {
 		return false, err
@@ -951,8 +977,7 @@ func (o queryOps) expire(ctx context.Context, q Querier, key string, ttl time.Du
 	expiresAt := time.Now().Add(ttl)
 
 	result, err := q.Exec(ctx,
-		`UPDATE kv_meta SET expires_at = $2 
-		 WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())`,
+		fmt.Sprintf("UPDATE kv_meta SET expires_at = $2 WHERE %s", expireWhereClause(opts)),
 		key, expiresAt,
 	)
 	if err != nil {
@@ -1053,6 +1078,22 @@ func (o queryOps) persist(ctx context.Context, q Querier, key string) (bool, err
 	}
 
 	return true, nil
+}
+
+func (o queryOps) randomKey(ctx context.Context, q Querier) (string, bool, error) {
+	var key string
+	err := q.QueryRow(ctx,
+		`SELECT key FROM kv_meta
+		 WHERE expires_at IS NULL OR expires_at > NOW()
+		 ORDER BY random() LIMIT 1`,
+	).Scan(&key)
+	if err == pgx.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return decodeKey(key), true, nil
 }
 
 func (o queryOps) keys(ctx context.Context, q Querier, pattern string) ([]string, error) {
@@ -1727,6 +1768,139 @@ func (o queryOps) rPopMulti(ctx context.Context, q Querier, keys []string) (stri
 	return o.popMulti(ctx, q, keys, "DESC")
 }
 
+// popMultiN is the LMPOP/RMPOP analogue of popMulti: it identifies the first
+// non-empty key among keys (in caller order) and pops up to count elements
+// from that one key in one SQL round-trip. order is "ASC" for LMPOP (left)
+// or "DESC" for RMPOP (right).
+func (o queryOps) popMultiN(ctx context.Context, q Querier, keys []string, order string, count int64) (string, []string, bool, error) {
+	if len(keys) == 0 || count <= 0 {
+		return "", nil, false, nil
+	}
+	encoded := make([]string, len(keys))
+	copy(encoded, keys)
+	encoded = encodeKeys(encoded)
+
+	// winner: the first non-empty key (precedence by array_position).
+	// target: rows from that key in pop order, capped at count.
+	sql := `WITH winner AS (
+		SELECT key FROM kv_lists
+		WHERE key = ANY($1::text[]) AND (expires_at IS NULL OR expires_at > NOW())
+		ORDER BY array_position($1::text[], key), idx ` + order + `
+		LIMIT 1
+	),
+	target AS (
+		SELECT key, idx FROM kv_lists
+		WHERE key = (SELECT key FROM winner)
+		  AND (expires_at IS NULL OR expires_at > NOW())
+		ORDER BY idx ` + order + `
+		LIMIT $2 FOR UPDATE SKIP LOCKED
+	),
+	deleted AS (
+		DELETE FROM kv_lists
+		WHERE (key, idx) IN (SELECT key, idx FROM target)
+		RETURNING key, idx, value
+	)
+	SELECT key, value FROM deleted ORDER BY idx ` + order
+
+	rows, err := q.Query(ctx, sql, encoded, count)
+	if err != nil {
+		return "", nil, false, err
+	}
+	defer rows.Close()
+
+	var poppedKey string
+	var values []string
+	for rows.Next() {
+		var k string
+		var v []byte
+		if err := rows.Scan(&k, &v); err != nil {
+			return "", nil, false, err
+		}
+		poppedKey = k
+		values = append(values, string(v))
+	}
+	if err := rows.Err(); err != nil {
+		return "", nil, false, err
+	}
+	if len(values) == 0 {
+		return "", nil, false, nil
+	}
+	return decodeKey(poppedKey), values, true, nil
+}
+
+func (o queryOps) lMPop(ctx context.Context, q Querier, keys []string, count int64) (string, []string, bool, error) {
+	return o.popMultiN(ctx, q, keys, "ASC", count)
+}
+
+func (o queryOps) rMPop(ctx context.Context, q Querier, keys []string, count int64) (string, []string, bool, error) {
+	return o.popMultiN(ctx, q, keys, "DESC", count)
+}
+
+// zMPop is the ZMPOP analogue: identify the first non-empty zset, then pop
+// up to count members by score (DESC for MAX, ASC for MIN) in one round-trip.
+func (o queryOps) zMPop(ctx context.Context, q Querier, keys []string, order string, count int64) (string, []ZMember, bool, error) {
+	if len(keys) == 0 || count <= 0 {
+		return "", nil, false, nil
+	}
+	encoded := make([]string, len(keys))
+	copy(encoded, keys)
+	encoded = encodeKeys(encoded)
+
+	sql := `WITH winner AS (
+		SELECT key FROM kv_zsets
+		WHERE key = ANY($1::text[]) AND (expires_at IS NULL OR expires_at > NOW())
+		ORDER BY array_position($1::text[], key), score ` + order + `, member ` + order + `
+		LIMIT 1
+	),
+	target AS (
+		SELECT key, member FROM kv_zsets
+		WHERE key = (SELECT key FROM winner)
+		  AND (expires_at IS NULL OR expires_at > NOW())
+		ORDER BY score ` + order + `, member ` + order + `
+		LIMIT $2 FOR UPDATE SKIP LOCKED
+	),
+	deleted AS (
+		DELETE FROM kv_zsets
+		WHERE (key, member) IN (SELECT key, member FROM target)
+		RETURNING key, member, score
+	)
+	SELECT key, member, score FROM deleted ORDER BY score ` + order + `, member ` + order
+
+	rows, err := q.Query(ctx, sql, encoded, count)
+	if err != nil {
+		return "", nil, false, err
+	}
+	defer rows.Close()
+
+	var poppedKey string
+	var members []ZMember
+	for rows.Next() {
+		var k string
+		var m []byte
+		var s float64
+		if err := rows.Scan(&k, &m, &s); err != nil {
+			return "", nil, false, err
+		}
+		poppedKey = k
+		members = append(members, ZMember{Member: string(m), Score: s})
+	}
+	if err := rows.Err(); err != nil {
+		return "", nil, false, err
+	}
+	if len(members) == 0 {
+		return "", nil, false, nil
+	}
+	return decodeKey(poppedKey), members, true, nil
+}
+
+func (o queryOps) zMPopMin(ctx context.Context, q Querier, keys []string, count int64) (string, []ZMember, bool, error) {
+	return o.zMPop(ctx, q, keys, "ASC", count)
+}
+
+func (o queryOps) zMPopMax(ctx context.Context, q Querier, keys []string, count int64) (string, []ZMember, bool, error) {
+	return o.zMPop(ctx, q, keys, "DESC", count)
+}
+
 func (o queryOps) lLen(ctx context.Context, q Querier, key string) (int64, error) {
 	key = encodeKey(key)
 
@@ -2061,6 +2235,48 @@ func (o queryOps) zRange(ctx context.Context, q Querier, key string, start, stop
 	return members, rows.Err()
 }
 
+// zRevRange mirrors zRange with ORDER BY DESC: positions are still 0-based but
+// counted from the highest score downward.
+func (o queryOps) zRevRange(ctx context.Context, q Querier, key string, start, stop int64, withScores bool) ([]ZMember, error) {
+	key = encodeKey(key)
+	rows, err := q.Query(ctx,
+		`WITH cnt AS (
+			SELECT COUNT(*)::bigint AS total FROM kv_zsets
+			WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())
+		),
+		bounds AS (
+			SELECT
+				GREATEST(CASE WHEN $2::bigint < 0 THEN total + $2::bigint ELSE $2::bigint END, 0) AS start_pos,
+				LEAST(CASE WHEN $3::bigint < 0 THEN total + $3::bigint ELSE $3::bigint END, total - 1) AS stop_pos,
+				total
+			FROM cnt
+		)
+		SELECT member, score FROM kv_zsets, bounds
+		WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())
+		  AND bounds.total > 0
+		  AND bounds.start_pos <= bounds.stop_pos
+		ORDER BY score DESC, member DESC
+		LIMIT (SELECT GREATEST(stop_pos - start_pos + 1, 0) FROM bounds)
+		OFFSET (SELECT start_pos FROM bounds)`,
+		key, start, stop,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var members []ZMember
+	for rows.Next() {
+		var member []byte
+		var score float64
+		if err := rows.Scan(&member, &score); err != nil {
+			return nil, err
+		}
+		members = append(members, ZMember{Member: string(member), Score: score})
+	}
+	return members, rows.Err()
+}
+
 func (o queryOps) zScore(ctx context.Context, q Querier, key, member string) (float64, bool, error) {
 	key = encodeKey(key)
 	var score float64
@@ -2121,6 +2337,280 @@ func (o queryOps) zRangeByScore(ctx context.Context, q Querier, key string, min,
 		query = `SELECT member, score FROM kv_zsets 
 			 WHERE key = $1 AND score >= $2 AND score <= $3 AND (expires_at IS NULL OR expires_at > NOW())
 			 ORDER BY score ASC, member ASC`
+		args = []interface{}{key, min, max}
+	}
+
+	rows, err := q.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var members []ZMember
+	for rows.Next() {
+		var member []byte
+		var score float64
+		if err := rows.Scan(&member, &score); err != nil {
+			return nil, err
+		}
+		members = append(members, ZMember{Member: string(member), Score: score})
+	}
+	return members, nil
+}
+
+// lexBoundClause turns one LexBound side into a SQL fragment + positional
+// argument (or no argument if Infinity). The clause is empty when the bound
+// imposes no restriction (matching ±infinity on the corresponding side).
+func lexBoundClause(b LexBound, isLower bool, paramIdx int) (clause string, arg interface{}) {
+	// Lower bound: -inf matches everything → no clause; +inf rejects everything
+	// (we represent that by a falsy 1=0). Mirror for upper bound.
+	if isLower {
+		switch b.Infinity {
+		case -1:
+			return "", nil
+		case +1:
+			return "1=0", nil
+		}
+	} else {
+		switch b.Infinity {
+		case +1:
+			return "", nil
+		case -1:
+			return "1=0", nil
+		}
+	}
+	op := "<"
+	if isLower {
+		op = ">"
+	}
+	if b.Inclusive {
+		op += "="
+	}
+	return fmt.Sprintf("member %s $%d", op, paramIdx), []byte(b.Value)
+}
+
+// buildLexWhere produces the WHERE-clause tail and ordered args for
+// zRangeByLex/zLexCount given parsed min/max bounds.
+func buildLexWhere(min, max LexBound, baseArgs []interface{}) (where string, args []interface{}) {
+	args = baseArgs
+	clauses := []string{}
+	if c, a := lexBoundClause(min, true, len(args)+1); c != "" {
+		clauses = append(clauses, c)
+		if a != nil {
+			args = append(args, a)
+		}
+	}
+	if c, a := lexBoundClause(max, false, len(args)+1); c != "" {
+		clauses = append(clauses, c)
+		if a != nil {
+			args = append(args, a)
+		}
+	}
+	if len(clauses) == 0 {
+		return "", args
+	}
+	return " AND " + strings.Join(clauses, " AND "), args
+}
+
+func (o queryOps) zRangeByLex(ctx context.Context, q Querier, key string, min, max LexBound, offset, count int64) ([]string, error) {
+	key = encodeKey(key)
+	where, args := buildLexWhere(min, max, []interface{}{key})
+
+	sql := "SELECT member FROM kv_zsets WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())" + where + " ORDER BY member ASC"
+	if count > 0 {
+		sql += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+		args = append(args, count, offset)
+	} else if offset > 0 {
+		sql += fmt.Sprintf(" OFFSET $%d", len(args)+1)
+		args = append(args, offset)
+	}
+
+	rows, err := q.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var members []string
+	for rows.Next() {
+		var member []byte
+		if err := rows.Scan(&member); err != nil {
+			return nil, err
+		}
+		members = append(members, string(member))
+	}
+	return members, rows.Err()
+}
+
+// zRevRangeByLex is zRangeByLex with ORDER BY DESC. The Redis wire protocol
+// passes max before min for ZREVRANGEBYLEX; the caller normalizes that.
+func (o queryOps) zRevRangeByLex(ctx context.Context, q Querier, key string, min, max LexBound, offset, count int64) ([]string, error) {
+	key = encodeKey(key)
+	where, args := buildLexWhere(min, max, []interface{}{key})
+
+	sql := "SELECT member FROM kv_zsets WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())" + where + " ORDER BY member DESC"
+	if count > 0 {
+		sql += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+		args = append(args, count, offset)
+	} else if offset > 0 {
+		sql += fmt.Sprintf(" OFFSET $%d", len(args)+1)
+		args = append(args, offset)
+	}
+
+	rows, err := q.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var members []string
+	for rows.Next() {
+		var member []byte
+		if err := rows.Scan(&member); err != nil {
+			return nil, err
+		}
+		members = append(members, string(member))
+	}
+	return members, rows.Err()
+}
+
+// zRangeStore evaluates the ZRANGE-style query described by spec against src
+// and copies the resulting (member, score) pairs into dst. dst is fully
+// replaced (any prior content is dropped). The caller is responsible for
+// running this inside a transaction so the replace is atomic.
+func (o queryOps) zRangeStore(ctx context.Context, q Querier, dst, src string, spec ZRangeStoreSpec) (int64, error) {
+	srcEnc := encodeKey(src)
+	dstEnc := encodeKey(dst)
+
+	// Build the source SELECT (member, score) + ordered args based on spec.
+	// $1 is always the source key; downstream args follow.
+	args := []interface{}{srcEnc}
+	var srcSQL string
+
+	orderAsc := "ORDER BY score ASC, member ASC"
+	orderDesc := "ORDER BY score DESC, member DESC"
+	order := orderAsc
+	if spec.Rev {
+		order = orderDesc
+	}
+
+	switch spec.By {
+	case ZRangeByIndex:
+		// Use the same bounds CTE as zRange/zRevRange to handle negative
+		// indices server-side.
+		args = append(args, spec.Start, spec.Stop)
+		srcSQL = fmt.Sprintf(`WITH cnt AS (
+			SELECT COUNT(*)::bigint AS total FROM kv_zsets
+			WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())
+		),
+		bounds AS (
+			SELECT
+				GREATEST(CASE WHEN $2::bigint < 0 THEN total + $2::bigint ELSE $2::bigint END, 0) AS start_pos,
+				LEAST(CASE WHEN $3::bigint < 0 THEN total + $3::bigint ELSE $3::bigint END, total - 1) AS stop_pos,
+				total
+			FROM cnt
+		)
+		SELECT member, score FROM kv_zsets, bounds
+		WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())
+		  AND bounds.total > 0
+		  AND bounds.start_pos <= bounds.stop_pos
+		%s
+		LIMIT (SELECT GREATEST(stop_pos - start_pos + 1, 0) FROM bounds)
+		OFFSET (SELECT start_pos FROM bounds)`, order)
+	case ZRangeByScore:
+		args = append(args, spec.MinScore, spec.MaxScore)
+		srcSQL = fmt.Sprintf(`SELECT member, score FROM kv_zsets
+			WHERE key = $1 AND score >= $2 AND score <= $3
+			  AND (expires_at IS NULL OR expires_at > NOW())
+			%s`, order)
+		if spec.Count > 0 {
+			srcSQL += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+			args = append(args, spec.Count, spec.Offset)
+		}
+	case ZRangeByLex:
+		where, withArgs := buildLexWhere(spec.MinLex, spec.MaxLex, args)
+		args = withArgs
+		// Lex ordering: by member only (scores tie because lex queries assume
+		// equal scores; we still preserve the actual score from the source).
+		lexOrder := "ORDER BY member ASC"
+		if spec.Rev {
+			lexOrder = "ORDER BY member DESC"
+		}
+		srcSQL = "SELECT member, score FROM kv_zsets WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())" + where + " " + lexOrder
+		if spec.Count > 0 {
+			srcSQL += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+			args = append(args, spec.Count, spec.Offset)
+		}
+	default:
+		return 0, fmt.Errorf("unknown ZRangeStoreBy: %d", spec.By)
+	}
+
+	// Replace dst: drop any prior data and meta entries, then insert.
+	if err := o.deleteKeyFromAllTables(ctx, q, dstEnc); err != nil {
+		return 0, err
+	}
+
+	// Insert: prepend $dstPlaceholder via a CTE so we only need one statement.
+	dstArgIdx := len(args) + 1
+	args = append(args, dstEnc)
+	insertSQL := fmt.Sprintf(`WITH src AS (%s)
+		INSERT INTO kv_zsets (key, member, score)
+		SELECT $%d, member, score FROM src
+		RETURNING 1`, srcSQL, dstArgIdx)
+
+	rows, err := q.Query(ctx, insertSQL, args...)
+	if err != nil {
+		return 0, err
+	}
+	var n int64
+	for rows.Next() {
+		n++
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	// Only register the key in kv_meta if we stored something. ZRangeStore on
+	// an empty result leaves dst missing, matching Redis.
+	if n > 0 {
+		if err := o.setMeta(ctx, q, dstEnc, TypeZSet, nil); err != nil {
+			return 0, err
+		}
+	}
+	return n, nil
+}
+
+func (o queryOps) zLexCount(ctx context.Context, q Querier, key string, min, max LexBound) (int64, error) {
+	key = encodeKey(key)
+	where, args := buildLexWhere(min, max, []interface{}{key})
+
+	var count int64
+	err := q.QueryRow(ctx,
+		"SELECT COUNT(*) FROM kv_zsets WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())"+where,
+		args...,
+	).Scan(&count)
+	return count, err
+}
+
+// zRevRangeByScore mirrors zRangeByScore with ORDER BY DESC. The caller is
+// responsible for passing min/max in the right slots (Redis ZREVRANGEBYSCORE
+// flips them in the wire protocol; this helper takes them already normalized).
+func (o queryOps) zRevRangeByScore(ctx context.Context, q Querier, key string, min, max float64, withScores bool, offset, count int64) ([]ZMember, error) {
+	key = encodeKey(key)
+	var query string
+	var args []interface{}
+
+	if count > 0 {
+		query = `SELECT member, score FROM kv_zsets
+			 WHERE key = $1 AND score >= $2 AND score <= $3 AND (expires_at IS NULL OR expires_at > NOW())
+			 ORDER BY score DESC, member DESC
+			 LIMIT $4 OFFSET $5`
+		args = []interface{}{key, min, max, count, offset}
+	} else {
+		query = `SELECT member, score FROM kv_zsets
+			 WHERE key = $1 AND score >= $2 AND score <= $3 AND (expires_at IS NULL OR expires_at > NOW())
+			 ORDER BY score DESC, member DESC`
 		args = []interface{}{key, min, max}
 	}
 
@@ -2785,6 +3275,236 @@ func (o queryOps) sDiffStore(ctx context.Context, q Querier, destination string,
 	return o.sAdd(ctx, q, destination, members)
 }
 
+// randInt returns a uniform int in [0, n). Used by the sample-with-replacement
+// paths of HRandField/SRandMember/ZRandMember. Crypto-strength randomness is
+// not required — these are non-security samples.
+func randInt(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	return rand.Intn(n)
+}
+
+// hRandField samples random fields (and optionally values) from a hash.
+func (o queryOps) hRandField(ctx context.Context, q Querier, key string, count int64, withValues bool) ([]string, error) {
+	if count == 0 {
+		return nil, nil
+	}
+	key = encodeKey(key)
+
+	if count > 0 {
+		// Distinct sample via ORDER BY random() LIMIT count. Postgres caps the
+		// result at the row count automatically — matches Redis (no padding).
+		var sql string
+		if withValues {
+			sql = `SELECT field, value FROM kv_hashes
+				   WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())
+				   ORDER BY random() LIMIT $2`
+		} else {
+			sql = `SELECT field FROM kv_hashes
+				   WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())
+				   ORDER BY random() LIMIT $2`
+		}
+		rows, err := q.Query(ctx, sql, key, count)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var result []string
+		for rows.Next() {
+			var f string
+			if withValues {
+				var v []byte
+				if err := rows.Scan(&f, &v); err != nil {
+					return nil, err
+				}
+				result = append(result, decodeField(f), string(v))
+			} else {
+				if err := rows.Scan(&f); err != nil {
+					return nil, err
+				}
+				result = append(result, decodeField(f))
+			}
+		}
+		return result, rows.Err()
+	}
+
+	// count < 0: sample with replacement. Fetch all then bootstrap.
+	rows, err := q.Query(ctx,
+		`SELECT field, value FROM kv_hashes
+		 WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())`,
+		key,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	type fv struct{ field, value string }
+	var pool []fv
+	for rows.Next() {
+		var f string
+		var v []byte
+		if err := rows.Scan(&f, &v); err != nil {
+			return nil, err
+		}
+		pool = append(pool, fv{decodeField(f), string(v)})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(pool) == 0 {
+		return nil, nil
+	}
+	n := -count
+	out := make([]string, 0, n)
+	if withValues {
+		out = make([]string, 0, n*2)
+	}
+	for i := int64(0); i < n; i++ {
+		p := pool[randInt(len(pool))]
+		out = append(out, p.field)
+		if withValues {
+			out = append(out, p.value)
+		}
+	}
+	return out, nil
+}
+
+func (o queryOps) sRandMember(ctx context.Context, q Querier, key string, count int64) ([]string, error) {
+	if count == 0 {
+		return nil, nil
+	}
+	key = encodeKey(key)
+	if count > 0 {
+		rows, err := q.Query(ctx,
+			`SELECT member FROM kv_sets
+			 WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())
+			 ORDER BY random() LIMIT $2`,
+			key, count,
+		)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var members []string
+		for rows.Next() {
+			var m []byte
+			if err := rows.Scan(&m); err != nil {
+				return nil, err
+			}
+			members = append(members, string(m))
+		}
+		return members, rows.Err()
+	}
+	rows, err := q.Query(ctx,
+		`SELECT member FROM kv_sets
+		 WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())`,
+		key,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var pool []string
+	for rows.Next() {
+		var m []byte
+		if err := rows.Scan(&m); err != nil {
+			return nil, err
+		}
+		pool = append(pool, string(m))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(pool) == 0 {
+		return nil, nil
+	}
+	n := -count
+	out := make([]string, 0, n)
+	for i := int64(0); i < n; i++ {
+		out = append(out, pool[randInt(len(pool))])
+	}
+	return out, nil
+}
+
+func (o queryOps) zRandMember(ctx context.Context, q Querier, key string, count int64) ([]ZMember, error) {
+	if count == 0 {
+		return nil, nil
+	}
+	key = encodeKey(key)
+	if count > 0 {
+		rows, err := q.Query(ctx,
+			`SELECT member, score FROM kv_zsets
+			 WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())
+			 ORDER BY random() LIMIT $2`,
+			key, count,
+		)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var members []ZMember
+		for rows.Next() {
+			var m []byte
+			var s float64
+			if err := rows.Scan(&m, &s); err != nil {
+				return nil, err
+			}
+			members = append(members, ZMember{Member: string(m), Score: s})
+		}
+		return members, rows.Err()
+	}
+	rows, err := q.Query(ctx,
+		`SELECT member, score FROM kv_zsets
+		 WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())`,
+		key,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var pool []ZMember
+	for rows.Next() {
+		var m []byte
+		var s float64
+		if err := rows.Scan(&m, &s); err != nil {
+			return nil, err
+		}
+		pool = append(pool, ZMember{Member: string(m), Score: s})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(pool) == 0 {
+		return nil, nil
+	}
+	n := -count
+	out := make([]ZMember, 0, n)
+	for i := int64(0); i < n; i++ {
+		out = append(out, pool[randInt(len(pool))])
+	}
+	return out, nil
+}
+
+// sInterCard returns |INTER(keys)|, optionally capped at limit. We reuse the
+// Go-side intersection from sInter and apply the cap on the result — for the
+// command's typical use (gating a "is the overlap >= N" check) the size of
+// the intersection itself is the limiting factor, not the per-set fetch cost.
+func (o queryOps) sInterCard(ctx context.Context, q Querier, keys []string, limit int64) (int64, error) {
+	if len(keys) == 0 {
+		return 0, nil
+	}
+	members, err := o.sInter(ctx, q, keys)
+	if err != nil {
+		return 0, err
+	}
+	count := int64(len(members))
+	if limit > 0 && count > limit {
+		return limit, nil
+	}
+	return count, nil
+}
+
 // ============== Sorted Set Extensions ==============
 
 func (o queryOps) zPopMax(ctx context.Context, q Querier, key string, count int64) ([]ZMember, error) {
@@ -3113,14 +3833,13 @@ func (o queryOps) zInterStore(ctx context.Context, q Querier, destination string
 
 // ============== Key Extensions ==============
 
-func (o queryOps) expireAt(ctx context.Context, q Querier, key string, timestamp time.Time) (bool, error) {
+func (o queryOps) expireAt(ctx context.Context, q Querier, key string, timestamp time.Time, opts ExpireOptions) (bool, error) {
 	key = encodeKey(key)
 	if err := o.lockKey(ctx, q, key); err != nil {
 		return false, err
 	}
 	result, err := q.Exec(ctx,
-		`UPDATE kv_meta SET expires_at = $2 
-		 WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())`,
+		fmt.Sprintf("UPDATE kv_meta SET expires_at = $2 WHERE %s", expireWhereClause(opts)),
 		key, timestamp,
 	)
 	if err != nil {

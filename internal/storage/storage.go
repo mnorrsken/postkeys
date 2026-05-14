@@ -501,8 +501,8 @@ func (s *Store) Exists(ctx context.Context, keys []string) (int64, error) {
 	return s.ops.exists(ctx, s.querier(), keys)
 }
 
-func (s *Store) Expire(ctx context.Context, key string, ttl time.Duration) (bool, error) {
-	return s.ops.expire(ctx, s.querier(), key, ttl)
+func (s *Store) Expire(ctx context.Context, key string, ttl time.Duration, opts ExpireOptions) (bool, error) {
+	return s.ops.expire(ctx, s.querier(), key, ttl, opts)
 }
 
 func (s *Store) TTL(ctx context.Context, key string) (int64, error) {
@@ -521,6 +521,10 @@ func (s *Store) Keys(ctx context.Context, pattern string) ([]string, error) {
 	return s.ops.keys(ctx, s.querier(), pattern)
 }
 
+func (s *Store) RandomKey(ctx context.Context) (string, bool, error) {
+	return s.ops.randomKey(ctx, s.querier())
+}
+
 func (s *Store) Type(ctx context.Context, key string) (KeyType, error) {
 	return s.ops.keyType(ctx, s.querier(), key)
 }
@@ -531,8 +535,8 @@ func (s *Store) Rename(ctx context.Context, oldKey, newKey string) error {
 	})
 }
 
-func (s *Store) ExpireAt(ctx context.Context, key string, timestamp time.Time) (bool, error) {
-	return s.ops.expireAt(ctx, s.querier(), key, timestamp)
+func (s *Store) ExpireAt(ctx context.Context, key string, timestamp time.Time, opts ExpireOptions) (bool, error) {
+	return s.ops.expireAt(ctx, s.querier(), key, timestamp, opts)
 }
 
 func (s *Store) Copy(ctx context.Context, source, destination string, replace bool) (bool, error) {
@@ -719,6 +723,54 @@ func (s *Store) RPopMulti(ctx context.Context, keys []string) (string, string, b
 	return k, v, found, err
 }
 
+func (s *Store) LMPop(ctx context.Context, keys []string, count int64) (string, []string, bool, error) {
+	var k string
+	var vals []string
+	var found bool
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		k, vals, found, err = s.ops.lMPop(ctx, s.txQuerier(tx), keys, count)
+		return err
+	})
+	return k, vals, found, err
+}
+
+func (s *Store) RMPop(ctx context.Context, keys []string, count int64) (string, []string, bool, error) {
+	var k string
+	var vals []string
+	var found bool
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		k, vals, found, err = s.ops.rMPop(ctx, s.txQuerier(tx), keys, count)
+		return err
+	})
+	return k, vals, found, err
+}
+
+func (s *Store) ZMPopMin(ctx context.Context, keys []string, count int64) (string, []ZMember, bool, error) {
+	var k string
+	var members []ZMember
+	var found bool
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		k, members, found, err = s.ops.zMPopMin(ctx, s.txQuerier(tx), keys, count)
+		return err
+	})
+	return k, members, found, err
+}
+
+func (s *Store) ZMPopMax(ctx context.Context, keys []string, count int64) (string, []ZMember, bool, error) {
+	var k string
+	var members []ZMember
+	var found bool
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		k, members, found, err = s.ops.zMPopMax(ctx, s.txQuerier(tx), keys, count)
+		return err
+	})
+	return k, members, found, err
+}
+
 func (s *Store) LLen(ctx context.Context, key string) (int64, error) {
 	return s.ops.lLen(ctx, s.querier(), key)
 }
@@ -805,6 +857,22 @@ func (s *Store) SDiffStore(ctx context.Context, destination string, keys []strin
 	return result, err
 }
 
+func (s *Store) SInterCard(ctx context.Context, keys []string, limit int64) (int64, error) {
+	return s.ops.sInterCard(ctx, s.querier(), keys, limit)
+}
+
+func (s *Store) HRandField(ctx context.Context, key string, count int64, withValues bool) ([]string, error) {
+	return s.ops.hRandField(ctx, s.querier(), key, count, withValues)
+}
+
+func (s *Store) SRandMember(ctx context.Context, key string, count int64) ([]string, error) {
+	return s.ops.sRandMember(ctx, s.querier(), key, count)
+}
+
+func (s *Store) ZRandMember(ctx context.Context, key string, count int64) ([]ZMember, error) {
+	return s.ops.zRandMember(ctx, s.querier(), key, count)
+}
+
 // ============== Sorted Set Commands ==============
 
 func (s *Store) ZAdd(ctx context.Context, key string, members []ZMember) (int64, error) {
@@ -835,6 +903,36 @@ func (s *Store) ZCard(ctx context.Context, key string) (int64, error) {
 
 func (s *Store) ZRangeByScore(ctx context.Context, key string, min, max float64, withScores bool, offset, count int64) ([]ZMember, error) {
 	return s.ops.zRangeByScore(ctx, s.querier(), key, min, max, withScores, offset, count)
+}
+
+func (s *Store) ZRevRange(ctx context.Context, key string, start, stop int64, withScores bool) ([]ZMember, error) {
+	return s.ops.zRevRange(ctx, s.querier(), key, start, stop, withScores)
+}
+
+func (s *Store) ZRevRangeByScore(ctx context.Context, key string, min, max float64, withScores bool, offset, count int64) ([]ZMember, error) {
+	return s.ops.zRevRangeByScore(ctx, s.querier(), key, min, max, withScores, offset, count)
+}
+
+func (s *Store) ZRangeByLex(ctx context.Context, key string, min, max LexBound, offset, count int64) ([]string, error) {
+	return s.ops.zRangeByLex(ctx, s.querier(), key, min, max, offset, count)
+}
+
+func (s *Store) ZRevRangeByLex(ctx context.Context, key string, min, max LexBound, offset, count int64) ([]string, error) {
+	return s.ops.zRevRangeByLex(ctx, s.querier(), key, min, max, offset, count)
+}
+
+func (s *Store) ZLexCount(ctx context.Context, key string, min, max LexBound) (int64, error) {
+	return s.ops.zLexCount(ctx, s.querier(), key, min, max)
+}
+
+func (s *Store) ZRangeStore(ctx context.Context, dst, src string, spec ZRangeStoreSpec) (int64, error) {
+	var n int64
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		n, err = s.ops.zRangeStore(ctx, s.txQuerier(tx), dst, src, spec)
+		return err
+	})
+	return n, err
 }
 
 func (s *Store) ZRemRangeByScore(ctx context.Context, key string, min, max float64) (int64, error) {

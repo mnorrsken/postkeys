@@ -31,6 +31,61 @@ type BitFieldOp struct {
 	Value    int64  // for SET and INCRBY
 }
 
+// ZRangeStoreBy selects between rank-based, score-based, and lex-based range
+// semantics for ZRangeStore.
+type ZRangeStoreBy int
+
+const (
+	ZRangeByIndex ZRangeStoreBy = iota
+	ZRangeByScore
+	ZRangeByLex
+)
+
+// ZRangeStoreSpec describes the source-side query that ZRangeStore should
+// evaluate and copy into the destination. Only the fields matching By are
+// consulted (e.g. MinScore/MaxScore are ignored when By is ZRangeByIndex).
+//
+// Count <= 0 disables the LIMIT (matches Redis' "no limit" behavior).
+type ZRangeStoreSpec struct {
+	By                 ZRangeStoreBy
+	Rev                bool
+	Start, Stop        int64    // ZRangeByIndex
+	MinScore, MaxScore float64  // ZRangeByScore
+	MinLex, MaxLex     LexBound // ZRangeByLex
+	Offset, Count      int64
+}
+
+// LexBound represents one side of a ZRANGEBYLEX range. Members are compared
+// byte-wise; Infinity short-circuits the comparison entirely.
+//
+//	Infinity == 0  → finite bound, use Value/Inclusive
+//	Infinity == -1 → "-" in the wire format; lower bound that always matches
+//	Infinity == +1 → "+" in the wire format; upper bound that always matches
+type LexBound struct {
+	Value     string
+	Inclusive bool
+	Infinity  int
+}
+
+// ExpireOptions controls the EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT flag behavior
+// added in Redis 7.0. At most one flag may be set; the caller is responsible
+// for rejecting combinations.
+//
+//	NX — set TTL only if the key has no TTL yet
+//	XX — set TTL only if the key already has a TTL
+//	GT — set TTL only if the new expiration is greater than the current one
+//	     (a key with no TTL is treated as having an infinite TTL, so GT can
+//	     never succeed against it)
+//	LT — set TTL only if the new expiration is less than the current one
+//	     (a key with no TTL is treated as having an infinite TTL, so LT always
+//	     succeeds against it)
+type ExpireOptions struct {
+	NX bool
+	XX bool
+	GT bool
+	LT bool
+}
+
 // Operations defines the common storage operations available in both regular and transaction contexts
 type Operations interface {
 	// String commands
@@ -53,8 +108,8 @@ type Operations interface {
 	// Key commands
 	Del(ctx context.Context, keys []string) (int64, error)
 	Exists(ctx context.Context, keys []string) (int64, error)
-	Expire(ctx context.Context, key string, ttl time.Duration) (bool, error)
-	ExpireAt(ctx context.Context, key string, timestamp time.Time) (bool, error)
+	Expire(ctx context.Context, key string, ttl time.Duration, opts ExpireOptions) (bool, error)
+	ExpireAt(ctx context.Context, key string, timestamp time.Time, opts ExpireOptions) (bool, error)
 	TTL(ctx context.Context, key string) (int64, error)
 	PTTL(ctx context.Context, key string) (int64, error)
 	Persist(ctx context.Context, key string) (bool, error)
@@ -62,6 +117,9 @@ type Operations interface {
 	Type(ctx context.Context, key string) (KeyType, error)
 	Rename(ctx context.Context, oldKey, newKey string) error
 	Copy(ctx context.Context, source, destination string, replace bool) (bool, error)
+	// RandomKey returns a random non-expired key, or ("", false, nil) if the
+	// keyspace is empty.
+	RandomKey(ctx context.Context) (string, bool, error)
 
 	// Bitmap commands
 	SetBit(ctx context.Context, key string, offset int64, value int) (int64, error)
@@ -83,6 +141,10 @@ type Operations interface {
 	HIncrBy(ctx context.Context, key, field string, increment int64) (int64, error)
 	HIncrByFloat(ctx context.Context, key, field string, increment float64) (float64, error)
 	HSetNX(ctx context.Context, key, field, value string) (bool, error)
+	// HRandField returns up to |count| random fields. count > 0 returns
+	// distinct fields; count < 0 allows duplicates. When withValues is true
+	// the slice is field,value,field,value,...
+	HRandField(ctx context.Context, key string, count int64, withValues bool) ([]string, error)
 
 	// List commands
 	LPush(ctx context.Context, key string, values []string) (int64, error)
@@ -95,6 +157,10 @@ type Operations interface {
 	// Returns the key popped from, the popped value, and found=true on success.
 	LPopMulti(ctx context.Context, keys []string) (key, value string, found bool, err error)
 	RPopMulti(ctx context.Context, keys []string) (key, value string, found bool, err error)
+	// LMPop / RMPop pop up to count elements from the first non-empty key
+	// (in caller order). count must be > 0. Used by LMPOP/BLMPOP.
+	LMPop(ctx context.Context, keys []string, count int64) (key string, values []string, found bool, err error)
+	RMPop(ctx context.Context, keys []string, count int64) (key string, values []string, found bool, err error)
 	LLen(ctx context.Context, key string) (int64, error)
 	LRange(ctx context.Context, key string, start, stop int64) ([]string, error)
 	LIndex(ctx context.Context, key string, index int64) (string, bool, error)
@@ -118,11 +184,34 @@ type Operations interface {
 	SUnionStore(ctx context.Context, destination string, keys []string) (int64, error)
 	SDiff(ctx context.Context, keys []string) ([]string, error)
 	SDiffStore(ctx context.Context, destination string, keys []string) (int64, error)
+	// SInterCard returns the cardinality of the intersection. When limit > 0,
+	// the result is capped at limit (Redis 7.0).
+	SInterCard(ctx context.Context, keys []string, limit int64) (int64, error)
+	// SRandMember returns up to |count| random members. count > 0 returns
+	// distinct members; count < 0 allows duplicates.
+	SRandMember(ctx context.Context, key string, count int64) ([]string, error)
 
 	// Sorted set commands
 	ZAdd(ctx context.Context, key string, members []ZMember) (int64, error)
 	ZRange(ctx context.Context, key string, start, stop int64, withScores bool) ([]ZMember, error)
 	ZRangeByScore(ctx context.Context, key string, min, max float64, withScores bool, offset, count int64) ([]ZMember, error)
+	ZRevRange(ctx context.Context, key string, start, stop int64, withScores bool) ([]ZMember, error)
+	ZRevRangeByScore(ctx context.Context, key string, min, max float64, withScores bool, offset, count int64) ([]ZMember, error)
+	ZRangeByLex(ctx context.Context, key string, min, max LexBound, offset, count int64) ([]string, error)
+	ZRevRangeByLex(ctx context.Context, key string, min, max LexBound, offset, count int64) ([]string, error)
+	ZLexCount(ctx context.Context, key string, min, max LexBound) (int64, error)
+	// ZRangeStore copies the result of a ZRANGE-style query against src into
+	// dst (replacing dst if it exists) and returns the number of elements
+	// written.
+	ZRangeStore(ctx context.Context, dst, src string, spec ZRangeStoreSpec) (int64, error)
+	// ZRandMember returns up to |count| random (member, score) pairs.
+	// count > 0 returns distinct members; count < 0 allows duplicates.
+	ZRandMember(ctx context.Context, key string, count int64) ([]ZMember, error)
+	// ZMPopMin / ZMPopMax pop up to count members from the first non-empty
+	// key (in caller order), ordered by lowest or highest score respectively.
+	// Used by ZMPOP/BZMPOP.
+	ZMPopMin(ctx context.Context, keys []string, count int64) (key string, members []ZMember, found bool, err error)
+	ZMPopMax(ctx context.Context, keys []string, count int64) (key string, members []ZMember, found bool, err error)
 	ZScore(ctx context.Context, key, member string) (float64, bool, error)
 	ZRem(ctx context.Context, key string, members []string) (int64, error)
 	ZRemRangeByScore(ctx context.Context, key string, min, max float64) (int64, error)

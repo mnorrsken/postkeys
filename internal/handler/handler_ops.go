@@ -655,8 +655,41 @@ func (h *Handler) existsOp(ctx context.Context, ops storage.Operations, args []r
 	return resp.Int(count)
 }
 
+// parseExpireOptions reads the optional NX/XX/GT/LT trailing args used by
+// EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT. Returns the parsed options or a RESP
+// error value (which the caller forwards) when the flags are invalid or
+// mutually exclusive flags are combined.
+func parseExpireOptions(args []resp.Value) (storage.ExpireOptions, *resp.Value) {
+	var opts storage.ExpireOptions
+	for _, a := range args {
+		switch strings.ToUpper(a.Bulk) {
+		case "NX":
+			opts.NX = true
+		case "XX":
+			opts.XX = true
+		case "GT":
+			opts.GT = true
+		case "LT":
+			opts.LT = true
+		default:
+			e := resp.Err("ERR Unsupported option " + a.Bulk)
+			return opts, &e
+		}
+	}
+	// Redis 7 rejects NX combined with any of XX/GT/LT and GT combined with LT.
+	if opts.NX && (opts.XX || opts.GT || opts.LT) {
+		e := resp.Err("ERR NX and XX, GT or LT options at the same time are not compatible")
+		return opts, &e
+	}
+	if opts.GT && opts.LT {
+		e := resp.Err("ERR GT and LT options at the same time are not compatible")
+		return opts, &e
+	}
+	return opts, nil
+}
+
 func (h *Handler) expireOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {
-	if len(args) != 2 {
+	if len(args) < 2 {
 		return resp.ErrWrongArgs("expire")
 	}
 
@@ -664,8 +697,12 @@ func (h *Handler) expireOp(ctx context.Context, ops storage.Operations, args []r
 	if err != nil {
 		return resp.Err("value is not an integer")
 	}
+	opts, errVal := parseExpireOptions(args[2:])
+	if errVal != nil {
+		return *errVal
+	}
 
-	ok, err := ops.Expire(ctx, args[0].Bulk, time.Duration(secs)*time.Second)
+	ok, err := ops.Expire(ctx, args[0].Bulk, time.Duration(secs)*time.Second, opts)
 	if err != nil {
 		return resp.Err(err.Error())
 	}
@@ -676,7 +713,7 @@ func (h *Handler) expireOp(ctx context.Context, ops storage.Operations, args []r
 }
 
 func (h *Handler) pexpireOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {
-	if len(args) != 2 {
+	if len(args) < 2 {
 		return resp.ErrWrongArgs("pexpire")
 	}
 
@@ -684,8 +721,12 @@ func (h *Handler) pexpireOp(ctx context.Context, ops storage.Operations, args []
 	if err != nil {
 		return resp.Err("value is not an integer")
 	}
+	opts, errVal := parseExpireOptions(args[2:])
+	if errVal != nil {
+		return *errVal
+	}
 
-	ok, err := ops.Expire(ctx, args[0].Bulk, time.Duration(ms)*time.Millisecond)
+	ok, err := ops.Expire(ctx, args[0].Bulk, time.Duration(ms)*time.Millisecond, opts)
 	if err != nil {
 		return resp.Err(err.Error())
 	}
@@ -696,7 +737,7 @@ func (h *Handler) pexpireOp(ctx context.Context, ops storage.Operations, args []
 }
 
 func (h *Handler) expireatOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {
-	if len(args) != 2 {
+	if len(args) < 2 {
 		return resp.ErrWrongArgs("expireat")
 	}
 
@@ -704,9 +745,13 @@ func (h *Handler) expireatOp(ctx context.Context, ops storage.Operations, args [
 	if err != nil {
 		return resp.Err("ERR value is not an integer or out of range")
 	}
+	opts, errVal := parseExpireOptions(args[2:])
+	if errVal != nil {
+		return *errVal
+	}
 
 	expireTime := time.Unix(timestamp, 0)
-	ok, err := ops.ExpireAt(ctx, args[0].Bulk, expireTime)
+	ok, err := ops.ExpireAt(ctx, args[0].Bulk, expireTime, opts)
 	if err != nil {
 		return resp.Err(err.Error())
 	}
@@ -717,7 +762,7 @@ func (h *Handler) expireatOp(ctx context.Context, ops storage.Operations, args [
 }
 
 func (h *Handler) pexpireatOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {
-	if len(args) != 2 {
+	if len(args) < 2 {
 		return resp.ErrWrongArgs("pexpireat")
 	}
 
@@ -725,10 +770,14 @@ func (h *Handler) pexpireatOp(ctx context.Context, ops storage.Operations, args 
 	if err != nil {
 		return resp.Err("ERR value is not an integer or out of range")
 	}
+	opts, errVal := parseExpireOptions(args[2:])
+	if errVal != nil {
+		return *errVal
+	}
 
 	// Convert milliseconds to time
 	expireTime := time.Unix(timestamp/1000, (timestamp%1000)*1000000)
-	ok, err := ops.ExpireAt(ctx, args[0].Bulk, expireTime)
+	ok, err := ops.ExpireAt(ctx, args[0].Bulk, expireTime, opts)
 	if err != nil {
 		return resp.Err(err.Error())
 	}
@@ -736,6 +785,207 @@ func (h *Handler) pexpireatOp(ctx context.Context, ops storage.Operations, args 
 		return resp.Int(1)
 	}
 	return resp.Int(0)
+}
+
+// HRANDFIELD key [count [WITHVALUES]]
+//
+// Without count → single random field as a bulk (or nil bulk if hash empty).
+// With count → array of fields (or [field,value,...] if WITHVALUES given).
+func (h *Handler) hrandfieldOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {
+	if len(args) < 1 || len(args) > 3 {
+		return resp.ErrWrongArgs("hrandfield")
+	}
+	key := args[0].Bulk
+	if len(args) == 1 {
+		out, err := ops.HRandField(ctx, key, 1, false)
+		if err != nil {
+			if strings.Contains(err.Error(), "WRONGTYPE") {
+				return resp.ErrWrongType()
+			}
+			return resp.Err(err.Error())
+		}
+		if len(out) == 0 {
+			return resp.NullBulk()
+		}
+		return resp.Bulk(out[0])
+	}
+	count, err := strconv.ParseInt(args[1].Bulk, 10, 64)
+	if err != nil {
+		return resp.Err("ERR value is not an integer or out of range")
+	}
+	withValues := false
+	if len(args) == 3 {
+		if strings.ToUpper(args[2].Bulk) != "WITHVALUES" {
+			return resp.Err("ERR syntax error")
+		}
+		withValues = true
+	}
+	out, err := ops.HRandField(ctx, key, count, withValues)
+	if err != nil {
+		if strings.Contains(err.Error(), "WRONGTYPE") {
+			return resp.ErrWrongType()
+		}
+		return resp.Err(err.Error())
+	}
+	result := make([]resp.Value, len(out))
+	for i, s := range out {
+		result[i] = resp.Bulk(s)
+	}
+	return resp.Arr(result...)
+}
+
+// SRANDMEMBER key [count]
+func (h *Handler) srandmemberOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {
+	if len(args) < 1 || len(args) > 2 {
+		return resp.ErrWrongArgs("srandmember")
+	}
+	key := args[0].Bulk
+	if len(args) == 1 {
+		out, err := ops.SRandMember(ctx, key, 1)
+		if err != nil {
+			if strings.Contains(err.Error(), "WRONGTYPE") {
+				return resp.ErrWrongType()
+			}
+			return resp.Err(err.Error())
+		}
+		if len(out) == 0 {
+			return resp.NullBulk()
+		}
+		return resp.Bulk(out[0])
+	}
+	count, err := strconv.ParseInt(args[1].Bulk, 10, 64)
+	if err != nil {
+		return resp.Err("ERR value is not an integer or out of range")
+	}
+	out, err := ops.SRandMember(ctx, key, count)
+	if err != nil {
+		if strings.Contains(err.Error(), "WRONGTYPE") {
+			return resp.ErrWrongType()
+		}
+		return resp.Err(err.Error())
+	}
+	result := make([]resp.Value, len(out))
+	for i, m := range out {
+		result[i] = resp.Bulk(m)
+	}
+	return resp.Arr(result...)
+}
+
+// ZRANDMEMBER key [count [WITHSCORES]]
+func (h *Handler) zrandmemberOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {
+	if len(args) < 1 || len(args) > 3 {
+		return resp.ErrWrongArgs("zrandmember")
+	}
+	key := args[0].Bulk
+	if len(args) == 1 {
+		out, err := ops.ZRandMember(ctx, key, 1)
+		if err != nil {
+			if strings.Contains(err.Error(), "WRONGTYPE") {
+				return resp.ErrWrongType()
+			}
+			return resp.Err(err.Error())
+		}
+		if len(out) == 0 {
+			return resp.NullBulk()
+		}
+		return resp.Bulk(out[0].Member)
+	}
+	count, err := strconv.ParseInt(args[1].Bulk, 10, 64)
+	if err != nil {
+		return resp.Err("ERR value is not an integer or out of range")
+	}
+	withScores := false
+	if len(args) == 3 {
+		if strings.ToUpper(args[2].Bulk) != "WITHSCORES" {
+			return resp.Err("ERR syntax error")
+		}
+		withScores = true
+	}
+	out, err := ops.ZRandMember(ctx, key, count)
+	if err != nil {
+		if strings.Contains(err.Error(), "WRONGTYPE") {
+			return resp.ErrWrongType()
+		}
+		return resp.Err(err.Error())
+	}
+	if withScores {
+		result := make([]resp.Value, 0, len(out)*2)
+		for _, m := range out {
+			result = append(result, resp.Bulk(m.Member))
+			result = append(result, resp.Bulk(strconv.FormatFloat(m.Score, 'f', -1, 64)))
+		}
+		return resp.Arr(result...)
+	}
+	result := make([]resp.Value, len(out))
+	for i, m := range out {
+		result[i] = resp.Bulk(m.Member)
+	}
+	return resp.Arr(result...)
+}
+
+// objectOp implements a subset of the Redis OBJECT command. Only ENCODING is
+// meaningful here — postkeys stores one canonical representation per type,
+// so the values are synthetic and cosmetic. Clients that branch on encoding
+// (for testing or admin tools) still get a recognizable answer instead of an
+// error. FREQ / IDLETIME / REFCOUNT / HELP return appropriate errors since
+// they have no equivalent semantics on this backend.
+func (h *Handler) objectOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {
+	if len(args) == 0 {
+		return resp.ErrWrongArgs("object")
+	}
+	sub := strings.ToUpper(args[0].Bulk)
+	switch sub {
+	case "ENCODING":
+		if len(args) != 2 {
+			return resp.ErrWrongArgs("object encoding")
+		}
+		kt, err := ops.Type(ctx, args[1].Bulk)
+		if err != nil {
+			return resp.Err(err.Error())
+		}
+		var encoding string
+		switch kt {
+		case storage.TypeNone:
+			return resp.Err("ERR no such key")
+		case storage.TypeString:
+			encoding = "raw"
+		case storage.TypeHash:
+			encoding = "listpack"
+		case storage.TypeList:
+			encoding = "quicklist"
+		case storage.TypeSet:
+			encoding = "listpack"
+		case storage.TypeZSet:
+			encoding = "skiplist"
+		default:
+			encoding = "raw"
+		}
+		return resp.Bulk(encoding)
+	case "HELP":
+		return resp.Arr(
+			resp.Bulk("OBJECT <subcommand> [<arg> ...]. Subcommands are:"),
+			resp.Bulk("ENCODING <key>"),
+			resp.Bulk("    Return the kind of internal representation used to store the value at <key>."),
+		)
+	case "FREQ", "IDLETIME", "REFCOUNT":
+		return resp.Err("ERR An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between maxmemory policies at runtime LFU and LRU data will take some time to adjust.")
+	default:
+		return resp.Err(fmt.Sprintf("ERR Unknown subcommand or wrong number of arguments for '%s'. Try OBJECT HELP.", strings.ToLower(args[0].Bulk)))
+	}
+}
+
+func (h *Handler) randomKeyOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {
+	if len(args) != 0 {
+		return resp.ErrWrongArgs("randomkey")
+	}
+	key, found, err := ops.RandomKey(ctx)
+	if err != nil {
+		return resp.Err(err.Error())
+	}
+	if !found {
+		return resp.NullBulk()
+	}
+	return resp.Bulk(key)
 }
 
 func (h *Handler) copyOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {
@@ -1426,6 +1676,199 @@ func (h *Handler) blockingPop(ctx context.Context, _ storage.Operations, keys []
 	}
 }
 
+// parseMPopHead consumes the common prefix of LMPOP/BLMPOP/ZMPOP/BZMPOP:
+// `numkeys key [key ...] WHERE [COUNT count]` where WHERE ∈ {LEFT,RIGHT,MIN,MAX}.
+// It validates that whereStr is in allowedWhere and returns the parsed pieces.
+func parseMPopHead(args []resp.Value, allowedWhere map[string]bool) (keys []string, where string, count int64, errVal *resp.Value) {
+	count = 1
+	if len(args) < 2 {
+		e := resp.Err("ERR syntax error")
+		return nil, "", 0, &e
+	}
+	numkeys, err := strconv.ParseInt(args[0].Bulk, 10, 64)
+	if err != nil || numkeys < 1 {
+		e := resp.Err("ERR numkeys should be greater than 0")
+		return nil, "", 0, &e
+	}
+	if int64(len(args)) < 1+numkeys+1 {
+		e := resp.Err("ERR syntax error")
+		return nil, "", 0, &e
+	}
+	keys = make([]string, numkeys)
+	for i := int64(0); i < numkeys; i++ {
+		keys[i] = args[1+i].Bulk
+	}
+	where = strings.ToUpper(args[1+numkeys].Bulk)
+	if !allowedWhere[where] {
+		e := resp.Err("ERR syntax error")
+		return nil, "", 0, &e
+	}
+	rest := args[2+numkeys:]
+	if len(rest) > 0 {
+		if len(rest) != 2 || strings.ToUpper(rest[0].Bulk) != "COUNT" {
+			e := resp.Err("ERR syntax error")
+			return nil, "", 0, &e
+		}
+		count, err = strconv.ParseInt(rest[1].Bulk, 10, 64)
+		if err != nil || count < 1 {
+			e := resp.Err("ERR count should be greater than 0")
+			return nil, "", 0, &e
+		}
+	}
+	return keys, where, count, nil
+}
+
+// LMPOP numkeys key [key ...] LEFT|RIGHT [COUNT count]
+func (h *Handler) lmpopOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {
+	keys, where, count, errVal := parseMPopHead(args, map[string]bool{"LEFT": true, "RIGHT": true})
+	if errVal != nil {
+		return *errVal
+	}
+	return doLMPop(ctx, ops, keys, where, count)
+}
+
+func doLMPop(ctx context.Context, ops storage.Operations, keys []string, where string, count int64) resp.Value {
+	var poppedKey string
+	var values []string
+	var found bool
+	var err error
+	if where == "LEFT" {
+		poppedKey, values, found, err = ops.LMPop(ctx, keys, count)
+	} else {
+		poppedKey, values, found, err = ops.RMPop(ctx, keys, count)
+	}
+	if err != nil {
+		return resp.Err(err.Error())
+	}
+	if !found {
+		return resp.NullArray()
+	}
+	inner := make([]resp.Value, len(values))
+	for i, v := range values {
+		inner[i] = resp.Bulk(v)
+	}
+	return resp.Arr(resp.Bulk(poppedKey), resp.Arr(inner...))
+}
+
+// BLMPOP timeout numkeys key [key ...] LEFT|RIGHT [COUNT count]
+func (h *Handler) blmpopOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {
+	if len(args) < 4 {
+		return resp.ErrWrongArgs("blmpop")
+	}
+	timeout, err := strconv.ParseFloat(args[0].Bulk, 64)
+	if err != nil {
+		return resp.Err("timeout is not a float or out of range")
+	}
+	keys, where, count, errVal := parseMPopHead(args[1:], map[string]bool{"LEFT": true, "RIGHT": true})
+	if errVal != nil {
+		return *errVal
+	}
+	return h.blockingMPop(ctx, keys, timeout, func() resp.Value {
+		return doLMPop(ctx, ops, keys, where, count)
+	})
+}
+
+// ZMPOP numkeys key [key ...] MIN|MAX [COUNT count]
+func (h *Handler) zmpopOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {
+	keys, where, count, errVal := parseMPopHead(args, map[string]bool{"MIN": true, "MAX": true})
+	if errVal != nil {
+		return *errVal
+	}
+	return doZMPop(ctx, ops, keys, where, count)
+}
+
+func doZMPop(ctx context.Context, ops storage.Operations, keys []string, where string, count int64) resp.Value {
+	var poppedKey string
+	var members []storage.ZMember
+	var found bool
+	var err error
+	if where == "MIN" {
+		poppedKey, members, found, err = ops.ZMPopMin(ctx, keys, count)
+	} else {
+		poppedKey, members, found, err = ops.ZMPopMax(ctx, keys, count)
+	}
+	if err != nil {
+		return resp.Err(err.Error())
+	}
+	if !found {
+		return resp.NullArray()
+	}
+	inner := make([]resp.Value, len(members))
+	for i, m := range members {
+		inner[i] = resp.Arr(resp.Bulk(m.Member), resp.Bulk(strconv.FormatFloat(m.Score, 'f', -1, 64)))
+	}
+	return resp.Arr(resp.Bulk(poppedKey), resp.Arr(inner...))
+}
+
+// BZMPOP timeout numkeys key [key ...] MIN|MAX [COUNT count]
+// Unlike BLPOP/BRPOP, blocking zset pops have no LISTEN/NOTIFY equivalent
+// so they always use the poll fallback.
+func (h *Handler) bzmpopOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {
+	if len(args) < 4 {
+		return resp.ErrWrongArgs("bzmpop")
+	}
+	timeout, err := strconv.ParseFloat(args[0].Bulk, 64)
+	if err != nil {
+		return resp.Err("timeout is not a float or out of range")
+	}
+	keys, where, count, errVal := parseMPopHead(args[1:], map[string]bool{"MIN": true, "MAX": true})
+	if errVal != nil {
+		return *errVal
+	}
+	return h.blockingMPop(ctx, keys, timeout, func() resp.Value {
+		return doZMPop(ctx, ops, keys, where, count)
+	})
+}
+
+// blockingMPop loops popping until popOnce returns a non-null result, the
+// context is cancelled, or the deadline expires. popOnce returns a resp.Value
+// already shaped for the client; a null array is treated as "nothing yet".
+func (h *Handler) blockingMPop(ctx context.Context, keys []string, timeout float64, popOnce func() resp.Value) resp.Value {
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(time.Duration(timeout * float64(time.Second)))
+	}
+	for {
+		v := popOnce()
+		// Errors short-circuit immediately.
+		if v.Type == resp.Error {
+			return v
+		}
+		// A null array means "nothing in any key right now". Any other
+		// response — including a real (non-null) array — means we succeeded.
+		if !(v.Type == resp.Array && v.Null) {
+			return v
+		}
+
+		if timeout > 0 && time.Now().After(deadline) {
+			return resp.NullArray()
+		}
+		waitTime := h.blockingPollInterval
+		if timeout > 0 {
+			remaining := time.Until(deadline)
+			if remaining < waitTime {
+				waitTime = remaining
+			}
+		}
+		if h.listNotifier != nil {
+			if h.listNotifier.WaitForKeys(ctx, keys, waitTime) != "" {
+				continue
+			}
+		} else {
+			select {
+			case <-ctx.Done():
+				return resp.NullArray()
+			case <-time.After(waitTime):
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return resp.NullArray()
+		default:
+		}
+	}
+}
+
 // ============== Key Scan Commands ==============
 
 // scanOp implements SCAN - incrementally iterate over keys
@@ -1828,6 +2271,324 @@ func (h *Handler) zrangeOp(ctx context.Context, ops storage.Operations, args []r
 		result[i] = resp.Bulk(m.Member)
 	}
 	return resp.Arr(result...)
+}
+
+// ZREVRANGE key start stop [WITHSCORES]
+func (h *Handler) zrevrangeOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {
+	if len(args) < 3 {
+		return resp.ErrWrongArgs("zrevrange")
+	}
+	start, err := strconv.ParseInt(args[1].Bulk, 10, 64)
+	if err != nil {
+		return resp.Err("value is not an integer or out of range")
+	}
+	stop, err := strconv.ParseInt(args[2].Bulk, 10, 64)
+	if err != nil {
+		return resp.Err("value is not an integer or out of range")
+	}
+	withScores := false
+	for _, a := range args[3:] {
+		if strings.ToUpper(a.Bulk) == "WITHSCORES" {
+			withScores = true
+		} else {
+			return resp.Err("ERR syntax error")
+		}
+	}
+
+	members, err := ops.ZRevRange(ctx, args[0].Bulk, start, stop, withScores)
+	if err != nil {
+		if strings.Contains(err.Error(), "WRONGTYPE") {
+			return resp.ErrWrongType()
+		}
+		return resp.Err(err.Error())
+	}
+	if withScores {
+		result := make([]resp.Value, 0, len(members)*2)
+		for _, m := range members {
+			result = append(result, resp.Bulk(m.Member))
+			result = append(result, resp.Bulk(strconv.FormatFloat(m.Score, 'f', -1, 64)))
+		}
+		return resp.Arr(result...)
+	}
+	result := make([]resp.Value, len(members))
+	for i, m := range members {
+		result[i] = resp.Bulk(m.Member)
+	}
+	return resp.Arr(result...)
+}
+
+// ZREVRANGEBYSCORE key max min [WITHSCORES] [LIMIT offset count]
+// Note: max is the first arg, min the second (Redis quirk).
+func (h *Handler) zrevrangebyscoreOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {
+	if len(args) < 3 {
+		return resp.ErrWrongArgs("zrevrangebyscore")
+	}
+	// Wire order is max, min — flip to canonical min, max for the storage call.
+	max, err := parseScoreBound(args[1].Bulk)
+	if err != nil {
+		return resp.Err("min or max is not a float")
+	}
+	min, err := parseScoreBound(args[2].Bulk)
+	if err != nil {
+		return resp.Err("min or max is not a float")
+	}
+
+	withScores := false
+	var offset, count int64 = 0, -1
+	for i := 3; i < len(args); i++ {
+		switch strings.ToUpper(args[i].Bulk) {
+		case "WITHSCORES":
+			withScores = true
+		case "LIMIT":
+			if i+2 >= len(args) {
+				return resp.ErrWrongArgs("zrevrangebyscore")
+			}
+			offset, err = strconv.ParseInt(args[i+1].Bulk, 10, 64)
+			if err != nil {
+				return resp.Err("ERR value is not an integer or out of range")
+			}
+			count, err = strconv.ParseInt(args[i+2].Bulk, 10, 64)
+			if err != nil {
+				return resp.Err("ERR value is not an integer or out of range")
+			}
+			i += 2
+		default:
+			return resp.Err("ERR syntax error")
+		}
+	}
+
+	members, err := ops.ZRevRangeByScore(ctx, args[0].Bulk, min, max, withScores, offset, count)
+	if err != nil {
+		if strings.Contains(err.Error(), "WRONGTYPE") {
+			return resp.ErrWrongType()
+		}
+		return resp.Err(err.Error())
+	}
+	if withScores {
+		result := make([]resp.Value, 0, len(members)*2)
+		for _, m := range members {
+			result = append(result, resp.Bulk(m.Member))
+			result = append(result, resp.Bulk(strconv.FormatFloat(m.Score, 'f', -1, 64)))
+		}
+		return resp.Arr(result...)
+	}
+	result := make([]resp.Value, len(members))
+	for i, m := range members {
+		result[i] = resp.Bulk(m.Member)
+	}
+	return resp.Arr(result...)
+}
+
+// parseLexBound parses Redis lex-range tokens: "-", "+", "[member", "(member".
+func parseLexBound(s string) (storage.LexBound, error) {
+	switch {
+	case s == "-":
+		return storage.LexBound{Infinity: -1}, nil
+	case s == "+":
+		return storage.LexBound{Infinity: +1}, nil
+	case strings.HasPrefix(s, "["):
+		return storage.LexBound{Value: s[1:], Inclusive: true}, nil
+	case strings.HasPrefix(s, "("):
+		return storage.LexBound{Value: s[1:], Inclusive: false}, nil
+	default:
+		return storage.LexBound{}, fmt.Errorf("min or max not valid string range item")
+	}
+}
+
+// parseLexLimit walks optional [LIMIT offset count] trailing args.
+func parseLexLimit(args []resp.Value) (offset, count int64, errVal *resp.Value) {
+	if len(args) == 0 {
+		return 0, -1, nil
+	}
+	if len(args) != 3 || strings.ToUpper(args[0].Bulk) != "LIMIT" {
+		e := resp.Err("ERR syntax error")
+		return 0, 0, &e
+	}
+	o, err := strconv.ParseInt(args[1].Bulk, 10, 64)
+	if err != nil {
+		e := resp.Err("ERR value is not an integer or out of range")
+		return 0, 0, &e
+	}
+	c, err := strconv.ParseInt(args[2].Bulk, 10, 64)
+	if err != nil {
+		e := resp.Err("ERR value is not an integer or out of range")
+		return 0, 0, &e
+	}
+	return o, c, nil
+}
+
+// ZRANGEBYLEX key min max [LIMIT offset count]
+func (h *Handler) zrangebylexOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {
+	if len(args) < 3 {
+		return resp.ErrWrongArgs("zrangebylex")
+	}
+	min, err := parseLexBound(args[1].Bulk)
+	if err != nil {
+		return resp.Err("ERR " + err.Error())
+	}
+	max, err := parseLexBound(args[2].Bulk)
+	if err != nil {
+		return resp.Err("ERR " + err.Error())
+	}
+	offset, count, errVal := parseLexLimit(args[3:])
+	if errVal != nil {
+		return *errVal
+	}
+	members, err := ops.ZRangeByLex(ctx, args[0].Bulk, min, max, offset, count)
+	if err != nil {
+		if strings.Contains(err.Error(), "WRONGTYPE") {
+			return resp.ErrWrongType()
+		}
+		return resp.Err(err.Error())
+	}
+	result := make([]resp.Value, len(members))
+	for i, m := range members {
+		result[i] = resp.Bulk(m)
+	}
+	return resp.Arr(result...)
+}
+
+// ZREVRANGEBYLEX key max min [LIMIT offset count]
+// Note the wire-protocol order: max first, then min.
+func (h *Handler) zrevrangebylexOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {
+	if len(args) < 3 {
+		return resp.ErrWrongArgs("zrevrangebylex")
+	}
+	max, err := parseLexBound(args[1].Bulk)
+	if err != nil {
+		return resp.Err("ERR " + err.Error())
+	}
+	min, err := parseLexBound(args[2].Bulk)
+	if err != nil {
+		return resp.Err("ERR " + err.Error())
+	}
+	offset, count, errVal := parseLexLimit(args[3:])
+	if errVal != nil {
+		return *errVal
+	}
+	members, err := ops.ZRevRangeByLex(ctx, args[0].Bulk, min, max, offset, count)
+	if err != nil {
+		if strings.Contains(err.Error(), "WRONGTYPE") {
+			return resp.ErrWrongType()
+		}
+		return resp.Err(err.Error())
+	}
+	result := make([]resp.Value, len(members))
+	for i, m := range members {
+		result[i] = resp.Bulk(m)
+	}
+	return resp.Arr(result...)
+}
+
+// ZRANGESTORE dst src min max [BYSCORE | BYLEX] [REV] [LIMIT offset count]
+func (h *Handler) zrangestoreOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {
+	if len(args) < 4 {
+		return resp.ErrWrongArgs("zrangestore")
+	}
+	dst := args[0].Bulk
+	src := args[1].Bulk
+	startArg := args[2].Bulk
+	stopArg := args[3].Bulk
+
+	spec := storage.ZRangeStoreSpec{By: storage.ZRangeByIndex, Count: -1}
+
+	for i := 4; i < len(args); i++ {
+		switch strings.ToUpper(args[i].Bulk) {
+		case "BYSCORE":
+			spec.By = storage.ZRangeByScore
+		case "BYLEX":
+			spec.By = storage.ZRangeByLex
+		case "REV":
+			spec.Rev = true
+		case "LIMIT":
+			if i+2 >= len(args) {
+				return resp.ErrWrongArgs("zrangestore")
+			}
+			off, err := strconv.ParseInt(args[i+1].Bulk, 10, 64)
+			if err != nil {
+				return resp.Err("ERR value is not an integer or out of range")
+			}
+			cnt, err := strconv.ParseInt(args[i+2].Bulk, 10, 64)
+			if err != nil {
+				return resp.Err("ERR value is not an integer or out of range")
+			}
+			spec.Offset, spec.Count = off, cnt
+			i += 2
+		default:
+			return resp.Err("ERR syntax error")
+		}
+	}
+
+	switch spec.By {
+	case storage.ZRangeByIndex:
+		start, err := strconv.ParseInt(startArg, 10, 64)
+		if err != nil {
+			return resp.Err("ERR value is not an integer or out of range")
+		}
+		stop, err := strconv.ParseInt(stopArg, 10, 64)
+		if err != nil {
+			return resp.Err("ERR value is not an integer or out of range")
+		}
+		spec.Start, spec.Stop = start, stop
+	case storage.ZRangeByScore:
+		min, err := parseScoreBound(startArg)
+		if err != nil {
+			return resp.Err("min or max is not a float")
+		}
+		max, err := parseScoreBound(stopArg)
+		if err != nil {
+			return resp.Err("min or max is not a float")
+		}
+		if spec.Rev {
+			min, max = max, min
+		}
+		spec.MinScore, spec.MaxScore = min, max
+	case storage.ZRangeByLex:
+		min, err := parseLexBound(startArg)
+		if err != nil {
+			return resp.Err("ERR " + err.Error())
+		}
+		max, err := parseLexBound(stopArg)
+		if err != nil {
+			return resp.Err("ERR " + err.Error())
+		}
+		if spec.Rev {
+			min, max = max, min
+		}
+		spec.MinLex, spec.MaxLex = min, max
+	}
+
+	n, err := ops.ZRangeStore(ctx, dst, src, spec)
+	if err != nil {
+		if strings.Contains(err.Error(), "WRONGTYPE") {
+			return resp.ErrWrongType()
+		}
+		return resp.Err(err.Error())
+	}
+	return resp.Int(n)
+}
+
+// ZLEXCOUNT key min max
+func (h *Handler) zlexcountOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {
+	if len(args) != 3 {
+		return resp.ErrWrongArgs("zlexcount")
+	}
+	min, err := parseLexBound(args[1].Bulk)
+	if err != nil {
+		return resp.Err("ERR " + err.Error())
+	}
+	max, err := parseLexBound(args[2].Bulk)
+	if err != nil {
+		return resp.Err("ERR " + err.Error())
+	}
+	n, err := ops.ZLexCount(ctx, args[0].Bulk, min, max)
+	if err != nil {
+		if strings.Contains(err.Error(), "WRONGTYPE") {
+			return resp.ErrWrongType()
+		}
+		return resp.Err(err.Error())
+	}
+	return resp.Int(n)
 }
 
 func (h *Handler) zscoreOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {
@@ -2694,6 +3455,45 @@ func (h *Handler) sinterOp(ctx context.Context, ops storage.Operations, args []r
 	return resp.Arr(result...)
 }
 
+// SINTERCARD numkeys key [key ...] [LIMIT limit]
+func (h *Handler) sintercardOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {
+	if len(args) < 2 {
+		return resp.ErrWrongArgs("sintercard")
+	}
+	numkeys, err := strconv.ParseInt(args[0].Bulk, 10, 64)
+	if err != nil || numkeys < 1 {
+		return resp.Err("ERR numkeys should be greater than 0")
+	}
+	if int64(len(args)) < 1+numkeys {
+		return resp.ErrWrongArgs("sintercard")
+	}
+	keys := make([]string, numkeys)
+	for i := int64(0); i < numkeys; i++ {
+		keys[i] = args[1+i].Bulk
+	}
+	var limit int64
+	// Optional LIMIT <n>
+	rest := args[1+numkeys:]
+	if len(rest) > 0 {
+		if len(rest) != 2 || strings.ToUpper(rest[0].Bulk) != "LIMIT" {
+			return resp.Err("ERR syntax error")
+		}
+		limit, err = strconv.ParseInt(rest[1].Bulk, 10, 64)
+		if err != nil || limit < 0 {
+			return resp.Err("ERR LIMIT can't be negative")
+		}
+	}
+
+	n, err := ops.SInterCard(ctx, keys, limit)
+	if err != nil {
+		if strings.Contains(err.Error(), "WRONGTYPE") {
+			return resp.ErrWrongType()
+		}
+		return resp.Err(err.Error())
+	}
+	return resp.Int(n)
+}
+
 func (h *Handler) sinterstoreOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {
 	if len(args) < 2 {
 		return resp.ErrWrongArgs("sinterstore")
@@ -3223,6 +4023,10 @@ func (h *Handler) ExecuteWithOps(ctx context.Context, ops storage.Operations, cm
 		return h.renameOp(ctx, ops, args)
 	case "COPY":
 		return h.copyOp(ctx, ops, args)
+	case "RANDOMKEY":
+		return h.randomKeyOp(ctx, ops, args)
+	case "OBJECT":
+		return h.objectOp(ctx, ops, args)
 
 	// Hash commands
 	case "HGET":
@@ -3253,6 +4057,8 @@ func (h *Handler) ExecuteWithOps(ctx context.Context, ops storage.Operations, cm
 		return h.hsetnxOp(ctx, ops, args)
 	case "HSCAN":
 		return h.hscanOp(ctx, ops, args)
+	case "HRANDFIELD":
+		return h.hrandfieldOp(ctx, ops, args)
 
 	// Watch commands (no-ops for PostgreSQL compatibility)
 	case "WATCH":
@@ -3273,6 +4079,10 @@ func (h *Handler) ExecuteWithOps(ctx context.Context, ops storage.Operations, cm
 		return h.blpopOp(ctx, ops, args)
 	case "BRPOP":
 		return h.brpopOp(ctx, ops, args)
+	case "LMPOP":
+		return h.lmpopOp(ctx, ops, args)
+	case "BLMPOP":
+		return h.blmpopOp(ctx, ops, args)
 	case "LLEN":
 		return h.llenOp(ctx, ops, args)
 	case "LRANGE":
@@ -3321,6 +4131,10 @@ func (h *Handler) ExecuteWithOps(ctx context.Context, ops storage.Operations, cm
 		return h.sdiffOp(ctx, ops, args)
 	case "SDIFFSTORE":
 		return h.sdiffstoreOp(ctx, ops, args)
+	case "SINTERCARD":
+		return h.sintercardOp(ctx, ops, args)
+	case "SRANDMEMBER":
+		return h.srandmemberOp(ctx, ops, args)
 	case "SSCAN":
 		return h.sscanOp(ctx, ops, args)
 
@@ -3335,6 +4149,24 @@ func (h *Handler) ExecuteWithOps(ctx context.Context, ops storage.Operations, cm
 		return h.zrangeOp(ctx, ops, args)
 	case "ZRANGEBYSCORE":
 		return h.zrangebyscoreOp(ctx, ops, args)
+	case "ZREVRANGE":
+		return h.zrevrangeOp(ctx, ops, args)
+	case "ZREVRANGEBYSCORE":
+		return h.zrevrangebyscoreOp(ctx, ops, args)
+	case "ZRANGEBYLEX":
+		return h.zrangebylexOp(ctx, ops, args)
+	case "ZREVRANGEBYLEX":
+		return h.zrevrangebylexOp(ctx, ops, args)
+	case "ZLEXCOUNT":
+		return h.zlexcountOp(ctx, ops, args)
+	case "ZRANGESTORE":
+		return h.zrangestoreOp(ctx, ops, args)
+	case "ZRANDMEMBER":
+		return h.zrandmemberOp(ctx, ops, args)
+	case "ZMPOP":
+		return h.zmpopOp(ctx, ops, args)
+	case "BZMPOP":
+		return h.bzmpopOp(ctx, ops, args)
 	case "ZSCORE":
 		return h.zscoreOp(ctx, ops, args)
 	case "ZREM":
