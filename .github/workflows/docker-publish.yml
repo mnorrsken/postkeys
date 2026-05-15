@@ -36,7 +36,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -66,15 +66,18 @@ jobs:
       contents: read
       packages: write
 
+    outputs:
+      primary-tag: ${{ steps.primary.outputs.tag }}
+
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
 
       - name: Log in to Container Registry
         uses: docker/login-action@v3
@@ -95,13 +98,32 @@ jobs:
             type=raw,value=latest
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Resolve primary image ref for scanning
+        id: primary
+        run: |
+          # Use the first tag (full semver, e.g. ghcr.io/owner/repo:1.2.3) as the scan target.
+          tag="$(echo '${{ steps.meta.outputs.tags }}' | head -n1)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.primary.outputs.tag }}
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+        env:
+          TRIVY_DISABLE_VEX_NOTICE: 'true'
 
   helm:
     name: Package and publish Helm chart
@@ -114,7 +136,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up Helm
         uses: azure/setup-helm@v4
@@ -155,7 +177,31 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build release binaries
+        run: |
+          VERSION_NO_V="${GITHUB_REF#refs/tags/v}"
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os="${target%/*}"
+            arch="${target##*/}"
+            out="dist/postkeys_${VERSION_NO_V}_${os}_${arch}"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -trimpath -ldflags="-s -w" -o "$out" ./cmd/server
+          done
+
+      - name: Compute sha256 checksums
+        working-directory: dist
+        run: |
+          sha256sum postkeys_* > checksums.txt
+          cat checksums.txt
 
       - name: Create GitHub release
         env:
@@ -174,4 +220,8 @@ jobs:
           ## Helm Chart
           \`\`\`
           helm pull oci://ghcr.io/${{ github.repository_owner }}/charts/postkeys --version ${VERSION_NO_V}
-          \`\`\`"
+          \`\`\`
+
+          ## Binaries
+          Verify with \`sha256sum -c checksums.txt\` — checksums attached below." \
+            dist/postkeys_* dist/checksums.txt

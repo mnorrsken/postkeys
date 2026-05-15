@@ -15,10 +15,12 @@ FROM alpine:latest
 
 RUN apk --no-cache add ca-certificates
 
-WORKDIR /root/
+WORKDIR /app
 
-COPY --from=builder /app/postkeys .
+COPY --from=builder /app/postkeys /app/postkeys
+
+USER 1000:1000
 
 EXPOSE 6379
 
-CMD ["./postkeys"]
+ENTRYPOINT ["/app/postkeys"]

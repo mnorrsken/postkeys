@@ -427,6 +427,45 @@ func extractBulkStrings(values []resp.Value) []string {
 	return result
 }
 
+// redactSensitiveArgs returns a copy of cmd with credentials replaced by
+// "<redacted>" when the command is AUTH or HELLO with an AUTH option, so
+// passwords never appear in trace logs.
+func redactSensitiveArgs(cmd resp.Value) resp.Value {
+	if cmd.Type != resp.Array || len(cmd.Array) == 0 {
+		return cmd
+	}
+	cmdName := strings.ToUpper(cmd.Array[0].Bulk)
+	switch cmdName {
+	case "AUTH":
+		// AUTH [username] password — redact every arg after the command name.
+		if len(cmd.Array) < 2 {
+			return cmd
+		}
+		out := resp.Value{Type: resp.Array, Array: make([]resp.Value, len(cmd.Array))}
+		out.Array[0] = cmd.Array[0]
+		for i := 1; i < len(cmd.Array); i++ {
+			out.Array[i] = resp.Value{Type: resp.BulkString, Bulk: "<redacted>"}
+		}
+		return out
+	case "HELLO":
+		// HELLO [proto [AUTH user password] [SETNAME name]] — redact the two
+		// args following an AUTH token.
+		out := resp.Value{Type: resp.Array, Array: make([]resp.Value, len(cmd.Array))}
+		copy(out.Array, cmd.Array)
+		for i := 1; i < len(out.Array); i++ {
+			if strings.ToUpper(out.Array[i].Bulk) == "AUTH" {
+				for j := i + 1; j < len(out.Array) && j <= i+2; j++ {
+					out.Array[j] = resp.Value{Type: resp.BulkString, Bulk: "<redacted>"}
+				}
+				break
+			}
+		}
+		return out
+	default:
+		return cmd
+	}
+}
+
 // formatRESPValue formats a RESP value for trace logging, detecting binary data
 func formatRESPValue(v resp.Value) string {
 	switch v.Type {
@@ -536,7 +575,7 @@ func (s *Server) traceCommand(conn net.Conn, cmd resp.Value) {
 	}
 
 	if s.traceLevel >= getCommandLevel(cmdName) {
-		log.Printf("[TRACE] %s <- %s", conn.RemoteAddr(), formatRESPValue(cmd))
+		log.Printf("[TRACE] %s <- %s", conn.RemoteAddr(), formatRESPValue(redactSensitiveArgs(cmd)))
 	}
 }
 

@@ -202,6 +202,8 @@ postkeys provides configurable tracing with three levels for both SQL and RESP c
 Binary data is automatically detected and replaced with `<binary:SIZE>` to keep logs readable.
 Errors are always logged at any trace level > 0.
 
+`AUTH <password>`, `AUTH <user> <password>`, and `HELLO ... AUTH <user> <password>` have their credential args replaced with `<redacted>` in the trace output so passwords never reach the logs.
+
 > **Warning:** Higher trace levels generate significant log volume. Use level 3 only for debugging, not in production.
 
 ### Graceful Shutdown

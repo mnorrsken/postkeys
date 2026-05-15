@@ -1,0 +1,7 @@
+# Trivy ignore file
+#
+# One vulnerability ID per line (CVE-YYYY-NNNN). Add an inline comment with a
+# short justification and a review-by date so entries don't rot here forever.
+#
+# Examples:
+# CVE-2024-12345  # false positive in alpine base, upstream advisory: ...
