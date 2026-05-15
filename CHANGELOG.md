@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.28.0] - 2026-05-15
+
+### Added
+Workstream C from the 1.0 plan — baseline security and release hygiene:
+
+- **Non-root container image** — `Dockerfile` runtime stage now sets `USER 1000:1000` and uses `/app` instead of `/root` as `WORKDIR`. The Helm chart already enforces `runAsUser: 1000` at the pod level; the image now matches so a bare `docker run` is also non-root. `ENTRYPOINT` replaces the previous `CMD` so flags can be appended without losing the binary path.
+- **Trivy image scan in CI** — new step in the `build-and-push` job of `.github/workflows/docker-publish.yml` runs `aquasecurity/trivy-action` against the freshly pushed image, fails on `HIGH,CRITICAL` with `ignore-unfixed: true`. New `.trivyignore` is the allowlist file (empty initially; format documented in the file header).
+- **AUTH/HELLO password redaction in RESP traces** — `internal/server/server.go` now routes incoming traced commands through `redactSensitiveArgs`, which replaces every arg of `AUTH` and the two args following `AUTH` inside `HELLO` with `<redacted>`. Output of `[TRACE] ... <- [AUTH "hunter2"]` becomes `[AUTH "<redacted>"]`. Unit tests in `internal/server/server_test.go` cover `AUTH password`, `AUTH user password`, `HELLO 2 AUTH user pw`, `HELLO 3 AUTH user pw SETNAME name`, lowercase command names, and the non-mutation invariant.
+- **Release sha256 checksums** — the `release` job in `.github/workflows/docker-publish.yml` now builds standalone binaries for `linux/amd64`, `linux/arm64`, `darwin/amd64`, and `darwin/arm64` with `-trimpath -ldflags="-s -w"`, computes a `sha256sum` manifest, and attaches both the binaries and `checksums.txt` to the GitHub release.
+
+### Changed
+- **Pinned critical GitHub Actions to commit SHAs** — `actions/checkout`, `docker/setup-buildx-action`, and `docker/build-push-action` references in `.github/workflows/docker-publish.yml` now use full commit SHAs with a trailing `# vX.Y.Z` comment. New `github-actions` ecosystem entry in `.github/dependabot.yml` so dependabot bumps the pinned digests on the same weekly cadence as the existing gomod and docker entries.
+
 ## [0.27.0] - 2026-05-15
 
 ### Added
