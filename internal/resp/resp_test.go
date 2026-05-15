@@ -225,10 +225,11 @@ func TestReader_Errors(t *testing.T) {
 	}
 }
 
-// TestReader_NegativeLengthPanic documents that negative bulk/array lengths
-// other than -1 cause a panic in the current implementation.
-// This is a known issue that should be fixed.
-func TestReader_NegativeLengthPanic(t *testing.T) {
+// TestReader_NegativeLength asserts that bulk/array lengths less than -1 are
+// rejected with an error rather than panicking. -1 is the valid "null" sentinel
+// for both types; any other negative value is malformed input and the parser
+// must not allocate a `make([]T, length+2)` for it.
+func TestReader_NegativeLength(t *testing.T) {
 	testCases := []struct {
 		name  string
 		input string
@@ -241,19 +242,10 @@ func TestReader_NegativeLengthPanic(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			defer func() {
-				if r := recover(); r != nil {
-					// Expected - current implementation panics
-					t.Logf("Known issue: %s causes panic: %v", tc.name, r)
-				}
-			}()
-
 			r := NewReader(strings.NewReader(tc.input))
 			_, err := r.Read()
 			if err == nil {
-				t.Error("expected error or panic, got nil")
-			} else {
-				t.Logf("Returned error (good): %v", err)
+				t.Error("expected error, got nil")
 			}
 		})
 	}

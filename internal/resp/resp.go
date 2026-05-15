@@ -10,6 +10,19 @@ import (
 	"strconv"
 )
 
+// Limits guard against malicious or malformed inputs that declare absurd
+// lengths up front; without these, a single command like "*9223372036854775807"
+// would let the parser try to allocate a slice large enough to OOM the
+// process before any element bytes have been read.
+const (
+	// MaxBulkLen matches the Redis default for `proto-max-bulk-len` (512 MiB).
+	MaxBulkLen = 512 * 1024 * 1024
+	// MaxArrayLen caps the number of elements a single array (or push/map)
+	// can declare. 1 MiB elements is well above any legitimate command size
+	// and keeps worst-case allocation bounded.
+	MaxArrayLen = 1 << 20
+)
+
 // Value types in RESP protocol
 type Type byte
 
@@ -149,6 +162,12 @@ func (r *Reader) readBulkString() (Value, error) {
 	if length == -1 {
 		return Value{Type: BulkString, Null: true}, nil
 	}
+	if length < 0 {
+		return Value{}, fmt.Errorf("invalid bulk string length: %d", length)
+	}
+	if length > MaxBulkLen {
+		return Value{}, fmt.Errorf("bulk string length %d exceeds limit %d", length, MaxBulkLen)
+	}
 
 	buf := make([]byte, length+2)
 	_, err = io.ReadFull(r.reader, buf)
@@ -172,6 +191,12 @@ func (r *Reader) readArray() (Value, error) {
 
 	if count == -1 {
 		return Value{Type: Array, Null: true}, nil
+	}
+	if count < 0 {
+		return Value{}, fmt.Errorf("invalid array length: %d", count)
+	}
+	if count > MaxArrayLen {
+		return Value{}, fmt.Errorf("array length %d exceeds limit %d", count, MaxArrayLen)
 	}
 
 	array := make([]Value, count)

@@ -3,9 +3,7 @@ package storage
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"fmt"
 	"math/rand"
 	"sort"
@@ -78,31 +76,6 @@ func decodeField(field string) string {
 		}
 	}
 	return field
-}
-
-// keyspaceChannelPrefix is the prefix for keyspace notification channels
-const keyspaceChannelPrefix = "__keyspace@0__:"
-
-// maxPgChannelLen is the maximum length for PostgreSQL NOTIFY channel names (NAMEDATALEN - 1)
-const maxPgChannelLen = 63
-
-// keyspaceChannel creates a safe channel name for keyspace notifications.
-// PostgreSQL channel names are limited to 63 bytes. For long keys, we use
-// a hash suffix to ensure uniqueness while staying within the limit.
-func keyspaceChannel(key string) string {
-	channel := keyspaceChannelPrefix + key
-	if len(channel) <= maxPgChannelLen {
-		return channel
-	}
-
-	// For long keys, use: prefix + truncated key + hash suffix
-	// Hash suffix is 8 chars (short hex hash) + 1 for separator = 9 chars
-	// Available for key: 63 - 14 (prefix) - 9 (hash suffix) = 40 chars
-	hash := sha256.Sum256([]byte(key))
-	hashSuffix := ":" + hex.EncodeToString(hash[:4]) // 8 hex chars
-	maxKeyLen := maxPgChannelLen - len(keyspaceChannelPrefix) - len(hashSuffix)
-
-	return keyspaceChannelPrefix + key[:maxKeyLen] + hashSuffix
 }
 
 // queryOps provides the actual implementation of storage operations using a Querier.
@@ -1074,7 +1047,7 @@ func (o queryOps) persist(ctx context.Context, q Querier, key string) (bool, err
 	// Also clear expires_at in data tables
 	tables := []string{"kv_strings", "kv_hashes", "kv_lists", "kv_sets", "kv_zsets", "kv_hyperloglog"}
 	for _, table := range tables {
-		q.Exec(ctx, fmt.Sprintf("UPDATE %s SET expires_at = NULL WHERE key = $1", table), key)
+		_, _ = q.Exec(ctx, fmt.Sprintf("UPDATE %s SET expires_at = NULL WHERE key = $1", table), key)
 	}
 
 	return true, nil

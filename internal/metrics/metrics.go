@@ -105,16 +105,16 @@ func NewServer(addr string, enablePprof bool, readyFn func() bool) *Server {
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
+		_, _ = w.Write([]byte("OK"))
 	})
 	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
 		if readyFn != nil && !readyFn() {
 			w.WriteHeader(http.StatusServiceUnavailable)
-			w.Write([]byte("standby"))
+			_, _ = w.Write([]byte("standby"))
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
+		_, _ = w.Write([]byte("OK"))
 	})
 
 	if enablePprof {
@@ -133,8 +133,9 @@ func NewServer(addr string, enablePprof bool, readyFn func() bool) *Server {
 
 	return &Server{
 		server: &http.Server{
-			Addr:    addr,
-			Handler: mux,
+			Addr:              addr,
+			Handler:           mux,
+			ReadHeaderTimeout: 10 * time.Second,
 		},
 	}
 }

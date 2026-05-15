@@ -267,7 +267,7 @@ func main() {
 		cancel()
 
 		log.Println("Stopping metrics server...")
-		metricsSrv.Stop()
+		_ = metricsSrv.Stop()
 
 		// Stop cache invalidator if running
 		if cacheInvalidator != nil {

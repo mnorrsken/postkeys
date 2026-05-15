@@ -298,3 +298,227 @@ func BenchmarkPgPipeline(b *testing.B) {
 		}
 	}
 }
+
+// ============== New-ops benchmarks ==============
+//
+// These exercise the v0.24+/v0.26 hot-path additions: batched type checks
+// behind HGETALL, the single-RTT multi-key BLPOP, and the CTE-based ZRANGE
+// variants. They guard against regressions in the work that closed the gap
+// against upstream Redis on those commands.
+
+// BenchmarkPgHGetAll measures the single-RTT HGETALL path (one query that
+// fetches both type metadata and field/value pairs) against a moderately
+// sized hash. The hash is populated once in setup so the benchmark itself
+// only times reads.
+func BenchmarkPgHGetAll(b *testing.B) {
+	ts := newPgTestServer(b)
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	const fields = 50
+	pairs := make([]interface{}, 0, fields*2)
+	for i := 0; i < fields; i++ {
+		pairs = append(pairs, fmt.Sprintf("field_%d", i), fmt.Sprintf("value_%d", i))
+	}
+	if err := ts.client.HSet(ctx, "bench_hgetall", pairs...).Err(); err != nil {
+		b.Fatalf("HSET setup failed: %v", err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out, err := ts.client.HGetAll(ctx, "bench_hgetall").Result()
+		if err != nil {
+			b.Fatalf("HGETALL failed: %v", err)
+		}
+		if len(out) != fields {
+			b.Fatalf("HGETALL returned %d fields, want %d", len(out), fields)
+		}
+	}
+}
+
+// BenchmarkPgHMGet measures the batched HMGET path on a subset of fields
+// from a populated hash.
+func BenchmarkPgHMGet(b *testing.B) {
+	ts := newPgTestServer(b)
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	const fields = 100
+	pairs := make([]interface{}, 0, fields*2)
+	for i := 0; i < fields; i++ {
+		pairs = append(pairs, fmt.Sprintf("field_%d", i), fmt.Sprintf("value_%d", i))
+	}
+	if err := ts.client.HSet(ctx, "bench_hmget", pairs...).Err(); err != nil {
+		b.Fatalf("HSET setup failed: %v", err)
+	}
+
+	want := make([]string, 10)
+	for i := range want {
+		want[i] = fmt.Sprintf("field_%d", i*7%fields)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := ts.client.HMGet(ctx, "bench_hmget", want...).Result(); err != nil {
+			b.Fatalf("HMGET failed: %v", err)
+		}
+	}
+}
+
+// BenchmarkPgBLPOPMultiKey hits the multi-key BLPOP fast path: keys that
+// already have data should return without ever entering the LISTEN/NOTIFY
+// blocking loop. Five keys exercises the array_position CTE pattern that
+// generalised popMulti.
+func BenchmarkPgBLPOPMultiKey(b *testing.B) {
+	ts := newPgTestServer(b)
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	keys := []string{"bl1", "bl2", "bl3", "bl4", "bl5"}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		// Push to one of the keys each iteration; BLPOP should pop without
+		// blocking since data is already present.
+		k := keys[i%len(keys)]
+		if err := ts.client.RPush(ctx, k, "v").Err(); err != nil {
+			b.Fatalf("RPUSH failed: %v", err)
+		}
+		if _, err := ts.client.BLPop(ctx, time.Second, keys...).Result(); err != nil {
+			b.Fatalf("BLPOP failed: %v", err)
+		}
+	}
+}
+
+// BenchmarkPgLMPOP exercises the LMPOP COUNT path — N members popped from
+// the first non-empty key in a single SQL round-trip.
+func BenchmarkPgLMPOP(b *testing.B) {
+	ts := newPgTestServer(b)
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	const popCount = 5
+	const keys = 3
+	keyNames := []string{"lmp1", "lmp2", "lmp3"}
+
+	// Pre-populate enough elements that every iteration finds something to pop.
+	// We use one big push per key, sized for b.N iterations distributed across
+	// the keys, so the timed loop is purely LMPOP cost.
+	values := make([]interface{}, 0, b.N*popCount)
+	for i := 0; i < b.N*popCount; i++ {
+		values = append(values, fmt.Sprintf("v%d", i))
+	}
+	per := len(values) / keys
+	for i, k := range keyNames {
+		start := i * per
+		end := start + per
+		if i == keys-1 {
+			end = len(values)
+		}
+		if end > start {
+			if err := ts.client.RPush(ctx, k, values[start:end]...).Err(); err != nil {
+				b.Fatalf("RPUSH setup failed: %v", err)
+			}
+		}
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := ts.client.Do(ctx,
+			"LMPOP", fmt.Sprintf("%d", keys), keyNames[0], keyNames[1], keyNames[2],
+			"LEFT", "COUNT", fmt.Sprintf("%d", popCount),
+		).Result()
+		if err != nil {
+			b.Fatalf("LMPOP failed at i=%d: %v", i, err)
+		}
+	}
+}
+
+// BenchmarkPgZRange hits the single-RTT ZRANGE path on a populated sorted
+// set, returning a window that's large enough to dominate fixed query cost.
+func BenchmarkPgZRange(b *testing.B) {
+	ts := newPgTestServer(b)
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	const members = 1000
+	zs := make([]redis.Z, members)
+	for i := 0; i < members; i++ {
+		zs[i] = redis.Z{Score: float64(i), Member: fmt.Sprintf("m%04d", i)}
+	}
+	if err := ts.client.ZAdd(ctx, "bench_zrange", zs...).Err(); err != nil {
+		b.Fatalf("ZADD setup failed: %v", err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out, err := ts.client.ZRange(ctx, "bench_zrange", 0, 99).Result()
+		if err != nil {
+			b.Fatalf("ZRANGE failed: %v", err)
+		}
+		if len(out) != 100 {
+			b.Fatalf("ZRANGE returned %d members, want 100", len(out))
+		}
+	}
+}
+
+// BenchmarkPgZRangeByScore exercises the score-bound query path with WITHSCORES.
+func BenchmarkPgZRangeByScore(b *testing.B) {
+	ts := newPgTestServer(b)
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	const members = 1000
+	zs := make([]redis.Z, members)
+	for i := 0; i < members; i++ {
+		zs[i] = redis.Z{Score: float64(i), Member: fmt.Sprintf("m%04d", i)}
+	}
+	if err := ts.client.ZAdd(ctx, "bench_zrbs", zs...).Err(); err != nil {
+		b.Fatalf("ZADD setup failed: %v", err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := ts.client.ZRangeByScoreWithScores(ctx, "bench_zrbs", &redis.ZRangeBy{
+			Min:    "100",
+			Max:    "199",
+			Offset: 0,
+			Count:  100,
+		}).Result()
+		if err != nil {
+			b.Fatalf("ZRANGEBYSCORE failed: %v", err)
+		}
+	}
+}
+
+// BenchmarkPgZRangeStore exercises the destination-writing variant: the
+// CTE that powers ZRANGE feeds an INSERT into kv_zsets in a single round-trip.
+func BenchmarkPgZRangeStore(b *testing.B) {
+	ts := newPgTestServer(b)
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	const members = 1000
+	zs := make([]redis.Z, members)
+	for i := 0; i < members; i++ {
+		zs[i] = redis.Z{Score: float64(i), Member: fmt.Sprintf("m%04d", i)}
+	}
+	if err := ts.client.ZAdd(ctx, "bench_zrs_src", zs...).Err(); err != nil {
+		b.Fatalf("ZADD setup failed: %v", err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		dst := fmt.Sprintf("bench_zrs_dst_%d", i)
+		if _, err := ts.client.Do(ctx, "ZRANGESTORE", dst, "bench_zrs_src", "0", "99").Result(); err != nil {
+			b.Fatalf("ZRANGESTORE failed: %v", err)
+		}
+	}
+}

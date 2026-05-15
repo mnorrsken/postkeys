@@ -93,7 +93,7 @@ func matchGlob(pattern, str string) bool {
 func (s *CachedStore) invalidate(ctx context.Context, key string) {
 	s.cache.Invalidate(key)
 	if s.invalidator != nil {
-		s.invalidator.InvalidateKey(ctx, key)
+		_ = s.invalidator.InvalidateKey(ctx, key)
 	}
 }
 
@@ -101,7 +101,7 @@ func (s *CachedStore) invalidate(ctx context.Context, key string) {
 func (s *CachedStore) invalidateMulti(ctx context.Context, keys []string) {
 	s.cache.DeleteMulti(keys)
 	if s.invalidator != nil {
-		s.invalidator.InvalidateKeys(ctx, keys...)
+		_ = s.invalidator.InvalidateKeys(ctx, keys...)
 	}
 }
 

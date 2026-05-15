@@ -1460,7 +1460,7 @@ func (h *Handler) lpushOp(ctx context.Context, ops storage.Operations, args []re
 
 	// Notify any BRPOP/BLPOP waiters
 	if h.listNotifier != nil {
-		h.listNotifier.NotifyPush(ctx, key)
+		_ = h.listNotifier.NotifyPush(ctx, key)
 	}
 
 	return resp.Int(length)
@@ -1487,7 +1487,7 @@ func (h *Handler) rpushOp(ctx context.Context, ops storage.Operations, args []re
 
 	// Notify any BRPOP/BLPOP waiters
 	if h.listNotifier != nil {
-		h.listNotifier.NotifyPush(ctx, key)
+		_ = h.listNotifier.NotifyPush(ctx, key)
 	}
 
 	return resp.Int(length)

@@ -3,7 +3,6 @@
 package storage
 
 import (
-	"encoding/binary"
 	"hash/fnv"
 	"math"
 	"math/bits"
@@ -129,13 +128,6 @@ func (hll *HyperLogLog) AddHash(hash uint64) bool {
 		return true
 	}
 	return false
-}
-
-// hashToBytes converts uint64 to bytes for hashing
-func hashToBytes(h uint64) []byte {
-	b := make([]byte, 8)
-	binary.LittleEndian.PutUint64(b, h)
-	return b
 }
 
 // Count returns the estimated cardinality

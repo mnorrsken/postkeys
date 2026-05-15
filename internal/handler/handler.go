@@ -70,10 +70,10 @@ const defaultBlockingPollInterval = 100 * time.Millisecond
 
 // Handler processes Redis commands
 type Handler struct {
-	store               storage.Backend
-	password            string
-	startTime           time.Time
-	listNotifier        ListNotifier
+	store                storage.Backend
+	password             string
+	startTime            time.Time
+	listNotifier         ListNotifier
 	blockingPollInterval time.Duration
 }
 
@@ -373,7 +373,7 @@ func (h *Handler) HandleExec(ctx context.Context, client TransactionClientState)
 
 		// Commit the transaction
 		if err := tx.Commit(ctx); err != nil {
-			tx.Rollback(ctx)
+			_ = tx.Rollback(ctx)
 			if storage.IsRetryableError(err) && attempt < maxExecRetries {
 				continue
 			}

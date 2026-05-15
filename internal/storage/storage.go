@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -19,6 +20,13 @@ type Store struct {
 	connStr       string
 	ops           queryOps
 	sqlTraceLevel int // 0=off, 1=important, 2=most queries, 3=everything
+
+	// cleanupCancel stops the background expired-keys cleanup loop. Close
+	// invokes it and waits on cleanupWG so the goroutine has actually exited
+	// before Close returns; this matters in tests (goleak) and in any host
+	// process that creates and tears down stores during its lifetime.
+	cleanupCancel context.CancelFunc
+	cleanupWG     sync.WaitGroup
 }
 
 // Config holds PostgreSQL connection configuration
@@ -80,14 +88,26 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 		return nil, fmt.Errorf("failed to initialize schema: %w", err)
 	}
 
-	// Start background goroutine to clean expired keys
-	go store.cleanupExpiredKeys(ctx)
+	// Start background goroutine to clean expired keys. The loop runs against
+	// a context derived from `ctx` but with our own cancel, so Close() can
+	// stop it deterministically even when callers pass context.Background().
+	cleanupCtx, cancel := context.WithCancel(ctx)
+	store.cleanupCancel = cancel
+	store.cleanupWG.Add(1)
+	go func() {
+		defer store.cleanupWG.Done()
+		store.cleanupExpiredKeys(cleanupCtx)
+	}()
 
 	return store, nil
 }
 
-// Close closes the database connection pool
+// Close closes the database connection pool and stops the background cleanup loop.
 func (s *Store) Close() {
+	if s.cleanupCancel != nil {
+		s.cleanupCancel()
+		s.cleanupWG.Wait()
+	}
 	s.pool.Close()
 }
 
@@ -201,7 +221,7 @@ func (s *Store) deleteExpiredKeys(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	var acquired bool
 	if err := tx.QueryRow(ctx, "SELECT pg_try_advisory_xact_lock($1)", advisoryLockCleanup).Scan(&acquired); err != nil || !acquired {
@@ -267,7 +287,7 @@ func (s *Store) deleteExpiredKeys(ctx context.Context) {
 	// Phase 3: Clean up orphaned kv_meta entries where data was removed but meta remains.
 	// This handles cases like LPOP/RPOP emptying a list, SREM removing all set members, etc.
 	// We batch delete to limit the impact per cleanup cycle.
-	tx.Exec(ctx, `
+	_, _ = tx.Exec(ctx, `
 		DELETE FROM kv_meta WHERE key IN (
 			SELECT m.key FROM kv_meta m
 			WHERE m.key_type = 'string' AND NOT EXISTS (SELECT 1 FROM kv_strings s WHERE s.key = m.key)
@@ -287,7 +307,7 @@ func (s *Store) deleteExpiredKeys(ctx context.Context) {
 		)
 	`)
 
-	tx.Commit(ctx)
+	_ = tx.Commit(ctx)
 }
 
 // isRetryableError returns true if the error is a PostgreSQL deadlock (40P01)
@@ -335,7 +355,7 @@ func (s *Store) execTx(ctx context.Context, fn func(tx pgx.Tx) error) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	if err := fn(tx); err != nil {
 		return err

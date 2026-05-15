@@ -7,6 +7,7 @@ require (
 	github.com/prometheus/client_golang v1.23.2
 	github.com/redis/go-redis/v9 v9.19.0
 	github.com/yuin/gopher-lua v1.1.2
+	go.uber.org/goleak v1.3.0
 )
 
 require (

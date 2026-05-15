@@ -13,7 +13,7 @@ import (
 // Reads are always passed through to PostgreSQL — reading from cache inside a
 // transaction would be incorrect for write-then-read patterns within the same EXEC.
 type CachingTx struct {
-	storage.Transaction                                        // all read methods promoted as-is
+	storage.Transaction                                          // all read methods promoted as-is
 	invalidateFn        func(ctx context.Context, keys []string) // called after successful commit
 	dirty               map[string]struct{}
 }
