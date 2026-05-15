@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.28.1] - 2026-05-15
+
+### Fixed
+- **CI lint job restored on Go 1.25** — `golangci-lint` v1.64.8 (the last v1 release, March 2025) is built with Go 1.24 and refuses to run against a Go 1.25 module, so the `lint` job in `.github/workflows/ci.yml` had been failing since the toolchain bump. Migrated `.golangci.yml` to the v2 schema and bumped the action to `golangci/golangci-lint-action@v9.2.0` with `version: v2.12.2`. Dropped revive's `exported` rule (project style does not require a comment on every exported identifier), disabled the new staticcheck `QF` (quickfix) class, and excluded gosec `G118` for long-lived listener goroutines that intentionally outlive any single request.
+- **21 errcheck violations the v1 lint never had a chance to flag in CI** — explicit `_ =` markers on `Close()` calls in cleanup paths in `internal/cache/invalidator.go`, `internal/listnotify/notifier.go`, `internal/pubsub/hub.go`, `internal/server/server.go`, `internal/leader/k8s.go`, `internal/cache/cached_store.go`, and the pgx batch-result `defer` blocks in `internal/storage/querier.go`. Behavior unchanged; the close errors are not actionable in these paths.
+- **Two trivial style fixes** — package comment on `cmd/server/main.go`, reshaped `Type` doc comment in `internal/resp/resp.go` to satisfy ST1021.
+
+### Changed
+- **GitHub Actions bumps (dependabot)** — `actions/checkout` v4 → v6, `actions/setup-go` v5 → v6, `docker/build-push-action` v6 → v7, `azure/setup-helm` v4 → v5. Resolves the Node.js 20 deprecation warning the runner now emits.
+- **Reverted the SHA-pin policy from v0.28.0** for `actions/checkout`, `docker/setup-buildx-action`, and `docker/build-push-action` in `.github/workflows/docker-publish.yml`. Floating tag refs (`@v6`, `@v7`, `@v3`) keep workflow diffs readable; dependabot still tracks the `github-actions` ecosystem weekly so updates land via PR. `aquasecurity/trivy-action` and `golangci/golangci-lint-action` remain SHA-pinned (third-party security-critical actions).
+
 ## [0.28.0] - 2026-05-15
 
 ### Added
