@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.27.0] - 2026-05-15
+
+### Added
+Workstream B from the 1.0 plan — testing-infrastructure pieces that don't add commands but raise confidence in the ones we ship:
+
+- **`golangci-lint` in CI** — new `.golangci.yml` (v1 schema, build-tagged for `postgres,redis`) enabling `errcheck`, `govet`, `staticcheck`, `unused`, `gosimple`, `gosec`, `revive`, and `gofmt`. Exclusions cover the intentional cases: SHA1 (Redis `SCRIPT LOAD` specifies SHA1 digests), `math/rand` (`RANDOMKEY` / `HRANDFIELD` / `SRANDMEMBER` / `ZRANDMEMBER` are deliberately non-cryptographic), and `gosec G115` integer-conversion false positives. Test files relax `errcheck` / `gosec` / `revive` and silence `staticcheck SA1019` for deprecated-but-still-supported go-redis APIs we exercise on purpose (`ZRangeByLex`, `RPopLPush`, etc.) for wire compatibility. New `lint` job in `.github/workflows/ci.yml` runs `golangci-lint v1.64.8` on every push and PR.
+- **`FuzzReader` and `FuzzRoundtrip` for the RESP parser** — new `internal/resp/fuzz_test.go` seeded from the existing test corpus (every shape `TestReader_*` and `TestReader_Errors` cover, including the negative cases). `FuzzReader` reads up to 32 framed values per input so back-to-back parses are also exercised; `FuzzRoundtrip` writes a value and asserts the reader accepts the bytes back. CI runs `FuzzReader` for 30s on every push (`go test -run=^$ -fuzz=FuzzReader -fuzztime=30s ./internal/resp/`).
+- **`goleak.VerifyTestMain` in the integration suite** — new `tests/main_test.go` (postgres-tagged, `package integration`) wraps the whole binary so any leaked goroutine after the last test fails the run. Ignores cover known-benign background loops in `pgxpool` (`backgroundHealthCheck`, `triggerHealthCheck`) and `go-redis` (`internal/pool.(*ConnPool).reaper`) that stay running for the lifetime of the test binary.
+- **Benchmarks for the v0.24+/v0.26 hot-path additions** — seven new entries in `tests/postgres_benchmark_test.go`: `BenchmarkPgHGetAll` and `BenchmarkPgHMGet` for the batched type-check path on hashes, `BenchmarkPgBLPOPMultiKey` and `BenchmarkPgLMPOP` for the single-RTT multi-key list ops, and `BenchmarkPgZRange` / `BenchmarkPgZRangeByScore` / `BenchmarkPgZRangeStore` for the CTE-based ZRANGE family.
+
+### Fixed
+Bugs the new tooling surfaced:
+
+- **RESP DoS via huge declared length** — a single command like `*9223372036854775807\r\n` made `readArray` call `make([]Value, count)` before any element bytes were read, OOM-ing the process. `internal/resp/resp.go` now caps bulk-string length at `MaxBulkLen` (512 MiB, matching Redis's `proto-max-bulk-len` default) and array length at `MaxArrayLen` (1 MiB elements).
+- **`internal/resp` parser panic on negative lengths** — `$-2\r\n` and `*-2\r\n` (and similar) caused a `runtime error: slice bounds out of range [:-2]` panic in `readBulkString` / `readArray` because `make([]T, length+2)` underflowed. The known-issue test (`TestReader_NegativeLengthPanic`) was renamed to `TestReader_NegativeLength` and now asserts a clean error return.
+- **Background `cleanupExpiredKeys` goroutine leaked across `Store.Close()`** — `storage.New` started the cleanup loop watching the caller's context, but `Close()` only closed the pool, so callers passing `context.Background()` (every test, plus the production server until `cancel()` runs) left the goroutine spinning. `Store` now holds its own `context.CancelFunc` + `sync.WaitGroup`; `Close()` cancels and waits before pool teardown. Surfaced by `goleak` on the very first integration run.
+- **Slowloris on the metrics HTTP server** — `ReadHeaderTimeout` was unset on the `http.Server` in `internal/metrics/metrics.go`, so a malicious client could hold the `/metrics`/`/health`/`/ready` connection open with a partial header forever. Now defaults to 10s.
+
+### Changed
+- Removed dead code: `keyspaceChannel` / `keyspaceChannelPrefix` / `maxPgChannelLen` in `internal/storage/querier.go` and `hashToBytes` in `internal/storage/hyperloglog.go` (with their now-unused `crypto/sha256`, `encoding/hex`, `encoding/binary` imports). `unused` flagged them; greps confirmed no callers.
+- Tightened the genuine `errcheck` violations the linter found into explicit `_ =` assignments to mark intent: `Store.deleteExpiredKeys` rollback/commit/exec, `Store.execTx` rollback, `Handler.EXEC` rollback on commit failure, `Handler.l/rpushOp` `listNotifier.NotifyPush`, `CachedStore.invalidate` / `invalidateMulti`, the metrics handler `w.Write` calls, and `metricsSrv.Stop` in `cmd/server/main.go`.
+
+### Note
+All `internal/...` unit tests pass with `-race`; the full postgres-tagged integration suite (~292 tests) passes with `goleak` active; the new benchmarks all run under `-benchtime=2x`. `golangci-lint run --build-tags=postgres,redis ./...` is clean.
+
 ## [0.26.0] - 2026-05-14
 
 ### Added
