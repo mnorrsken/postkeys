@@ -112,7 +112,7 @@ func (s *Server) Close() {
 func (s *Server) Stop() {
 	close(s.quit)
 	if s.listener != nil {
-		s.listener.Close()
+		_ = s.listener.Close()
 	}
 	if s.pubsub != nil {
 		s.pubsub.Stop()
@@ -132,7 +132,7 @@ func (s *Server) Stop() {
 // Existing connections remain active until drained.
 func (s *Server) CloseListener() {
 	if s.listener != nil {
-		s.listener.Close()
+		_ = s.listener.Close()
 	}
 }
 
@@ -181,7 +181,7 @@ func (s *Server) acceptLoop(ctx context.Context) {
 
 func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 	defer s.wg.Done()
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	defer metrics.ActiveConnections.Dec()
 
 	// Track connection for graceful drain

@@ -109,7 +109,7 @@ func (s *CachedStore) invalidateMulti(ctx context.Context, keys []string) {
 func (s *CachedStore) flush(ctx context.Context) {
 	s.cache.Flush()
 	if s.invalidator != nil {
-		s.invalidator.InvalidateFlush(ctx)
+		_ = s.invalidator.InvalidateFlush(ctx)
 	}
 }
 

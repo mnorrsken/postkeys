@@ -65,7 +65,7 @@ func (n *Notifier) Start(ctx context.Context) error {
 	// Start listening on the list push channel
 	_, err = conn.Exec(ctx, fmt.Sprintf("LISTEN %s", listPushChannel))
 	if err != nil {
-		conn.Close(ctx)
+		_ = conn.Close(ctx)
 		return fmt.Errorf("failed to LISTEN: %w", err)
 	}
 
@@ -81,7 +81,7 @@ func (n *Notifier) Stop() {
 	n.wg.Wait()
 
 	if n.listenerConn != nil {
-		n.listenerConn.Close(context.Background())
+		_ = n.listenerConn.Close(context.Background())
 	}
 }
 
@@ -218,7 +218,7 @@ func (n *Notifier) listenLoop() {
 			if !isTimeoutError(err) {
 				log.Printf("List notifier listener error (will reconnect): %v", err)
 				// Drop the connection; the top of the loop will reconnect.
-				n.listenerConn.Close(context.Background())
+				_ = n.listenerConn.Close(context.Background())
 				n.listenerConn = nil
 				continue
 			}
@@ -273,7 +273,7 @@ func (n *Notifier) notifySubscribers(key string) {
 func (n *Notifier) reconnect() bool {
 	// Close old connection if it exists
 	if n.listenerConn != nil {
-		n.listenerConn.Close(context.Background())
+		_ = n.listenerConn.Close(context.Background())
 		n.listenerConn = nil
 	}
 
@@ -289,7 +289,7 @@ func (n *Notifier) reconnect() bool {
 	// Re-subscribe to the channel
 	_, err = conn.Exec(ctx, fmt.Sprintf("LISTEN %s", listPushChannel))
 	if err != nil {
-		conn.Close(ctx)
+		_ = conn.Close(ctx)
 		log.Printf("List notifier LISTEN failed after reconnect: %v", err)
 		return false
 	}

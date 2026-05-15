@@ -23,7 +23,7 @@ const (
 	MaxArrayLen = 1 << 20
 )
 
-// Value types in RESP protocol
+// Type identifies the RESP value kind (SimpleString, Error, Integer, BulkString, Array, etc.).
 type Type byte
 
 const (

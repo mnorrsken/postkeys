@@ -1,3 +1,4 @@
+// Command server runs the postkeys Redis-compatible server backed by PostgreSQL.
 package main
 
 import (

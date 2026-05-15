@@ -65,7 +65,7 @@ func (inv *Invalidator) Start(ctx context.Context) error {
 	// Start listening on the cache invalidation channel
 	_, err = conn.Exec(ctx, fmt.Sprintf("LISTEN %s", cacheInvalidateChannel))
 	if err != nil {
-		conn.Close(ctx)
+		_ = conn.Close(ctx)
 		return fmt.Errorf("failed to LISTEN: %w", err)
 	}
 
@@ -85,7 +85,7 @@ func (inv *Invalidator) Stop() {
 	inv.wg.Wait()
 
 	if inv.listenerConn != nil {
-		inv.listenerConn.Close(context.Background())
+		_ = inv.listenerConn.Close(context.Background())
 	}
 }
 
@@ -195,7 +195,7 @@ func (inv *Invalidator) listenLoop() {
 			if !isTimeoutError(err) {
 				log.Printf("Cache invalidator listener error (will reconnect): %v", err)
 				// Drop the connection; the top of the loop will reconnect.
-				inv.listenerConn.Close(context.Background())
+				_ = inv.listenerConn.Close(context.Background())
 				inv.listenerConn = nil
 			}
 			continue
@@ -213,7 +213,7 @@ func (inv *Invalidator) listenLoop() {
 func (inv *Invalidator) reconnect() bool {
 	// Close old connection if it exists
 	if inv.listenerConn != nil {
-		inv.listenerConn.Close(context.Background())
+		_ = inv.listenerConn.Close(context.Background())
 		inv.listenerConn = nil
 	}
 
@@ -229,7 +229,7 @@ func (inv *Invalidator) reconnect() bool {
 	// Re-subscribe to the channel
 	_, err = conn.Exec(ctx, fmt.Sprintf("LISTEN %s", cacheInvalidateChannel))
 	if err != nil {
-		conn.Close(ctx)
+		_ = conn.Close(ctx)
 		log.Printf("Cache invalidator LISTEN failed after reconnect: %v", err)
 		return false
 	}

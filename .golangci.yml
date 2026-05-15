@@ -1,3 +1,5 @@
+version: "2"
+
 run:
   timeout: 5m
   build-tags:
@@ -5,57 +7,69 @@ run:
     - redis
 
 linters:
-  disable-all: true
+  default: none
   enable:
     - errcheck
     - govet
     - staticcheck
     - unused
-    - gosimple
     - gosec
     - revive
-    - gofmt
-
-linters-settings:
-  revive:
+  settings:
+    revive:
+      rules:
+        - name: var-naming
+        - name: package-comments
+        - name: unused-parameter
+          disabled: true
+        - name: unexported-return
+          disabled: true
+    staticcheck:
+      # QF* is the v2 "quick fix" class — purely stylistic suggestions
+      # (apply De Morgan, tagged switch, etc.) that were not part of v1 and
+      # don't represent correctness issues. Disable to keep the lint signal
+      # focused on real bugs.
+      checks:
+        - "all"
+        - "-QF1001"
+        - "-QF1003"
+        - "-QF1008"
+    gosec:
+      excludes:
+        # G104: Errors unhandled — covered by errcheck.
+        - G104
+        # G115: Integer overflow on conversions — many false positives where
+        # bounded inputs (pool sizes, attempt counts, hash bucket indices) are
+        # converted between numeric types. Re-enable case-by-case if a real
+        # truncation risk surfaces.
+        - G115
+        # G118: Goroutine uses context.Background while a request context is
+        # available — false positive for long-lived listener loops
+        # (cache invalidator, listnotify, pubsub hub) that intentionally
+        # outlive any single request.
+        - G118
+        # G401/G505: SHA1 / weak crypto — required by Redis SCRIPT LOAD which
+        # specifies SHA1 digests as the script identifier.
+        - G401
+        - G505
+        # G404: math/rand — RANDOMKEY / HRANDFIELD / SRANDMEMBER / ZRANDMEMBER
+        # are intentionally non-cryptographic.
+        - G404
+  exclusions:
     rules:
-      - name: var-naming
-      - name: package-comments
-      - name: exported
-        arguments:
-          - disableStutteringCheck
-      - name: unused-parameter
-        disabled: true
-      - name: unexported-return
-        disabled: true
-  gosec:
-    excludes:
-      # G104: Errors unhandled — covered by errcheck.
-      - G104
-      # G115: Integer overflow on conversions — many false positives where
-      # bounded inputs (pool sizes, attempt counts, hash bucket indices) are
-      # converted between numeric types. Re-enable case-by-case if a real
-      # truncation risk surfaces.
-      - G115
-      # G401/G505: SHA1 / weak crypto — required by Redis SCRIPT LOAD which
-      # specifies SHA1 digests as the script identifier.
-      - G401
-      - G505
-      # G404: math/rand — RANDOMKEY / HRANDFIELD / SRANDMEMBER / ZRANDMEMBER
-      # are intentionally non-cryptographic.
-      - G404
+      # Test files use a lot of intentional unchecked errors and weaker patterns,
+      # and exercise deprecated-but-still-supported go-redis APIs on purpose
+      # (e.g. ZRangeByLex, RPopLPush) to confirm wire compatibility.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+          - revive
+      - path: _test\.go
+        text: "SA1019:"
+        linters:
+          - staticcheck
 
-issues:
-  exclude-rules:
-    # Test files use a lot of intentional unchecked errors and weaker patterns,
-    # and exercise deprecated-but-still-supported go-redis APIs on purpose
-    # (e.g. ZRangeByLex, RPopLPush) to confirm wire compatibility.
-    - path: _test\.go
-      linters:
-        - errcheck
-        - gosec
-        - revive
-    - path: _test\.go
-      text: "SA1019:"
-      linters:
-        - staticcheck
+formatters:
+  enable:
+    - gofmt

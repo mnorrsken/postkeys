@@ -81,7 +81,7 @@ func (c *k8sClient) setLeaderLabel(ctx context.Context, leader bool) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	io.Copy(io.Discard, resp.Body) //nolint:errcheck
 
 	if resp.StatusCode >= 300 {
@@ -147,7 +147,7 @@ func (c *k8sClient) doLease(ctx context.Context, method, url string, body []byte
 	if err != nil {
 		return nil, 0, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {

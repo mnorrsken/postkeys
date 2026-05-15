@@ -95,7 +95,7 @@ func (h *Hub) Start(ctx context.Context) error {
 	// every published message so that both SUBSCRIBE and PSUBSCRIBE work.
 	_, err = listenerConn.Exec(ctx, fmt.Sprintf("LISTEN %s", pgxIdentifier(broadcastChannel)))
 	if err != nil {
-		listenerConn.Close(ctx)
+		_ = listenerConn.Close(ctx)
 		return fmt.Errorf("failed to LISTEN on broadcast channel: %w", err)
 	}
 
@@ -112,7 +112,7 @@ func (h *Hub) Stop() {
 	h.wg.Wait()
 
 	if h.listenerConn != nil {
-		h.listenerConn.Close(context.Background())
+		_ = h.listenerConn.Close(context.Background())
 	}
 }
 
@@ -432,7 +432,7 @@ func (h *Hub) listenLoop() {
 			if !isTimeoutError(err) {
 				log.Printf("Pub/sub listener error (will reconnect): %v", err)
 				// Drop the connection; the top of the loop will reconnect.
-				h.listenerConn.Close(context.Background())
+				_ = h.listenerConn.Close(context.Background())
 				h.listenerConn = nil
 				continue
 			}
@@ -495,7 +495,7 @@ func (h *Hub) listenLoop() {
 func (h *Hub) reconnect() bool {
 	// Close old connection if it exists
 	if h.listenerConn != nil {
-		h.listenerConn.Close(context.Background())
+		_ = h.listenerConn.Close(context.Background())
 		h.listenerConn = nil
 	}
 
@@ -513,7 +513,7 @@ func (h *Hub) reconnect() bool {
 	_, err = conn.Exec(ctx, fmt.Sprintf("LISTEN %s", pgxIdentifier(broadcastChannel)))
 	if err != nil {
 		log.Printf("Failed to LISTEN on broadcast channel after reconnect: %v", err)
-		conn.Close(ctx)
+		_ = conn.Close(ctx)
 		h.listenerConn = nil
 		return false
 	}

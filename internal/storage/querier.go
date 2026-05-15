@@ -1235,7 +1235,7 @@ func (o queryOps) hGetAll(ctx context.Context, q Querier, key string) (map[strin
 		key,
 	)
 	br := q.SendBatch(ctx, batch)
-	defer br.Close()
+	defer func() { _ = br.Close() }()
 
 	if err := o.readTypeCheck(br, TypeHash); err != nil {
 		return nil, err
@@ -1884,7 +1884,7 @@ func (o queryOps) lLen(ctx context.Context, q Querier, key string) (int64, error
 		key,
 	)
 	br := q.SendBatch(ctx, batch)
-	defer br.Close()
+	defer func() { _ = br.Close() }()
 
 	if err := o.readTypeCheck(br, TypeList); err != nil {
 		return 0, err
@@ -1905,16 +1905,16 @@ func (o queryOps) lRange(ctx context.Context, q Querier, key string, start, stop
 	br := q.SendBatch(ctx, batch)
 
 	if err := o.readTypeCheck(br, TypeList); err != nil {
-		br.Close()
+		_ = br.Close()
 		return nil, err
 	}
 
 	var total int64
 	if err := br.QueryRow().Scan(&total); err != nil {
-		br.Close()
+		_ = br.Close()
 		return nil, fmt.Errorf("failed to get list count: %w", err)
 	}
-	br.Close()
+	_ = br.Close()
 
 	// Convert negative indices
 	if start < 0 {
@@ -2074,7 +2074,7 @@ func (o queryOps) sMembers(ctx context.Context, q Querier, key string) ([]string
 		key,
 	)
 	br := q.SendBatch(ctx, batch)
-	defer br.Close()
+	defer func() { _ = br.Close() }()
 
 	if err := o.readTypeCheck(br, TypeSet); err != nil {
 		return nil, err
@@ -2118,7 +2118,7 @@ func (o queryOps) sCard(ctx context.Context, q Querier, key string) (int64, erro
 		key,
 	)
 	br := q.SendBatch(ctx, batch)
-	defer br.Close()
+	defer func() { _ = br.Close() }()
 
 	if err := o.readTypeCheck(br, TypeSet); err != nil {
 		return 0, err
