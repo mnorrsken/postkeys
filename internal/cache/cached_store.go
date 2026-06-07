@@ -150,8 +150,8 @@ func (s *CachedStore) Set(ctx context.Context, key, value string, ttl time.Durat
 	return nil
 }
 
-func (s *CachedStore) SetNX(ctx context.Context, key, value string) (bool, error) {
-	ok, err := s.backend.SetNX(ctx, key, value)
+func (s *CachedStore) SetNX(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
+	ok, err := s.backend.SetNX(ctx, key, value, ttl)
 	if err != nil {
 		return false, err
 	}
@@ -211,7 +211,7 @@ func (s *CachedStore) SetRange(ctx context.Context, key string, offset int64, va
 	return result, nil
 }
 
-func (s *CachedStore) BitField(ctx context.Context, key string, ops []storage.BitFieldOp) ([]int64, error) {
+func (s *CachedStore) BitField(ctx context.Context, key string, ops []storage.BitFieldOp) ([]*int64, error) {
 	result, err := s.backend.BitField(ctx, key, ops)
 	if err != nil {
 		return nil, err
@@ -461,8 +461,8 @@ func (s *CachedStore) SCard(ctx context.Context, key string) (int64, error) {
 
 // ============== Sorted Set Commands ==============
 
-func (s *CachedStore) ZAdd(ctx context.Context, key string, members []storage.ZMember) (int64, error) {
-	return s.backend.ZAdd(ctx, key, members)
+func (s *CachedStore) ZAdd(ctx context.Context, key string, members []storage.ZMember, opts storage.ZAddOptions) (int64, error) {
+	return s.backend.ZAdd(ctx, key, members, opts)
 }
 
 func (s *CachedStore) ZRange(ctx context.Context, key string, start, stop int64, withScores bool) ([]storage.ZMember, error) {

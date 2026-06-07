@@ -5,6 +5,7 @@ package integration_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -214,6 +215,58 @@ func TestSetNX(t *testing.T) {
 	val, _ := ts.client.Get(ctx, "nxkey").Result()
 	if val != "nxvalue" {
 		t.Errorf("Expected nxvalue, got %s", val)
+	}
+}
+
+// TestSetNXWithExpiry covers the exclusive-lease pattern used by clients such as
+// GitLab's Gitlab::ExclusiveLease (SET key uuid NX EX ttl). Two things must hold:
+// the NX write must persist the TTL (otherwise the lease never expires and locks
+// the holder out forever), and once the TTL passes the key must be re-acquirable
+// via NX even before the background sweeper removes it (lazy expiry).
+func TestSetNXWithExpiry(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	// SET key val NX EX 100 — acquire a lease with a TTL.
+	ok, err := ts.client.SetArgs(ctx, "lease", "owner-a", redis.SetArgs{Mode: "NX", TTL: 100 * time.Second}).Result()
+	if err != nil {
+		t.Fatalf("SET NX EX failed: %v", err)
+	}
+	if ok != "OK" {
+		t.Fatalf("Expected OK acquiring lease, got %q", ok)
+	}
+
+	// The TTL must actually be set — this is the core regression: previously NX
+	// dropped the expiry and the key persisted forever.
+	ttl, err := ts.client.TTL(ctx, "lease").Result()
+	if err != nil {
+		t.Fatalf("TTL failed: %v", err)
+	}
+	if ttl <= 0 || ttl > 100*time.Second {
+		t.Fatalf("Expected TTL in (0, 100s], got %v", ttl)
+	}
+
+	// While the lease is held, a competing NX acquire must fail.
+	_, err = ts.client.SetArgs(ctx, "lease", "owner-b", redis.SetArgs{Mode: "NX", TTL: 100 * time.Second}).Result()
+	if !errors.Is(err, redis.Nil) {
+		t.Fatalf("Expected redis.Nil acquiring held lease, got val/err: %v", err)
+	}
+
+	// Acquire a short-lived lease, let it expire, and confirm it can be retaken
+	// before the sweeper runs (lazy expiry on the NX path).
+	ok, err = ts.client.SetArgs(ctx, "lease2", "owner-a", redis.SetArgs{Mode: "NX", TTL: 1 * time.Second}).Result()
+	if err != nil || ok != "OK" {
+		t.Fatalf("SET NX EX (short) failed: ok=%q err=%v", ok, err)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	ok, err = ts.client.SetArgs(ctx, "lease2", "owner-b", redis.SetArgs{Mode: "NX", TTL: 1 * time.Second}).Result()
+	if err != nil || ok != "OK" {
+		t.Fatalf("Expected to re-acquire expired lease, got ok=%q err=%v", ok, err)
+	}
+	if v, _ := ts.client.Get(ctx, "lease2").Result(); v != "owner-b" {
+		t.Fatalf("Expected re-acquired lease value owner-b, got %q", v)
 	}
 }
 
@@ -2758,6 +2811,80 @@ func TestZAddUpdateScore(t *testing.T) {
 	}
 }
 
+// TestZAddFlags covers the NX/XX/GT/LT/CH options, which were previously parsed
+// but silently discarded — every ZADD behaved as a plain upsert. Sidekiq and
+// several GitLab rate-limiters rely on GT/NX semantics, so dropping them
+// corrupts scheduling and dedup.
+func TestZAddFlags(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+
+	ctx := context.Background()
+	key := "zflags"
+
+	// Seed a member.
+	if _, err := ts.client.ZAdd(ctx, key, redis.Z{Score: 5, Member: "m"}).Result(); err != nil {
+		t.Fatalf("seed ZADD failed: %v", err)
+	}
+
+	// Plain update of an existing member returns 0 (only *new* members count).
+	added, err := ts.client.ZAdd(ctx, key, redis.Z{Score: 6, Member: "m"}).Result()
+	if err != nil || added != 0 {
+		t.Fatalf("expected 0 added on update, got %d err=%v", added, err)
+	}
+
+	// GT must not lower a score.
+	if _, err := ts.client.ZAddArgs(ctx, key, redis.ZAddArgs{GT: true, Members: []redis.Z{{Score: 1, Member: "m"}}}).Result(); err != nil {
+		t.Fatalf("ZADD GT failed: %v", err)
+	}
+	if s, _ := ts.client.ZScore(ctx, key, "m").Result(); s != 6 {
+		t.Fatalf("GT lowered score: want 6, got %v", s)
+	}
+	// GT raises a score.
+	if _, err := ts.client.ZAddArgs(ctx, key, redis.ZAddArgs{GT: true, Members: []redis.Z{{Score: 9, Member: "m"}}}).Result(); err != nil {
+		t.Fatalf("ZADD GT raise failed: %v", err)
+	}
+	if s, _ := ts.client.ZScore(ctx, key, "m").Result(); s != 9 {
+		t.Fatalf("GT did not raise score: want 9, got %v", s)
+	}
+
+	// LT must not raise a score.
+	if _, err := ts.client.ZAddArgs(ctx, key, redis.ZAddArgs{LT: true, Members: []redis.Z{{Score: 100, Member: "m"}}}).Result(); err != nil {
+		t.Fatalf("ZADD LT failed: %v", err)
+	}
+	if s, _ := ts.client.ZScore(ctx, key, "m").Result(); s != 9 {
+		t.Fatalf("LT raised score: want 9, got %v", s)
+	}
+
+	// NX never updates an existing member, but adds new ones.
+	if _, err := ts.client.ZAddArgs(ctx, key, redis.ZAddArgs{NX: true, Members: []redis.Z{{Score: 1, Member: "m"}, {Score: 2, Member: "new"}}}).Result(); err != nil {
+		t.Fatalf("ZADD NX failed: %v", err)
+	}
+	if s, _ := ts.client.ZScore(ctx, key, "m").Result(); s != 9 {
+		t.Fatalf("NX overwrote existing member: want 9, got %v", s)
+	}
+	if s, _ := ts.client.ZScore(ctx, key, "new").Result(); s != 2 {
+		t.Fatalf("NX did not add new member: want 2, got %v", s)
+	}
+
+	// XX never adds a new member.
+	if _, err := ts.client.ZAddArgs(ctx, key, redis.ZAddArgs{XX: true, Members: []redis.Z{{Score: 7, Member: "absent"}}}).Result(); err != nil {
+		t.Fatalf("ZADD XX failed: %v", err)
+	}
+	if _, err := ts.client.ZScore(ctx, key, "absent").Result(); !errors.Is(err, redis.Nil) {
+		t.Fatalf("XX added a new member; expected it absent, err=%v", err)
+	}
+
+	// CH counts changed members, not just newly added ones.
+	ch, err := ts.client.ZAddArgs(ctx, key, redis.ZAddArgs{Ch: true, Members: []redis.Z{{Score: 50, Member: "m"}, {Score: 3, Member: "fresh"}}}).Result()
+	if err != nil {
+		t.Fatalf("ZADD CH failed: %v", err)
+	}
+	if ch != 2 { // "m" changed + "fresh" added
+		t.Fatalf("CH count: want 2, got %d", ch)
+	}
+}
+
 func TestZRangeNegativeIndices(t *testing.T) {
 	ts := newTestServer(t, "")
 	defer ts.Close()
@@ -5240,6 +5367,61 @@ func TestBitField(t *testing.T) {
 	// SET returns old value (0), GET returns 100, INCRBY returns 101
 	if results[0] != 0 || results[1] != 100 || results[2] != 101 {
 		t.Errorf("Expected [0, 100, 101], got %v", results)
+	}
+}
+
+// TestBitFieldOverflow covers OVERFLOW SAT/FAIL, which were previously parsed
+// then ignored — every op silently wrapped.
+func TestBitFieldOverflow(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	// WRAP (default): u8 255 + 10 wraps to 9.
+	res, err := ts.client.BitField(ctx, "bfw", "SET", "u8", "0", "255", "INCRBY", "u8", "0", "10").Result()
+	if err != nil {
+		t.Fatalf("WRAP BITFIELD failed: %v", err)
+	}
+	if res[1] != 9 {
+		t.Fatalf("WRAP: want 9, got %d", res[1])
+	}
+
+	// SAT: u8 saturates at 255 instead of wrapping.
+	res, err = ts.client.BitField(ctx, "bfs", "SET", "u8", "0", "250", "OVERFLOW", "SAT", "INCRBY", "u8", "0", "100").Result()
+	if err != nil {
+		t.Fatalf("SAT BITFIELD failed: %v", err)
+	}
+	if res[1] != 255 {
+		t.Fatalf("SAT: want 255 (clamped), got %d", res[1])
+	}
+
+	// SAT on a signed type clamps at the lower bound too.
+	res, err = ts.client.BitField(ctx, "bfs2", "SET", "i8", "0", "-120", "OVERFLOW", "SAT", "INCRBY", "i8", "0", "-100").Result()
+	if err != nil {
+		t.Fatalf("SAT signed BITFIELD failed: %v", err)
+	}
+	if res[1] != -128 {
+		t.Fatalf("SAT signed: want -128 (clamped), got %d", res[1])
+	}
+
+	// FAIL: an overflowing op returns a nil element and leaves the value
+	// unchanged. Use Do() so the nil array element is observable.
+	cmd := ts.client.Do(ctx, "BITFIELD", "bff", "SET", "u8", "0", "250", "OVERFLOW", "FAIL", "INCRBY", "u8", "0", "100")
+	if cmd.Err() != nil {
+		t.Fatalf("FAIL BITFIELD failed: %v", cmd.Err())
+	}
+	arr, ok := cmd.Val().([]interface{})
+	if !ok || len(arr) != 2 {
+		t.Fatalf("FAIL: expected 2-element array, got %#v", cmd.Val())
+	}
+	if arr[1] != nil {
+		t.Fatalf("FAIL: expected nil for overflowing op, got %#v", arr[1])
+	}
+	// Value must be unchanged (still 250).
+	got, err := ts.client.BitField(ctx, "bff", "GET", "u8", "0").Result()
+	if err != nil || got[0] != 250 {
+		t.Fatalf("FAIL must not modify value: want 250, got %v err=%v", got, err)
 	}
 }
 

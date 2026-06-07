@@ -400,8 +400,14 @@ func (s *Store) Set(ctx context.Context, key, value string, ttl time.Duration) e
 	})
 }
 
-func (s *Store) SetNX(ctx context.Context, key, value string) (bool, error) {
-	return s.ops.setNX(ctx, s.querier(), key, value)
+func (s *Store) SetNX(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
+	var ok bool
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		ok, err = s.ops.setNX(ctx, s.txQuerier(tx), key, value, ttl)
+		return err
+	})
+	return ok, err
 }
 
 func (s *Store) MGet(ctx context.Context, keys []string) ([]interface{}, error) {
@@ -448,8 +454,8 @@ func (s *Store) SetRange(ctx context.Context, key string, offset int64, value st
 	return result, err
 }
 
-func (s *Store) BitField(ctx context.Context, key string, ops []BitFieldOp) ([]int64, error) {
-	var result []int64
+func (s *Store) BitField(ctx context.Context, key string, ops []BitFieldOp) ([]*int64, error) {
+	var result []*int64
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
 		var err error
 		result, err = s.ops.bitField(ctx, s.txQuerier(tx), key, ops)
@@ -895,11 +901,11 @@ func (s *Store) ZRandMember(ctx context.Context, key string, count int64) ([]ZMe
 
 // ============== Sorted Set Commands ==============
 
-func (s *Store) ZAdd(ctx context.Context, key string, members []ZMember) (int64, error) {
+func (s *Store) ZAdd(ctx context.Context, key string, members []ZMember, opts ZAddOptions) (int64, error) {
 	var result int64
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
 		var err error
-		result, err = s.ops.zAdd(ctx, s.txQuerier(tx), key, members)
+		result, err = s.ops.zAdd(ctx, s.txQuerier(tx), key, members, opts)
 		return err
 	})
 	return result, err

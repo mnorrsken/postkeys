@@ -301,35 +301,36 @@ func (o queryOps) set(ctx context.Context, q Querier, key, value string, ttl tim
 	return err
 }
 
-func (o queryOps) setNX(ctx context.Context, q Querier, key, value string) (bool, error) {
-	key = encodeKey(key)
-	if err := o.lockKey(ctx, q, key); err != nil {
-		return false, err
-	}
-	// Set meta first with DO NOTHING for consistent lock ordering (kv_meta before kv_strings).
-	// If the key already exists, this is a no-op; if the key is new, meta is created first.
-	_, err := q.Exec(ctx,
-		`INSERT INTO kv_meta (key, key_type) VALUES ($1, $2)
-		 ON CONFLICT (key) DO NOTHING`,
-		key, TypeString,
-	)
-	if err != nil {
+func (o queryOps) setNX(ctx context.Context, q Querier, key, value string, ttl time.Duration) (bool, error) {
+	enc := encodeKey(key)
+	// Advisory lock serializes concurrent SETNX on the same key for the duration
+	// of the surrounding transaction, making the check-then-set below atomic.
+	if err := o.lockKey(ctx, q, enc); err != nil {
 		return false, err
 	}
 
-	result, err := q.Exec(ctx,
-		`INSERT INTO kv_strings (key, value) VALUES ($1, $2)
-		 ON CONFLICT (key) DO NOTHING`,
-		key, []byte(value),
-	)
-	if err != nil {
+	// Lazy expiry: a key whose TTL has already passed but has not yet been
+	// removed by the background sweeper must be treated as absent, so an
+	// expiring lock/lease can be re-acquired the instant it expires. kv_meta
+	// tracks every key regardless of value type.
+	var exists bool
+	if err := q.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM kv_meta WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW()))`,
+		enc,
+	).Scan(&exists); err != nil {
 		return false, err
 	}
-
-	if result.RowsAffected() > 0 {
-		return true, nil
+	if exists {
+		return false, nil
 	}
-	return false, nil
+
+	// Key is absent or expired: write the value (clearing any stale data of a
+	// different type) together with its TTL. set() encodes the key and persists
+	// expires_at to both kv_meta and kv_strings.
+	if err := o.set(ctx, q, key, value, ttl); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (o queryOps) mGet(ctx context.Context, q Querier, keys []string) ([]interface{}, error) {
@@ -555,7 +556,7 @@ func (o queryOps) setRange(ctx context.Context, q Querier, key string, offset in
 	return int64(len(existing)), nil
 }
 
-func (o queryOps) bitField(ctx context.Context, q Querier, key string, ops []BitFieldOp) ([]int64, error) {
+func (o queryOps) bitField(ctx context.Context, q Querier, key string, ops []BitFieldOp) ([]*int64, error) {
 	key = encodeKey(key)
 	// Get existing value or create empty
 	var value []byte
@@ -571,8 +572,12 @@ func (o queryOps) bitField(ctx context.Context, q Querier, key string, ops []Bit
 		return nil, err
 	}
 
-	results := make([]int64, 0, len(ops))
+	results := make([]*int64, 0, len(ops))
 	modified := false
+	appendResult := func(v int64) {
+		r := v
+		results = append(results, &r)
+	}
 
 	for _, op := range ops {
 		// Parse encoding (e.g., "u8", "i16", "u32")
@@ -601,43 +606,42 @@ func (o queryOps) bitField(ctx context.Context, q Querier, key string, ops []Bit
 			value = newValue
 		}
 
+		min, max := bitfieldBounds(bitWidth, signed)
+
 		switch op.OpType {
 		case "GET":
-			result := getBitField(value, bitOffset, bitWidth, signed)
-			results = append(results, result)
+			appendResult(getBitField(value, bitOffset, bitWidth, signed))
 
 		case "SET":
 			oldValue := getBitField(value, bitOffset, bitWidth, signed)
-			results = append(results, oldValue)
-			setBitField(value, bitOffset, bitWidth, op.Value)
+			// WRAP stores the low bitWidth bits (setBitField truncates); SAT
+			// clamps; FAIL rejects an out-of-range value.
+			stored, ok := bitfieldResolveOverflow(op.Overflow, op.Value > max, op.Value < min, op.Value, min, max)
+			if !ok {
+				results = append(results, nil) // FAIL: report nil, leave value unchanged
+				continue
+			}
+			appendResult(oldValue)
+			setBitField(value, bitOffset, bitWidth, stored)
 			modified = true
 
 		case "INCRBY":
 			oldValue := getBitField(value, bitOffset, bitWidth, signed)
-			newValue := oldValue + op.Value
-			// Handle overflow based on encoding
-			if signed {
-				// Signed overflow wraps around
-				max := int64(1) << (bitWidth - 1)
-				min := -max
-				for newValue >= max {
-					newValue -= max * 2
-				}
-				for newValue < min {
-					newValue += max * 2
-				}
-			} else {
-				// Unsigned overflow wraps around
-				mask := int64((1 << bitWidth) - 1)
-				newValue = newValue & mask
+			sum := oldValue + op.Value
+			// Detect overflow of the int64 addition itself, so SAT/FAIL still
+			// react correctly when the true result exceeds int64. WRAP is
+			// unaffected: the wrapped value is correct modulo 2^bitWidth.
+			addOverflow := (op.Value > 0 && sum < oldValue) || (op.Value < 0 && sum > oldValue)
+			high := (addOverflow && op.Value > 0) || (!addOverflow && sum > max)
+			low := (addOverflow && op.Value < 0) || (!addOverflow && sum < min)
+			newValue, ok := bitfieldResolveOverflow(op.Overflow, high, low, wrapBitfield(sum, bitWidth, signed), min, max)
+			if !ok {
+				results = append(results, nil) // FAIL
+				continue
 			}
 			setBitField(value, bitOffset, bitWidth, newValue)
-			results = append(results, newValue)
+			appendResult(newValue)
 			modified = true
-
-		case "OVERFLOW":
-			// OVERFLOW just sets mode for subsequent ops, we ignore it for now (default WRAP)
-			continue
 		}
 	}
 
@@ -665,6 +669,62 @@ func (o queryOps) bitField(ctx context.Context, q Querier, key string, ops []Bit
 	}
 
 	return results, nil
+}
+
+// bitfieldBounds returns the min and max representable values for a BITFIELD
+// encoding. For the full-width signed case (i64) this is the entire int64 range.
+func bitfieldBounds(bitWidth int64, signed bool) (min, max int64) {
+	if signed {
+		max = (int64(1) << (bitWidth - 1)) - 1
+		min = -(int64(1) << (bitWidth - 1))
+	} else {
+		max = (int64(1) << bitWidth) - 1
+		min = 0
+	}
+	return min, max
+}
+
+// wrapBitfield reduces v into the range of a BITFIELD encoding (the WRAP mode),
+// matching Redis' two's-complement wrap-around for signed encodings and a bit
+// mask for unsigned ones.
+func wrapBitfield(v, bitWidth int64, signed bool) int64 {
+	if bitWidth >= 64 {
+		return v // full int64 range; wrapping is the identity
+	}
+	if signed {
+		max := int64(1) << (bitWidth - 1)
+		min := -max
+		for v >= max {
+			v -= max * 2
+		}
+		for v < min {
+			v += max * 2
+		}
+		return v
+	}
+	mask := int64((1 << bitWidth) - 1)
+	return v & mask
+}
+
+// bitfieldResolveOverflow applies the active OVERFLOW mode to a SET/INCRBY whose
+// desired value is out of range when high or low is set. wrapped is the value to
+// use in WRAP mode (and whenever the value is already in range). ok=false means
+// FAIL mode rejected the op, so the caller must store nothing and reply nil.
+func bitfieldResolveOverflow(mode string, high, low bool, wrapped, min, max int64) (int64, bool) {
+	if !high && !low {
+		return wrapped, true
+	}
+	switch mode {
+	case "SAT":
+		if high {
+			return max, true
+		}
+		return min, true
+	case "FAIL":
+		return 0, false
+	default: // WRAP
+		return wrapped, true
+	}
 }
 
 // getBitField extracts a bit field value from a byte slice
@@ -2131,7 +2191,7 @@ func (o queryOps) sCard(ctx context.Context, q Querier, key string) (int64, erro
 
 // ============== Sorted Set Commands ==============
 
-func (o queryOps) zAdd(ctx context.Context, q Querier, key string, members []ZMember) (int64, error) {
+func (o queryOps) zAdd(ctx context.Context, q Querier, key string, members []ZMember, opts ZAddOptions) (int64, error) {
 	key = encodeKey(key)
 	keyType, err := o.getKeyType(ctx, q, key)
 	if err != nil {
@@ -2141,24 +2201,75 @@ func (o queryOps) zAdd(ctx context.Context, q Querier, key string, members []ZMe
 		return 0, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
 
-	// Set meta before data table for consistent lock ordering (kv_meta before kv_zsets).
+	// XX on a non-existent key adds nothing and must not create the key.
+	if keyType == TypeNone && opts.XX {
+		return 0, nil
+	}
+
+	// setMeta takes the key advisory lock, serializing the per-member
+	// read-modify-write below for the duration of the transaction (so the
+	// existence check and conditional write are atomic against other writers).
+	// Set meta before the data table for consistent lock ordering. When the key
+	// is new this is only reached without XX, where at least one member is always
+	// added, so no phantom empty key is created.
 	if err := o.setMeta(ctx, q, key, TypeZSet, nil); err != nil {
 		return 0, err
 	}
 
-	var added int64
+	var added, changed int64
 	for _, m := range members {
-		result, err := q.Exec(ctx,
-			`INSERT INTO kv_zsets (key, member, score) VALUES ($1, $2, $3)
-			 ON CONFLICT (key, member) DO UPDATE SET score = $3`,
-			key, []byte(m.Member), m.Score,
-		)
-		if err != nil {
+		var oldScore float64
+		exists := true
+		err := q.QueryRow(ctx,
+			`SELECT score FROM kv_zsets WHERE key = $1 AND member = $2`,
+			key, []byte(m.Member),
+		).Scan(&oldScore)
+		if err == pgx.ErrNoRows {
+			exists = false
+		} else if err != nil {
 			return 0, err
 		}
-		added += result.RowsAffected()
+
+		if exists {
+			// NX never updates existing members. GT/LT gate the update by the
+			// direction of the score change.
+			if opts.NX {
+				continue
+			}
+			if opts.GT && m.Score <= oldScore {
+				continue
+			}
+			if opts.LT && m.Score >= oldScore {
+				continue
+			}
+			if m.Score == oldScore {
+				continue // no change, not counted by CH
+			}
+			if _, err := q.Exec(ctx,
+				`UPDATE kv_zsets SET score = $3 WHERE key = $1 AND member = $2`,
+				key, []byte(m.Member), m.Score,
+			); err != nil {
+				return 0, err
+			}
+			changed++
+		} else {
+			// XX never adds new members; GT/LT do not block adds of new members.
+			if opts.XX {
+				continue
+			}
+			if _, err := q.Exec(ctx,
+				`INSERT INTO kv_zsets (key, member, score) VALUES ($1, $2, $3)`,
+				key, []byte(m.Member), m.Score,
+			); err != nil {
+				return 0, err
+			}
+			added++
+		}
 	}
 
+	if opts.CH {
+		return added + changed, nil
+	}
 	return added, nil
 }
 
@@ -3715,7 +3826,7 @@ func (o queryOps) zUnionStore(ctx context.Context, q Querier, destination string
 		members = append(members, ZMember{Member: member, Score: finalScore})
 	}
 
-	return o.zAdd(ctx, q, destination, members)
+	return o.zAdd(ctx, q, destination, members, ZAddOptions{})
 }
 
 func (o queryOps) zInterStore(ctx context.Context, q Querier, destination string, keys []string, weights []float64, aggregate string) (int64, error) {
@@ -3801,7 +3912,7 @@ func (o queryOps) zInterStore(ctx context.Context, q Querier, destination string
 		members = append(members, ZMember{Member: member, Score: finalScore})
 	}
 
-	return o.zAdd(ctx, q, destination, members)
+	return o.zAdd(ctx, q, destination, members, ZAddOptions{})
 }
 
 // ============== Key Extensions ==============

@@ -23,12 +23,24 @@ type ZMember struct {
 	Score  float64
 }
 
+// ZAddOptions holds the optional ZADD flags. NX/XX gate whether existing or new
+// members may be touched; GT/LT gate score updates by direction; CH makes the
+// reply count changed members in addition to newly added ones.
+type ZAddOptions struct {
+	NX bool
+	XX bool
+	GT bool
+	LT bool
+	CH bool
+}
+
 // BitFieldOp represents a BITFIELD operation (GET, SET, INCRBY)
 type BitFieldOp struct {
 	OpType   string // "GET", "SET", "INCRBY"
 	Encoding string // e.g., "u8", "i16", "u32"
 	Offset   int64  // bit offset (can use # prefix for type-width multiplier)
 	Value    int64  // for SET and INCRBY
+	Overflow string // overflow mode for SET/INCRBY: "WRAP" (default), "SAT", "FAIL"
 }
 
 // ZRangeStoreBy selects between rank-based, score-based, and lex-based range
@@ -91,7 +103,7 @@ type Operations interface {
 	// String commands
 	Get(ctx context.Context, key string) (string, bool, error)
 	Set(ctx context.Context, key, value string, ttl time.Duration) error
-	SetNX(ctx context.Context, key, value string) (bool, error)
+	SetNX(ctx context.Context, key, value string, ttl time.Duration) (bool, error)
 	MGet(ctx context.Context, keys []string) ([]interface{}, error)
 	MSet(ctx context.Context, pairs map[string]string) error
 	Incr(ctx context.Context, key string, delta int64) (int64, error)
@@ -103,7 +115,9 @@ type Operations interface {
 	GetEx(ctx context.Context, key string, ttl time.Duration, persist bool) (string, bool, error)
 	GetDel(ctx context.Context, key string) (string, bool, error)
 	GetSet(ctx context.Context, key, value string) (string, bool, error)
-	BitField(ctx context.Context, key string, ops []BitFieldOp) ([]int64, error)
+	// BitField returns one result per non-OVERFLOW op. A nil entry means the op
+	// overflowed under FAIL mode (the client receives a nil reply for it).
+	BitField(ctx context.Context, key string, ops []BitFieldOp) ([]*int64, error)
 
 	// Key commands
 	Del(ctx context.Context, keys []string) (int64, error)
@@ -192,7 +206,7 @@ type Operations interface {
 	SRandMember(ctx context.Context, key string, count int64) ([]string, error)
 
 	// Sorted set commands
-	ZAdd(ctx context.Context, key string, members []ZMember) (int64, error)
+	ZAdd(ctx context.Context, key string, members []ZMember, opts ZAddOptions) (int64, error)
 	ZRange(ctx context.Context, key string, start, stop int64, withScores bool) ([]ZMember, error)
 	ZRangeByScore(ctx context.Context, key string, min, max float64, withScores bool, offset, count int64) ([]ZMember, error)
 	ZRevRange(ctx context.Context, key string, start, stop int64, withScores bool) ([]ZMember, error)

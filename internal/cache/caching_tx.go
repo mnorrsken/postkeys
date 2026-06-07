@@ -70,8 +70,8 @@ func (t *CachingTx) Set(ctx context.Context, key, value string, ttl time.Duratio
 	return err
 }
 
-func (t *CachingTx) SetNX(ctx context.Context, key, value string) (bool, error) {
-	ok, err := t.Transaction.SetNX(ctx, key, value)
+func (t *CachingTx) SetNX(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
+	ok, err := t.Transaction.SetNX(ctx, key, value, ttl)
 	if err == nil && ok {
 		t.mark(key)
 	}
@@ -120,7 +120,7 @@ func (t *CachingTx) SetRange(ctx context.Context, key string, offset int64, valu
 	return v, err
 }
 
-func (t *CachingTx) BitField(ctx context.Context, key string, ops []storage.BitFieldOp) ([]int64, error) {
+func (t *CachingTx) BitField(ctx context.Context, key string, ops []storage.BitFieldOp) ([]*int64, error) {
 	v, err := t.Transaction.BitField(ctx, key, ops)
 	if err == nil && bitFieldHasWrites(ops) {
 		t.mark(key)

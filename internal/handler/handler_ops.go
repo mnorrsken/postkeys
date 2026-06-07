@@ -69,103 +69,117 @@ func (h *Handler) setOp(ctx context.Context, ops storage.Operations, args []resp
 
 	key := args[0].Bulk
 	value := args[1].Bulk
-	var ttl time.Duration
 
-	// Parse options (EX, PX, NX, XX, etc.)
+	var ttl time.Duration
+	var nx, xx, keepTTL, get bool
+
+	// Parse all options first so flag order does not matter. Redis treats SET
+	// options as unordered, so e.g. "NX EX 10" and "EX 10 NX" are equivalent.
 	for i := 2; i < len(args); i++ {
 		opt := strings.ToUpper(args[i].Bulk)
 		switch opt {
-		case "EX":
+		case "EX", "PX", "EXAT", "PXAT":
 			if i+1 >= len(args) {
 				return resp.Err("syntax error")
 			}
 			i++
-			secs, err := strconv.ParseInt(args[i].Bulk, 10, 64)
+			n, err := strconv.ParseInt(args[i].Bulk, 10, 64)
 			if err != nil {
 				return resp.Err("value is not an integer")
 			}
-			ttl = time.Duration(secs) * time.Second
-		case "PX":
-			if i+1 >= len(args) {
-				return resp.Err("syntax error")
+			switch opt {
+			case "EX":
+				ttl = time.Duration(n) * time.Second
+			case "PX":
+				ttl = time.Duration(n) * time.Millisecond
+			case "EXAT":
+				ttl = time.Until(time.Unix(n, 0))
+			case "PXAT":
+				ttl = time.Until(time.UnixMilli(n))
 			}
-			i++
-			ms, err := strconv.ParseInt(args[i].Bulk, 10, 64)
-			if err != nil {
-				return resp.Err("value is not an integer")
-			}
-			ttl = time.Duration(ms) * time.Millisecond
-		case "EXAT":
-			if i+1 >= len(args) {
-				return resp.Err("syntax error")
-			}
-			i++
-			ts, err := strconv.ParseInt(args[i].Bulk, 10, 64)
-			if err != nil {
-				return resp.Err("value is not an integer")
-			}
-			ttl = time.Until(time.Unix(ts, 0))
-		case "PXAT":
-			if i+1 >= len(args) {
-				return resp.Err("syntax error")
-			}
-			i++
-			ts, err := strconv.ParseInt(args[i].Bulk, 10, 64)
-			if err != nil {
-				return resp.Err("value is not an integer")
-			}
-			ttl = time.Until(time.UnixMilli(ts))
 		case "NX":
-			// Set only if not exists
-			ok, err := ops.SetNX(ctx, key, value)
-			if err != nil {
-				return resp.Err(err.Error())
-			}
-			if !ok {
-				return resp.NullBulk()
-			}
-			return resp.OK()
+			nx = true
 		case "XX":
-			// Set only if exists
-			_, found, err := ops.Get(ctx, key)
-			if err != nil {
-				return resp.Err(err.Error())
-			}
-			if !found {
-				return resp.NullBulk()
-			}
+			xx = true
 		case "KEEPTTL":
-			// Keep existing TTL
-			currentTTL, err := ops.TTL(ctx, key)
-			if err != nil {
-				return resp.Err(err.Error())
-			}
-			if currentTTL > 0 {
-				ttl = time.Duration(currentTTL) * time.Second
-			}
+			keepTTL = true
 		case "GET":
-			// Return old value
-			oldValue, found, err := ops.Get(ctx, key)
-			if err != nil {
-				return resp.Err(err.Error())
-			}
-			if err := ops.Set(ctx, key, value, ttl); err != nil {
-				return resp.Err(err.Error())
-			}
-			if !found {
-				return resp.NullBulk()
-			}
-			return resp.Bulk(oldValue)
+			get = true
 		case "IFEQ", "IFGT":
 			// Not implemented, ignore
 			continue
 		}
 	}
 
-	if err := ops.Set(ctx, key, value, ttl); err != nil {
-		return resp.Err(err.Error())
+	// KEEPTTL preserves the existing TTL only when no explicit expiry was given.
+	if keepTTL && ttl == 0 {
+		currentTTL, err := ops.TTL(ctx, key)
+		if err != nil {
+			return resp.Err(err.Error())
+		}
+		if currentTTL > 0 {
+			ttl = time.Duration(currentTTL) * time.Second
+		}
 	}
-	return resp.OK()
+
+	// Capture the old value up front when GET was requested.
+	var oldValue string
+	var hadOld bool
+	if get {
+		var err error
+		oldValue, hadOld, err = ops.Get(ctx, key)
+		if err != nil {
+			return resp.Err(err.Error())
+		}
+	}
+	reply := func() resp.Value {
+		if get {
+			if hadOld {
+				return resp.Bulk(oldValue)
+			}
+			return resp.NullBulk()
+		}
+		return resp.OK()
+	}
+
+	switch {
+	case nx:
+		ok, err := ops.SetNX(ctx, key, value, ttl)
+		if err != nil {
+			return resp.Err(err.Error())
+		}
+		if !ok {
+			// Condition failed: report the old value with GET, else nil.
+			if get {
+				return reply()
+			}
+			return resp.NullBulk()
+		}
+	case xx:
+		exists := hadOld
+		if !get {
+			_, found, err := ops.Get(ctx, key)
+			if err != nil {
+				return resp.Err(err.Error())
+			}
+			exists = found
+		}
+		if !exists {
+			if get {
+				return reply()
+			}
+			return resp.NullBulk()
+		}
+		if err := ops.Set(ctx, key, value, ttl); err != nil {
+			return resp.Err(err.Error())
+		}
+	default:
+		if err := ops.Set(ctx, key, value, ttl); err != nil {
+			return resp.Err(err.Error())
+		}
+	}
+
+	return reply()
 }
 
 func (h *Handler) setnxOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {
@@ -173,7 +187,7 @@ func (h *Handler) setnxOp(ctx context.Context, ops storage.Operations, args []re
 		return resp.ErrWrongArgs("setnx")
 	}
 
-	set, err := ops.SetNX(ctx, args[0].Bulk, args[1].Bulk)
+	set, err := ops.SetNX(ctx, args[0].Bulk, args[1].Bulk, 0)
 	if err != nil {
 		return resp.Err(err.Error())
 	}
@@ -363,6 +377,9 @@ func (h *Handler) bitfieldOp(ctx context.Context, ops storage.Operations, args [
 	key := args[0].Bulk
 	var bitfieldOps []storage.BitFieldOp
 
+	// OVERFLOW applies to every SET/INCRBY that follows it, until changed again.
+	overflow := "WRAP"
+
 	i := 1
 	for i < len(args) {
 		opType := strings.ToUpper(args[i].Bulk)
@@ -403,6 +420,7 @@ func (h *Handler) bitfieldOp(ctx context.Context, ops storage.Operations, args [
 				Encoding: encoding,
 				Offset:   offset,
 				Value:    value,
+				Overflow: overflow,
 			})
 			i += 3
 
@@ -424,14 +442,22 @@ func (h *Handler) bitfieldOp(ctx context.Context, ops storage.Operations, args [
 				Encoding: encoding,
 				Offset:   offset,
 				Value:    increment,
+				Overflow: overflow,
 			})
 			i += 3
 
 		case "OVERFLOW":
-			// Skip overflow mode for now (default WRAP)
-			if i < len(args) {
-				i++ // skip the mode (WRAP, SAT, FAIL)
+			if i >= len(args) {
+				return resp.Err("ERR syntax error")
 			}
+			mode := strings.ToUpper(args[i].Bulk)
+			switch mode {
+			case "WRAP", "SAT", "FAIL":
+				overflow = mode
+			default:
+				return resp.Err("ERR Invalid OVERFLOW type specified")
+			}
+			i++
 
 		default:
 			return resp.Err("ERR syntax error")
@@ -443,10 +469,14 @@ func (h *Handler) bitfieldOp(ctx context.Context, ops storage.Operations, args [
 		return resp.Err(err.Error())
 	}
 
-	// Return array of results
+	// Return array of results; a nil entry is an op that overflowed under FAIL.
 	values := make([]resp.Value, len(results))
 	for i, r := range results {
-		values[i] = resp.Int(r)
+		if r == nil {
+			values[i] = resp.NullBulk()
+		} else {
+			values[i] = resp.Int(*r)
+		}
 	}
 	return resp.Value{Type: resp.Array, Array: values}
 }
@@ -2124,15 +2154,7 @@ parseMembers:
 		i += 2
 	}
 
-	// For now, we ignore NX/XX/GT/LT/CH flags and do basic ZADD
-	// TODO: implement full flag support in storage layer
-	_ = nx
-	_ = xx
-	_ = gt
-	_ = lt
-	_ = ch
-
-	added, err := ops.ZAdd(ctx, key, members)
+	added, err := ops.ZAdd(ctx, key, members, storage.ZAddOptions{NX: nx, XX: xx, GT: gt, LT: lt, CH: ch})
 	if err != nil {
 		if strings.Contains(err.Error(), "WRONGTYPE") {
 			return resp.ErrWrongType()

@@ -53,8 +53,8 @@ func (t *TxStore) Set(ctx context.Context, key, value string, ttl time.Duration)
 	return t.ops.set(ctx, t.querier(), key, value, ttl)
 }
 
-func (t *TxStore) SetNX(ctx context.Context, key, value string) (bool, error) {
-	return t.ops.setNX(ctx, t.querier(), key, value)
+func (t *TxStore) SetNX(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
+	return t.ops.setNX(ctx, t.querier(), key, value, ttl)
 }
 
 func (t *TxStore) MGet(ctx context.Context, keys []string) ([]interface{}, error) {
@@ -81,7 +81,7 @@ func (t *TxStore) SetRange(ctx context.Context, key string, offset int64, value 
 	return t.ops.setRange(ctx, t.querier(), key, offset, value)
 }
 
-func (t *TxStore) BitField(ctx context.Context, key string, ops []BitFieldOp) ([]int64, error) {
+func (t *TxStore) BitField(ctx context.Context, key string, ops []BitFieldOp) ([]*int64, error) {
 	return t.ops.bitField(ctx, t.querier(), key, ops)
 }
 
@@ -373,8 +373,8 @@ func (t *TxStore) SDiffStore(ctx context.Context, destination string, keys []str
 
 // ============== Sorted Set Commands ==============
 
-func (t *TxStore) ZAdd(ctx context.Context, key string, members []ZMember) (int64, error) {
-	return t.ops.zAdd(ctx, t.querier(), key, members)
+func (t *TxStore) ZAdd(ctx context.Context, key string, members []ZMember, opts ZAddOptions) (int64, error) {
+	return t.ops.zAdd(ctx, t.querier(), key, members, opts)
 }
 
 func (t *TxStore) ZRange(ctx context.Context, key string, start, stop int64, withScores bool) ([]ZMember, error) {
