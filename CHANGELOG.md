@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.28.2] - 2026-06-07
+
+### Fixed
+- **`SET … NX EX` silently dropped the TTL** — when `NX` was combined with an expiry, the `NX` branch wrote the value with no TTL and returned early, discarding the parsed `EX`/`PX`. Keys set this way never expired. This broke clients that implement locks/leases via `SET key val NX EX ttl` — notably GitLab's `Gitlab::ExclusiveLease`, whose lease keys would persist forever and lock the holder out with "Cannot obtain an exclusive lease. There must be another instance already in execution." `SetNX` now persists the TTL, treats expired-but-unswept keys as absent (lazy expiry, matching real Redis), and runs atomically under the key advisory lock. `SET` option parsing is now order-independent. **Operators upgrading should clear any lease keys already written without a TTL** (e.g. `DEL gitlab:exclusive_lease:<worker>`, or delete `gitlab:exclusive_lease:%` rows where `expires_at IS NULL`).
+- **`ZADD` ignored its `NX`/`XX`/`GT`/`LT`/`CH` flags** — the flags were parsed and validated, then silently discarded, so every `ZADD` behaved as a plain upsert. This corrupted score-conditional updates (e.g. Sidekiq schedules and rate-limiters using `GT`) and member dedup (`NX`). Flags are now enforced in the storage layer via a per-member conditional write under the key advisory lock. Plain `ZADD` now returns the correct count of *newly added* members (it previously counted updates as additions), and `CH` returns added + changed.
+- **`BITFIELD OVERFLOW SAT|FAIL` was ignored** — the overflow mode was parsed then dropped, so every `SET`/`INCRBY` wrapped. `SAT` now clamps to the encoding's bounds and `FAIL` returns a nil reply and leaves the value unchanged, applied to all subsequent operations as Redis specifies. Also fixes a latent infinite loop in the signed `i64` wrap path.
+
 ## [0.28.1] - 2026-05-15
 
 ### Fixed
