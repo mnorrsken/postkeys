@@ -4822,9 +4822,10 @@ func TestExpireAt(t *testing.T) {
 	// Set a key
 	ts.client.Set(ctx, "mykey", "myvalue", 0)
 
-	// Set expiration at specific time (1 second from now)
-	expireTime := time.Now().Add(1 * time.Second)
-	result, err := ts.client.ExpireAt(ctx, "mykey", expireTime).Result()
+	// Set expiration well in the future; the key must still exist. Using a
+	// generous window avoids racing the expiry against scheduling delays on
+	// loaded CI runners (a tight 1s window flaked under `go test -race`).
+	result, err := ts.client.ExpireAt(ctx, "mykey", time.Now().Add(1*time.Hour)).Result()
 	if err != nil {
 		t.Fatalf("EXPIREAT failed: %v", err)
 	}
@@ -4838,8 +4839,15 @@ func TestExpireAt(t *testing.T) {
 		t.Error("Expected key to exist")
 	}
 
-	// Wait for expiration
-	time.Sleep(1100 * time.Millisecond)
+	// Set expiration in the past; the key must be treated as expired
+	// immediately (lazy expiry), deterministically and without sleeping.
+	result, err = ts.client.ExpireAt(ctx, "mykey", time.Now().Add(-1*time.Hour)).Result()
+	if err != nil {
+		t.Fatalf("EXPIREAT (past) failed: %v", err)
+	}
+	if !result {
+		t.Error("Expected true")
+	}
 
 	// Key should be expired
 	exists, _ = ts.client.Exists(ctx, "mykey").Result()
@@ -4857,9 +4865,9 @@ func TestPExpireAt(t *testing.T) {
 	// Set a key
 	ts.client.Set(ctx, "mykey", "myvalue", 0)
 
-	// Set expiration at specific time (500ms from now)
-	expireTime := time.Now().Add(500 * time.Millisecond)
-	result, err := ts.client.PExpireAt(ctx, "mykey", expireTime).Result()
+	// Set expiration well in the future; the key must still exist. A tight
+	// sub-second window raced the expiry on loaded CI runners under -race.
+	result, err := ts.client.PExpireAt(ctx, "mykey", time.Now().Add(1*time.Hour)).Result()
 	if err != nil {
 		t.Fatalf("PEXPIREAT failed: %v", err)
 	}
@@ -4873,8 +4881,15 @@ func TestPExpireAt(t *testing.T) {
 		t.Error("Expected key to exist")
 	}
 
-	// Wait for expiration
-	time.Sleep(600 * time.Millisecond)
+	// Set expiration in the past; the key must be treated as expired
+	// immediately (lazy expiry), deterministically and without sleeping.
+	result, err = ts.client.PExpireAt(ctx, "mykey", time.Now().Add(-1*time.Hour)).Result()
+	if err != nil {
+		t.Fatalf("PEXPIREAT (past) failed: %v", err)
+	}
+	if !result {
+		t.Error("Expected true")
+	}
 
 	// Key should be expired
 	exists, _ = ts.client.Exists(ctx, "mykey").Result()

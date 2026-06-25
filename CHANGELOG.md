@@ -7,6 +7,9 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - **Dependency bumps (dependabot)** — Go modules: `github.com/jackc/pgx/v5` 5.9.2 → 5.10.0, `github.com/redis/go-redis/v9` 9.19.0 → 9.21.0. GitHub Actions: `docker/metadata-action` v5 → v6, `docker/login-action` v3 → v4, `docker/setup-buildx-action` v3 → v4, `docker/setup-qemu-action` v3 → v4, `golangci/golangci-lint-action` v9.2.0 → v9.2.1.
 
+### Fixed
+- **Flaky `TestExpireAt`/`TestPExpireAt`** — both tests set a sub-second expiry, then asserted the key still existed before sleeping past it. Under `go test -race` on a loaded CI runner, the expiry could elapse before the existence check, intermittently failing with "Expected key to exist". Rewritten to assert existence against a far-future expiry (no race) and verify expiry via a past timestamp (lazy expiry), making them deterministic and removing the sleeps.
+
 ## [0.28.2] - 2026-06-07
 
 ### Fixed
