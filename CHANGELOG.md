@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.28.3] - 2026-06-26
+
+### Changed
+- **Dependency bumps (dependabot)** — Go modules: `github.com/jackc/pgx/v5` 5.9.2 → 5.10.0, `github.com/redis/go-redis/v9` 9.19.0 → 9.21.0. GitHub Actions: `docker/metadata-action` v5 → v6, `docker/login-action` v3 → v4, `docker/setup-buildx-action` v3 → v4, `docker/setup-qemu-action` v3 → v4, `golangci/golangci-lint-action` v9.2.0 → v9.2.1.
+
 ## [0.28.2] - 2026-06-07
 
 ### Fixed
