@@ -1,65 +1,46 @@
-# pg-kv-backend Release Process
+# postkeys
 
-## Version scheme
-`vMAJOR.MINOR.PATCH` — bump **minor** for new features, **patch** for bug fixes/small changes.
+Redis 7 API-compatible server (RESP2/RESP3, pub/sub with RESP3 push, Lua
+EVAL/EVALSHA, MULTI/EXEC) that stores everything in PostgreSQL. Go. Ships as a
+multi-arch Docker image and a Helm chart on GHCR.
 
-## Step-by-step
+## Commands
 
-### 1. Commit the feature/fix changes first
-```bash
-git add <files>
-git commit -m "Short description of change"
-```
+- `make build`, `make test` (starts the test Postgres from
+  `docker-compose.test.yml` via `make test-up`, runs `./tests/...` with
+  `-tags=postgres` and `./internal/...`), `make test-down`
+- `make bench`, `make bench-redis`, `make bench-compare` for performance work
+- `make docker-build`, `make docker-up` / `make docker-down` for a local stack
+- `make deploy` / `make undeploy` push the Helm chart to the current kube
+  context. Ask before running them.
 
-### 2. Check current version
-```bash
-git tag --sort=-v:refname | head -5
-```
-Latest tag = current version. Determine next version based on change type.
+## Verify before done
 
-### 3. Update CHANGELOG.md
-Add a new section **at the top** (below the intro line), before the previous latest version:
-```markdown
-## [X.Y.Z] - YYYY-MM-DD
+`make test` green. For a new or changed Redis command: add it to the handler,
+the README supported/unsupported lists, and an integration test in `tests/`
+that exercises it through a real Redis client.
 
-### Added
-- **Feature name** — description of what was added.
+## Layout and conventions
 
-### Changed
-- **Thing** — description of what changed.
+- `internal/handler`: command dispatch (`handler.go`, `handler_ops.go`,
+  `handler_pubsub.go`, `lua.go`). `internal/storage`: the Postgres layer
+  (`interface.go`, `querier.go`, `transaction.go`). Handlers never write SQL;
+  they go through the storage interface.
+- `internal/resp` parses and writes the protocol; `internal/pubsub`,
+  `internal/listnotify`, `internal/leader`, `internal/cache`, `internal/metrics`
+  are the supporting subsystems.
+- Match Redis error strings exactly (`ERR ...`, `WRONGTYPE ...`); clients
+  depend on them.
+- Unsupported commands stay listed in README. Never return OK for something
+  that is not implemented.
 
-### Fixed
-- **Bug** — description of the fix.
-```
-Only include the headings that apply.
+## Release notes (what differs from the wiki "GitHub Release Process" skill)
 
-### 4. Update README.md if necessary
-Only update if the change affects documented behaviour, commands, or configuration.
-
-### 5. Commit changelog (and readme if changed)
-```bash
-git add CHANGELOG.md README.md
-git commit -m "Add <feature> (vX.Y.Z)"
-```
-
-### 6. Tag and push
-```bash
-git tag vX.Y.Z
-git push origin main
-git push origin vX.Y.Z
-```
-
-## What happens automatically on tag push
-
-GitHub Actions (`.github/workflows/docker-publish.yml`) triggers on `v*` tags and runs:
-
-1. **Tests** — unit tests + PostgreSQL integration tests (must pass before anything is published)
-2. **build-and-push** — builds multi-platform Docker image (amd64/arm64) and pushes to GHCR with semver tags (`X.Y.Z`, `X.Y`, `X`, `latest`)
-3. **helm** — extracts version from tag, sets it in `Chart.yaml` automatically, lints, packages, and pushes the Helm chart to GHCR OCI registry
-4. **release** — creates a GitHub release with install instructions
-
-## Notes
-- Do **not** manually bump `Chart.yaml` — the CI sets `version` and `appVersion` from the git tag
-- No version string in Go source — version is tracked only via git tags
-- Commit message convention: `Add <feature> (vX.Y.Z)` or `Fix <thing> (vX.Y.Z)`
-- Tests also run on every push to `main` and on pull requests (but no publishing occurs without a tag)
+- Changelog heading: `## [X.Y.Z] - YYYY-MM-DD`.
+- Release commit: `Add <feature> (vX.Y.Z)` or `Fix <thing> (vX.Y.Z)`, changelog
+  and readme in that commit.
+- `ci.yml` runs on push/PR. `docker-publish.yml` on `v*` tags runs the tests,
+  builds the amd64/arm64 image with semver tags, sets `Chart.yaml`
+  `version`/`appVersion` from the tag (never bump them by hand), pushes the
+  chart to the GHCR OCI registry and creates the GitHub release.
+- No version string in Go source; git tags only.
