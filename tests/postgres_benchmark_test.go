@@ -522,3 +522,77 @@ func BenchmarkPgZRangeStore(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkPgEval(b *testing.B) {
+	ts := newPgTestServer(b)
+	defer ts.Close()
+
+	ctx := context.Background()
+	script := redis.NewScript(`
+		local v = redis.call("incr", KEYS[1])
+		if v == 1 then redis.call("expire", KEYS[1], 60) end
+		return v
+	`)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := script.Run(ctx, ts.client, []string{fmt.Sprintf("rate:%d", i%100)}).Err(); err != nil {
+			b.Fatalf("EVALSHA failed: %v", err)
+		}
+	}
+}
+
+func BenchmarkPgMultiExec(b *testing.B) {
+	ts := newPgTestServer(b)
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := ts.client.TxPipelined(ctx, func(p redis.Pipeliner) error {
+			p.LPush(ctx, "queue:bench", i)
+			p.SAdd(ctx, "queues", "bench")
+			p.Incr(ctx, "stat:bench")
+			return nil
+		})
+		if err != nil {
+			b.Fatalf("EXEC failed: %v", err)
+		}
+	}
+}
+
+func BenchmarkPgExpire(b *testing.B) {
+	ts := newPgTestServer(b)
+	defer ts.Close()
+
+	ctx := context.Background()
+	for j := 0; j < 100; j++ {
+		ts.client.Set(ctx, fmt.Sprintf("exp:%d", j), "v", 0)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := ts.client.Expire(ctx, fmt.Sprintf("exp:%d", i%100), time.Hour).Err(); err != nil {
+			b.Fatalf("EXPIRE failed: %v", err)
+		}
+	}
+}
+
+func BenchmarkPgDelMany(b *testing.B) {
+	ts := newPgTestServer(b)
+	defer ts.Close()
+
+	ctx := context.Background()
+	keys := make([]string, 20)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for j := range keys {
+			keys[j] = fmt.Sprintf("del:%d:%d", i, j)
+		}
+		if err := ts.client.Del(ctx, keys...).Err(); err != nil {
+			b.Fatalf("DEL failed: %v", err)
+		}
+	}
+}

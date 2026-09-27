@@ -14,6 +14,11 @@ import (
 
 var clientIDCounter uint64
 
+// pubSubWriteTimeout bounds how long delivering one pub/sub message may block
+// on a subscriber that stopped reading. Delivery runs on the hub's single
+// listener goroutine, so a stuck subscriber would stall every other one.
+var pubSubWriteTimeout = 5 * time.Second
+
 // ClientState holds per-connection state
 type ClientState struct {
 	ID         uint64
@@ -34,6 +39,7 @@ type ClientState struct {
 
 	// Pub/sub state
 	inPubSubMode bool
+	conn         net.Conn
 	writer       *resp.Writer
 	writerMu     sync.Mutex
 }
@@ -51,6 +57,7 @@ func NewClientState(conn net.Conn, debug bool) *ClientState {
 		CreatedAt:       time.Now(),
 		protocolVersion: 2, // Default to RESP2
 		debug:           debug,
+		conn:            conn,
 	}
 }
 
@@ -278,8 +285,16 @@ func (c *ClientState) SendPubSubMessage(msgType, channel, payload string) error 
 		return fmt.Errorf("unknown message type: %s", msgType)
 	}
 
-	if err := c.writer.WriteValue(response); err != nil {
-		return err
+	_ = c.conn.SetWriteDeadline(time.Now().Add(pubSubWriteTimeout))
+	err := c.writer.WriteValue(response)
+	if err == nil {
+		err = c.writer.Flush()
 	}
-	return c.writer.Flush()
+	_ = c.conn.SetWriteDeadline(time.Time{})
+	if err != nil {
+		// The writer is unusable after a failed write. Close the connection;
+		// its handler then exits and removes the subscriptions.
+		_ = c.conn.Close()
+	}
+	return err
 }

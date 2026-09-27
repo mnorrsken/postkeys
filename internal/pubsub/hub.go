@@ -340,6 +340,21 @@ func (h *Hub) GetSubscribedChannels(subID uint64) []string {
 	return nil
 }
 
+// GetSubscribedPatterns returns the list of patterns a subscriber is subscribed to
+func (h *Hub) GetSubscribedPatterns(subID uint64) []string {
+	h.patternMu.RLock()
+	defer h.patternMu.RUnlock()
+
+	if pats, exists := h.subPatterns[subID]; exists {
+		patterns := make([]string, 0, len(pats))
+		for p := range pats {
+			patterns = append(patterns, p)
+		}
+		return patterns
+	}
+	return nil
+}
+
 // RemoveSubscriber removes a subscriber from all subscriptions
 func (h *Hub) RemoveSubscriber(subID uint64) {
 	// Remove from channel subscriptions

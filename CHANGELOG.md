@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.29.0] - 2026-09-27
+
+### Added
+- **`PG_PING_TIMEOUT`** (default 5s, chart value `postgresql.pool.pingTimeout`) — an idle pooled connection whose liveness ping does not answer in time is dropped, instead of hanging the command until TCP gives up (could be minutes after a failover or NAT drop).
+- **Reliability, error-reply and pub/sub compatibility tests** — concurrency, blocking commands and shutdown; error replies and pub/sub replies checked against real Redis 7; EVAL/MULTI/EXPIRE/DEL benchmarks.
+
+### Fixed
+- **Lua scripts were not atomic** — each `redis.call` ran on its own, so concurrent scripts handed out the same Sidekiq scheduled job several times and lost counter updates. Each script now runs in one transaction and locks its `KEYS` first.
+- **`redis.call` errors inside a script broke the client connection** — the error reply contained a newline. Script errors now match Redis 7.
+- **`BLPOP`/`BRPOP`/`BLMPOP`/`BZMPOP` inside `MULTI` or `EVAL` blocked forever**, holding a transaction and a pool connection and hanging shutdown. They now return nil at once, as in Redis.
+- **A client that disconnected while blocked in `BLPOP`/`BRPOP`/`BLMPOP`/`BZMPOP` kept waiting on the server and popped (lost) the next pushed item.** The wait is now cancelled on disconnect, `Stop` and drain.
+- **`MULTI`/`EXEC` deadlocks were never retried** (clients got "commit unexpectedly resulted in rollback"). `EXEC` now locks the keys of all queued commands up front and retries on deadlock.
+- **`EXPIRE`, `EXPIREAT`, `PERSIST`, `LTRIM`, `ZREMRANGEBYRANK`, `PFADD` and `PFMERGE` ran outside a transaction**, so their key lock did nothing and deadlocks were not retried. Concurrent `PFADD`s lost updates.
+- **Expired-key cleanup could deadlock with writes**, or delete the metadata of a key that was just refilled (making the key vanish). It now skips keys in use and re-checks once it holds the lock.
+- **A pub/sub subscriber that stopped reading stalled delivery to all subscribers.** It is now disconnected after 5s.
+- **Error replies no longer read "ERR ERR ..."**; "value is not an integer or out of range" now matches Redis.
+- **`(P)(UN)SUBSCRIBE` reply counts and RESP2 `PING`** — the subscription count now includes pattern subscriptions; `UNSUBSCRIBE` with no arguments no longer leaves pub/sub mode while pattern subscriptions remain; `PING` in RESP2 pub/sub mode now replies `["pong", msg]`.
+
+### Changed
+- **Multi-key lock acquisition is one query instead of one per key** (`MSET` about 60% faster in benchmarks).
+
 ## [0.28.4] - 2026-09-27
 
 ### Changed

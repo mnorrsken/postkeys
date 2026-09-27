@@ -329,64 +329,119 @@ func (h *Handler) HandleDiscard(client TransactionClientState) resp.Value {
 
 const maxExecRetries = 3
 
+// noBlockKey marks a context whose blocking commands (BLPOP, BZMPOP, ...)
+// must not wait: inside MULTI/EXEC and Lua scripts Redis runs them as if the
+// timeout had already expired.
+const noBlockKey contextKey = "noBlock"
+
+func withNoBlock(ctx context.Context) context.Context {
+	return context.WithValue(ctx, noBlockKey, true)
+}
+
+func isNoBlock(ctx context.Context) bool {
+	v, _ := ctx.Value(noBlockKey).(bool)
+	return v
+}
+
 // HandleExec executes all queued commands in a transaction, retrying on deadlock.
 func (h *Handler) HandleExec(ctx context.Context, client TransactionClientState) resp.Value {
 	if !client.InTransaction() {
-		return resp.Err("ERR EXEC without MULTI")
+		return resp.Err("EXEC without MULTI")
 	}
 
 	commands := client.GetQueuedCommands()
 
-	for attempt := 0; attempt <= maxExecRetries; attempt++ {
+	var keys []string
+	for _, cmd := range commands {
+		if cmd.Type == resp.Array && len(cmd.Array) > 0 {
+			keys = append(keys, commandKeys(strings.ToUpper(cmd.Array[0].Bulk), cmd.Array[1:])...)
+		}
+	}
+
+	ctx = withNoBlock(ctx)
+	result := h.runTx(ctx, keys, func(tx storage.Transaction) resp.Value {
+		results := make([]resp.Value, len(commands))
+		for i, cmd := range commands {
+			if cmd.Type != resp.Array || len(cmd.Array) == 0 {
+				results[i] = resp.Err("invalid command format")
+				continue
+			}
+			results[i] = h.ExecuteWithOps(ctx, tx, strings.ToUpper(cmd.Array[0].Bulk), cmd.Array[1:])
+		}
+		return resp.Value{Type: resp.Array, Array: results}
+	})
+
+	if result.Type == resp.Array {
+		metrics.RecordCommand("EXEC", 0, false)
+	}
+	return result
+}
+
+// runTx runs fn in a storage transaction that first locks keys in a fixed
+// order. When Postgres reports a deadlock or serialization failure (from the
+// lock, a command inside fn, or the commit) the whole transaction is rolled
+// back and run again.
+func (h *Handler) runTx(ctx context.Context, keys []string, fn func(storage.Transaction) resp.Value) resp.Value {
+	for attempt := 0; ; attempt++ {
 		if attempt > 0 {
 			// Exponential backoff with jitter before retry
 			base := time.Duration(5<<uint(attempt-1)) * time.Millisecond
 			jitter := time.Duration(rand.Int63n(int64(base)))
 			select {
 			case <-ctx.Done():
-				return resp.Err(fmt.Sprintf("ERR transaction aborted: %v", ctx.Err()))
+				return resp.Err(fmt.Sprintf("transaction aborted: %v", ctx.Err()))
 			case <-time.After(base + jitter):
 			}
 		}
+		canRetry := attempt < maxExecRetries
 
-		// Start a storage transaction
 		tx, err := h.store.BeginTx(ctx)
 		if err != nil {
-			return resp.Err(fmt.Sprintf("ERR transaction start failed: %v", err))
+			return resp.Err(fmt.Sprintf("transaction start failed: %v", err))
 		}
-
-		// Execute all commands within the transaction using the unified Operations interface
-		results := make([]resp.Value, len(commands))
-
-		for i, cmd := range commands {
-			if cmd.Type != resp.Array || len(cmd.Array) == 0 {
-				results[i] = resp.Err("invalid command format")
+		if err := tx.LockKeys(ctx, keys); err != nil {
+			_ = tx.Rollback(ctx)
+			if storage.IsRetryableError(err) && canRetry {
 				continue
 			}
-
-			cmdName := strings.ToUpper(cmd.Array[0].Bulk)
-			args := cmd.Array[1:]
-
-			// Execute using the unified handler with the transaction
-			results[i] = h.ExecuteWithOps(ctx, tx, cmdName, args)
+			return resp.Err(fmt.Sprintf("transaction failed: %v", err))
 		}
 
-		// Commit the transaction
+		result := fn(tx)
+		if hasRetryableError(result) {
+			_ = tx.Rollback(ctx)
+			if canRetry {
+				continue
+			}
+			return result
+		}
 		if err := tx.Commit(ctx); err != nil {
 			_ = tx.Rollback(ctx)
-			if storage.IsRetryableError(err) && attempt < maxExecRetries {
+			if storage.IsRetryableError(err) && canRetry {
 				continue
 			}
-			return resp.Err(fmt.Sprintf("ERR transaction commit failed: %v", err))
+			if result.Type == resp.Error {
+				// A failed script: its own error says more than the commit's.
+				return result
+			}
+			return resp.Err(fmt.Sprintf("transaction commit failed: %v", err))
 		}
-
-		// Record metrics for EXEC
-		metrics.RecordCommand("EXEC", 0, false)
-
-		return resp.Value{Type: resp.Array, Array: results}
+		return result
 	}
+}
 
-	return resp.Err("ERR transaction failed after retries")
+// hasRetryableError reports whether v, or a direct element of it, is an
+// error reply caused by a deadlock or serialization failure.
+func hasRetryableError(v resp.Value) bool {
+	if v.Type == resp.Error {
+		return storage.IsRetryableMessage(v.Str)
+	}
+	for _, e := range v.Array {
+		if e.Type == resp.Error && storage.IsRetryableMessage(e.Str) {
+			return true
+		}
+	}
+	return false
 }
 
 // ============== Connection Commands ==============

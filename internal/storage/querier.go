@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"math/rand"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -165,21 +166,17 @@ func (o queryOps) lockKeys(ctx context.Context, q Querier, keys []string) error 
 	if len(keys) == 0 {
 		return nil
 	}
+	if len(keys) == 1 {
+		return o.lockKey(ctx, q, keys[0])
+	}
 	sorted := make([]string, len(keys))
 	copy(sorted, keys)
 	sort.Strings(sorted)
-	// Deduplicate and lock in order
-	prev := ""
-	for _, key := range sorted {
-		if key == prev {
-			continue
-		}
-		if err := o.lockKey(ctx, q, key); err != nil {
-			return err
-		}
-		prev = key
-	}
-	return nil
+	sorted = slices.Compact(sorted)
+	// One round trip: the function scan over unnest yields rows in array
+	// order, so the locks are taken in sorted order.
+	_, err := q.Exec(ctx, "SELECT count(pg_advisory_xact_lock(hashtext(k))) FROM unnest($1::text[]) AS k", sorted)
+	return err
 }
 
 func (o queryOps) setMeta(ctx context.Context, q Querier, key string, keyType KeyType, expiresAt *time.Time) error {
@@ -426,7 +423,7 @@ func (o queryOps) incr(ctx context.Context, q Querier, key string, delta int64) 
 	} else {
 		current, err = strconv.ParseInt(string(value), 10, 64)
 		if err != nil {
-			return 0, fmt.Errorf("value is not an integer")
+			return 0, fmt.Errorf("value is not an integer or out of range")
 		}
 	}
 
@@ -1009,25 +1006,20 @@ func (o queryOps) expire(ctx context.Context, q Querier, key string, ttl time.Du
 	}
 	expiresAt := time.Now().Add(ttl)
 
-	result, err := q.Exec(ctx,
-		fmt.Sprintf("UPDATE kv_meta SET expires_at = $2 WHERE %s", expireWhereClause(opts)),
+	var keyType string
+	err := q.QueryRow(ctx,
+		fmt.Sprintf("UPDATE kv_meta SET expires_at = $2 WHERE %s RETURNING key_type", expireWhereClause(opts)),
 		key, expiresAt,
-	)
+	).Scan(&keyType)
+	if err == pgx.ErrNoRows {
+		return false, nil
+	}
 	if err != nil {
 		return false, err
-	}
-
-	if result.RowsAffected() == 0 {
-		return false, nil
 	}
 
 	// Update expires_at in the data table
-	keyType, err := o.getKeyType(ctx, q, key)
-	if err != nil {
-		return false, err
-	}
-
-	table := dataTableForType(keyType)
+	table := dataTableForType(KeyType(keyType))
 	if table == "" {
 		return true, nil
 	}
@@ -2730,6 +2722,9 @@ func (o queryOps) zRemRangeByScore(ctx context.Context, q Querier, key string, m
 
 func (o queryOps) zRemRangeByRank(ctx context.Context, q Querier, key string, start, stop int64) (int64, error) {
 	key = encodeKey(key)
+	if err := o.lockKey(ctx, q, key); err != nil {
+		return 0, err
+	}
 	// Get total count first to handle negative indices
 	var count int64
 	err := q.QueryRow(ctx,
@@ -3922,25 +3917,20 @@ func (o queryOps) expireAt(ctx context.Context, q Querier, key string, timestamp
 	if err := o.lockKey(ctx, q, key); err != nil {
 		return false, err
 	}
-	result, err := q.Exec(ctx,
-		fmt.Sprintf("UPDATE kv_meta SET expires_at = $2 WHERE %s", expireWhereClause(opts)),
+	var keyType string
+	err := q.QueryRow(ctx,
+		fmt.Sprintf("UPDATE kv_meta SET expires_at = $2 WHERE %s RETURNING key_type", expireWhereClause(opts)),
 		key, timestamp,
-	)
+	).Scan(&keyType)
+	if err == pgx.ErrNoRows {
+		return false, nil
+	}
 	if err != nil {
 		return false, err
-	}
-
-	if result.RowsAffected() == 0 {
-		return false, nil
 	}
 
 	// Update expires_at in the data table
-	keyType, err := o.getKeyType(ctx, q, key)
-	if err != nil {
-		return false, err
-	}
-
-	table := dataTableForType(keyType)
+	table := dataTableForType(KeyType(keyType))
 	if table == "" {
 		return true, nil
 	}
@@ -4459,6 +4449,10 @@ func (o queryOps) bitPos(ctx context.Context, q Querier, key string, bit int, st
 
 func (o queryOps) pfAdd(ctx context.Context, q Querier, key string, elements []string) (int64, error) {
 	key = encodeKey(key)
+	// Lock before reading the registers so concurrent PFADDs don't lose updates.
+	if err := o.lockKey(ctx, q, key); err != nil {
+		return 0, err
+	}
 	// Check key type if exists
 	keyType, err := o.getKeyType(ctx, q, key)
 	if err != nil {
@@ -4560,6 +4554,9 @@ func (o queryOps) pfCount(ctx context.Context, q Querier, keys []string) (int64,
 func (o queryOps) pfMerge(ctx context.Context, q Querier, destKey string, sourceKeys []string) error {
 	destKey = encodeKey(destKey)
 	sourceKeys = encodeKeys(sourceKeys)
+	if err := o.lockKeys(ctx, q, append([]string{destKey}, sourceKeys...)); err != nil {
+		return err
+	}
 	// Check dest key type if exists
 	keyType, err := o.getKeyType(ctx, q, destKey)
 	if err != nil {

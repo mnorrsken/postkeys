@@ -78,7 +78,9 @@ Scripts have access to:
 - `redis.pcall(cmd, ...)` - execute Redis command (returns error as table)
 - `redis.sha1hex(str)` - compute SHA1 hash
 
-**Note**: Scripts execute atomically. Certain commands are blocked from scripts: `SUBSCRIBE`, `PUBLISH`, `MULTI`, `EXEC`, `WATCH`, nested `EVAL`/`EVALSHA`.
+**Note**: Each script runs in one PostgreSQL transaction and locks every key in `KEYS` first, so scripts on the same keys run one at a time and their writes appear together. As in Redis, declare every key the script touches in `KEYS`; keys the script uses without declaring them are not locked. Blocking commands (`BLPOP`, `BRPOP`, `BLMPOP`, `BZMPOP`) return nil at once instead of waiting, as in Redis. Certain commands are blocked from scripts: `SUBSCRIBE`, `PUBLISH`, `MULTI`, `EXEC`, `WATCH`, nested `EVAL`/`EVALSHA`.
+
+`MULTI`/`EXEC` also runs in one PostgreSQL transaction that locks the keys of all queued commands up front. If PostgreSQL still reports a deadlock, the whole `EXEC` is retried (up to 3 times). Blocking commands inside `MULTI` behave like their non-blocking forms, as in Redis.
 
 ## Requirements
 
@@ -111,6 +113,7 @@ Environment variables:
 | `PG_MAX_CONN_LIFETIME` | Maximum lifetime of a connection | `30m` |
 | `PG_MAX_CONN_IDLE_TIME` | Maximum idle time before closing connection | `5m` |
 | `PG_HEALTH_CHECK_PERIOD` | Period between health checks on idle connections | `1m` |
+| `PG_PING_TIMEOUT` | How long to wait for the liveness ping of an idle pooled connection before dropping it and using another | `5s` |
 | `CACHE_ENABLED` | Enable in-memory cache (opt-in) | `false` |
 | `CACHE_TTL` | Cache TTL duration | `250ms` |
 | `CACHE_MAX_SIZE` | Maximum cached entries | `10000` |
@@ -131,6 +134,7 @@ postkeys uses a configurable connection pool to manage PostgreSQL connections ef
 - **Health checks** (`PG_HEALTH_CHECK_PERIOD`): Idle connections are periodically checked to ensure they're still alive
 - **Connection lifetime** (`PG_MAX_CONN_LIFETIME`): Connections are automatically closed and recreated after a maximum lifetime, ensuring fresh connections during database switchovers
 - **Idle timeout** (`PG_MAX_CONN_IDLE_TIME`): Idle connections are closed to free resources
+- **Ping timeout** (`PG_PING_TIMEOUT`): A connection that sat idle is pinged before use; if the ping does not answer in time the connection is dropped instead of hanging the command
 - **Pool sizing** (`PG_MIN_CONNS`, `PG_MAX_CONNS`): Controls the minimum and maximum number of connections maintained
 
 These settings work together with the existing reconnection logic in LISTEN/NOTIFY components (pub/sub, cache invalidation, list blocking operations) to provide resilience during PostgreSQL master node switchovers or network disruptions.

@@ -268,6 +268,10 @@ type Backend interface {
 type Transaction interface {
 	Operations
 
+	// LockKeys takes the per-key write locks for keys up front, in a fixed
+	// order, so later commands in the transaction cannot deadlock on them.
+	LockKeys(ctx context.Context, keys []string) error
+
 	// Transaction control
 	Commit(ctx context.Context) error
 	Rollback(ctx context.Context) error

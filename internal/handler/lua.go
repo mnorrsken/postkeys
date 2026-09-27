@@ -7,6 +7,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -76,6 +77,10 @@ type luaExecutor struct {
 	ops  storage.Operations
 	keys []string
 	argv []string
+
+	// callErr is the last error reply raised by redis.call, so a script
+	// that fails on it returns that reply instead of a Lua traceback.
+	callErr string
 }
 
 // newLuaExecutor creates a new Lua executor
@@ -148,7 +153,7 @@ func (le *luaExecutor) Execute(script string) (resp.Value, error) {
 
 	// Execute the script
 	if err := L.DoString(script); err != nil {
-		return resp.Value{}, fmt.Errorf("ERR Error running script: %v", err)
+		return resp.Value{}, scriptError(script, err, le.callErr)
 	}
 
 	// Get the return value (if any)
@@ -165,10 +170,30 @@ func (le *luaExecutor) Execute(script string) (resp.Value, error) {
 	return le.luaToResp(result), nil
 }
 
+// luaErrLine finds the script line in a gopher-lua error ("<string>:3: ...").
+var luaErrLine = regexp.MustCompile(`<string>:(\d+):`)
+
+// scriptError builds the reply for a failed script the way Redis 7 does: an
+// error from redis.call is returned as is, with the script and line appended;
+// other Lua errors become "ERR Error running script: ...". Only the first line
+// of the Lua message is kept (the rest is a traceback).
+func scriptError(script string, err error, callErr string) error {
+	msg, _, _ := strings.Cut(err.Error(), "\n")
+	line := "?"
+	if m := luaErrLine.FindStringSubmatch(msg); m != nil {
+		line = m[1]
+	}
+	if callErr != "" && strings.HasSuffix(msg, callErr) {
+		return fmt.Errorf("%s script: %s, on @user_script:%s.", callErr, scriptSHA1(script), line)
+	}
+	return fmt.Errorf("ERR Error running script: %s", msg)
+}
+
 // redisCall implements redis.call() - raises error on Redis errors
 func (le *luaExecutor) redisCall(L *lua.LState) int {
 	result := le.executeRedisCommand(L)
 	if result.Type == resp.Error {
+		le.callErr = result.Str
 		L.RaiseError("%s", result.Str)
 		return 0
 	}
@@ -325,7 +350,7 @@ func (le *luaExecutor) luaToResp(v lua.LValue) resp.Value {
 	case *lua.LTable:
 		// Check for error or status reply
 		if err := val.RawGetString("err"); err != lua.LNil {
-			return resp.Err(le.luaToString(err))
+			return resp.ErrCustom(le.luaToString(err))
 		}
 		if ok := val.RawGetString("ok"); ok != lua.LNil {
 			return resp.Value{Type: resp.SimpleString, Str: le.luaToString(ok)}
@@ -381,14 +406,7 @@ func (h *Handler) evalOp(ctx context.Context, ops storage.Operations, args []res
 	// Cache the script (EVAL always caches)
 	scriptCache.Store(script)
 
-	// Execute
-	executor := newLuaExecutor(ctx, h, ops, keys, argv)
-	result, err := executor.Execute(script)
-	if err != nil {
-		return resp.Err(err.Error())
-	}
-
-	return result
+	return h.runScript(ctx, ops, script, keys, argv)
 }
 
 // evalshaOp handles EVALSHA command
@@ -428,14 +446,29 @@ func (h *Handler) evalshaOp(ctx context.Context, ops storage.Operations, args []
 		argv[i] = args[2+numKeys+i].Bulk
 	}
 
-	// Execute
-	executor := newLuaExecutor(ctx, h, ops, keys, argv)
-	result, err := executor.Execute(script)
-	if err != nil {
-		return resp.Err(err.Error())
-	}
+	return h.runScript(ctx, ops, script, keys, argv)
+}
 
-	return result
+// runScript runs a Lua script atomically, as Redis does. Outside MULTI it gets
+// its own transaction; in both cases the declared KEYS are locked first, so
+// scripts on the same keys run one after another instead of interleaving.
+// Blocking commands inside the script do not wait.
+func (h *Handler) runScript(ctx context.Context, ops storage.Operations, script string, keys, argv []string) resp.Value {
+	ctx = withNoBlock(ctx)
+	run := func(ops storage.Operations) resp.Value {
+		result, err := newLuaExecutor(ctx, h, ops, keys, argv).Execute(script)
+		if err != nil {
+			return resp.ErrCustom(err.Error())
+		}
+		return result
+	}
+	if tx, ok := ops.(storage.Transaction); ok {
+		if err := tx.LockKeys(ctx, keys); err != nil {
+			return resp.Err(err.Error())
+		}
+		return run(tx)
+	}
+	return h.runTx(ctx, keys, func(tx storage.Transaction) resp.Value { return run(tx) })
 }
 
 // scriptOp handles SCRIPT subcommands

@@ -157,6 +157,8 @@ postgresql:
     # Period between health checks on idle connections
     # Helps detect and remove stale connections
     healthCheckPeriod: "1m"
+    # Max wait for the liveness ping of an idle connection before it is dropped
+    pingTimeout: "5s"
   
   # Use an existing secret for PostgreSQL credentials
   existingSecret:

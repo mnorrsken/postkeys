@@ -121,6 +121,10 @@ spec:
               value: {{ .Values.postgresql.pool.maxConnIdleTime | quote }}
             - name: PG_HEALTH_CHECK_PERIOD
               value: {{ .Values.postgresql.pool.healthCheckPeriod | quote }}
+            {{- with .Values.postgresql.pool.pingTimeout }}
+            - name: PG_PING_TIMEOUT
+              value: {{ . | quote }}
+            {{- end }}
             {{- end }}
             {{- if or .Values.redis.password.value .Values.redis.password.existingSecret.name }}
             - name: REDIS_PASSWORD

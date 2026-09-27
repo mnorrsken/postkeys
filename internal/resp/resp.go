@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"strconv"
+	"strings"
 )
 
 // Limits guard against malicious or malformed inputs that declare absurd
@@ -79,6 +80,13 @@ func (r *Reader) debugLog(format string, v ...interface{}) {
 	if r.debug {
 		log.Printf("[RESP DEBUG] "+format, v...)
 	}
+}
+
+// WaitReadable blocks until at least one byte can be read or the underlying
+// reader fails (disconnect, deadline). Buffered data is left in place.
+func (r *Reader) WaitReadable() error {
+	_, err := r.reader.Peek(1)
+	return err
 }
 
 // Read reads a single RESP value
@@ -260,13 +268,17 @@ func (w *Writer) WriteValue(v Value) error {
 
 // WriteSimpleString writes a simple string
 func (w *Writer) WriteSimpleString(s string) error {
-	_, err := w.writer.WriteString("+" + s + "\r\n")
+	_, err := w.writer.WriteString("+" + lineBreaks.Replace(s) + "\r\n")
 	return err
 }
 
+// lineBreaks strips CR/LF from simple strings and errors, as Redis does.
+// A raw newline there would end the reply early and desync the client.
+var lineBreaks = strings.NewReplacer("\r", " ", "\n", " ")
+
 // WriteError writes an error
 func (w *Writer) WriteError(s string) error {
-	_, err := w.writer.WriteString("-" + s + "\r\n")
+	_, err := w.writer.WriteString("-" + lineBreaks.Replace(s) + "\r\n")
 	return err
 }
 
@@ -356,7 +368,11 @@ func OK() Value {
 }
 
 // Err returns an error value with ERR prefix
+// Messages that already start with "ERR " are kept as they are.
 func Err(msg string) Value {
+	if strings.HasPrefix(msg, "ERR ") {
+		return Value{Type: Error, Str: msg}
+	}
 	return Value{Type: Error, Str: "ERR " + msg}
 }
 

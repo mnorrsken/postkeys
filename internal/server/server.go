@@ -10,6 +10,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -32,8 +33,9 @@ type Server struct {
 	pubsub     *pubsub.Hub
 
 	// Connection tracking for graceful drain
-	connsMu sync.Mutex
-	conns   map[net.Conn]struct{}
+	connsMu       sync.Mutex
+	conns         map[net.Conn]struct{}
+	drainDeadline time.Time // read deadline set by DrainConnections, zero if not draining
 }
 
 // New creates a new server
@@ -145,6 +147,7 @@ func (s *Server) DrainConnections(timeout time.Duration) {
 
 	deadline := time.Now().Add(timeout)
 	s.connsMu.Lock()
+	s.drainDeadline = deadline
 	for c := range s.conns {
 		c.SetReadDeadline(deadline) //nolint:errcheck
 	}
@@ -251,6 +254,14 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		// Add protocol version to context for handlers
 		cmdCtx := handler.WithProtocolVersion(ctx, client.GetProtocolVersion())
 
+		// A blocking command must stop waiting when its client goes away,
+		// or it would pop an item that nobody receives.
+		stopWatch := func() {}
+		if cmd.Type == resp.Array && len(cmd.Array) > 0 && authenticated && !client.InTransaction() &&
+			blockingCommands[strings.ToUpper(cmd.Array[0].Bulk)] {
+			cmdCtx, stopWatch = s.watchDisconnect(cmdCtx, conn, reader)
+		}
+
 		if cmd.Type == resp.Array && len(cmd.Array) > 0 {
 			cmdName := strings.ToUpper(cmd.Array[0].Bulk)
 
@@ -332,7 +343,15 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 			} else if client.InPubSubMode() && !client.UseRESP3() {
 				// In RESP2 pub/sub mode, only allow SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PING, QUIT
 				// RESP3 clients can continue to use regular commands while subscribed (using Push type for messages)
-				if cmdName == "PING" || cmdName == "QUIT" {
+				if cmdName == "PING" {
+					// Redis answers PING in RESP2 pub/sub mode with a
+					// ["pong", message] array; clients use it as a health check.
+					msg := ""
+					if len(cmd.Array) > 1 {
+						msg = cmd.Array[1].Bulk
+					}
+					response = resp.Arr(resp.Bulk("pong"), resp.Bulk(msg))
+				} else if cmdName == "QUIT" {
 					response = s.handler.Handle(cmdCtx, cmd)
 				} else {
 					if s.debug {
@@ -378,6 +397,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		} else {
 			response = s.handler.Handle(cmdCtx, cmd)
 		}
+		stopWatch()
 
 		// Log error responses when debug is enabled
 		if s.debug && response.Type == resp.Error {
@@ -415,6 +435,40 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 			}
 			return
 		}
+	}
+}
+
+// blockingCommands wait for data and are cancelled when the client disconnects.
+var blockingCommands = map[string]bool{
+	"BLPOP": true, "BRPOP": true, "BLMPOP": true, "BZMPOP": true,
+}
+
+// watchDisconnect returns a context that is cancelled when conn fails while a
+// blocking command runs (client closed it, Stop, or the drain deadline).
+// Clients send nothing while blocked, so any read error means the client is
+// gone. The returned stop func must be called before reading the next
+// command; it ends the watch and restores the read deadline.
+func (s *Server) watchDisconnect(ctx context.Context, conn net.Conn, reader *resp.Reader) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(ctx)
+	var stopping atomic.Bool
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Returns nil if the client pipelined another command; that is not
+		// a disconnect, and the next Read will pick it up.
+		if err := reader.WaitReadable(); err != nil && !stopping.Load() {
+			cancel()
+		}
+	}()
+	return ctx, func() {
+		stopping.Store(true)
+		_ = conn.SetReadDeadline(time.Now()) // wake WaitReadable
+		<-done
+		s.connsMu.Lock()
+		deadline := s.drainDeadline
+		s.connsMu.Unlock()
+		_ = conn.SetReadDeadline(deadline)
+		cancel()
 	}
 }
 

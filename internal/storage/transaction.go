@@ -25,6 +25,15 @@ func (t *TxStore) querier() Querier {
 	return t.tx
 }
 
+// LockKeys takes the advisory locks for keys in sorted order.
+func (t *TxStore) LockKeys(ctx context.Context, keys []string) error {
+	enc := make([]string, len(keys))
+	for i, k := range keys {
+		enc[i] = encodeKey(k)
+	}
+	return t.ops.lockKeys(ctx, t.querier(), enc)
+}
+
 // Commit commits the transaction
 func (t *TxStore) Commit(ctx context.Context) error {
 	if t.done {

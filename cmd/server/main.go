@@ -97,6 +97,7 @@ func main() {
 			MaxConnLifetime:   cfg.PGMaxConnLifetime,
 			MaxConnIdleTime:   cfg.PGMaxConnIdleTime,
 			HealthCheckPeriod: cfg.PGHealthCheckPeriod,
+			PingTimeout:       cfg.PGPingTimeout,
 		})
 		if err != nil {
 			return err

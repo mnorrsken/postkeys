@@ -33,10 +33,11 @@ func (h *Handler) HandleSubscribe(hub *pubsub.Hub, client PubSubClientState, cha
 	// Subscribe to channels
 	counts := hub.Subscribe(client, channels...)
 
-	// Build responses for each channel
+	// Like Redis, the count covers channels and patterns together.
+	_, patternCount := hub.GetSubscriptionCount(client.GetID())
 	responses := make([]resp.Value, len(channels))
 	for i, channel := range channels {
-		responses[i] = pubsub.BuildSubscribeResponse(channel, counts[i])
+		responses[i] = pubsub.BuildSubscribeResponse(channel, counts[i]+patternCount)
 	}
 
 	duration := time.Since(start)
@@ -58,12 +59,17 @@ func (h *Handler) HandleUnsubscribe(hub *pubsub.Hub, client PubSubClientState, c
 	}
 
 	// Unsubscribe from channels
-	counts := hub.Unsubscribe(client, channels...)
+	counts := hub.Unsubscribe(client, unsubChannels...)
+
+	// Like Redis, the count covers channels and patterns together.
+	channelCount, patternCount := hub.GetSubscriptionCount(client.GetID())
+	if channelCount == 0 && patternCount == 0 {
+		client.ExitPubSubMode()
+	}
 
 	// If no channels to unsubscribe from, return single response
 	if len(unsubChannels) == 0 {
-		responses := []resp.Value{pubsub.BuildUnsubscribeResponse("", 0)}
-		client.ExitPubSubMode()
+		responses := []resp.Value{pubsub.BuildUnsubscribeResponse("", patternCount)}
 		duration := time.Since(start)
 		metrics.RecordCommand("UNSUBSCRIBE", duration, false)
 		return responses
@@ -72,17 +78,7 @@ func (h *Handler) HandleUnsubscribe(hub *pubsub.Hub, client PubSubClientState, c
 	// Build responses for each channel
 	responses := make([]resp.Value, len(unsubChannels))
 	for i, channel := range unsubChannels {
-		count := 0
-		if i < len(counts) {
-			count = counts[i]
-		}
-		responses[i] = pubsub.BuildUnsubscribeResponse(channel, count)
-	}
-
-	// Check if we should exit pub/sub mode
-	channelCount, patternCount := hub.GetSubscriptionCount(client.GetID())
-	if channelCount == 0 && patternCount == 0 {
-		client.ExitPubSubMode()
+		responses[i] = pubsub.BuildUnsubscribeResponse(channel, counts[i]+patternCount)
 	}
 
 	duration := time.Since(start)
@@ -105,10 +101,11 @@ func (h *Handler) HandlePSubscribe(hub *pubsub.Hub, client PubSubClientState, pa
 	// Subscribe to patterns
 	counts := hub.PSubscribe(client, patterns...)
 
-	// Build responses for each pattern
+	// Like Redis, the count covers channels and patterns together.
+	channelCount, _ := hub.GetSubscriptionCount(client.GetID())
 	responses := make([]resp.Value, len(patterns))
 	for i, pattern := range patterns {
-		responses[i] = pubsub.BuildPSubscribeResponse(pattern, counts[i])
+		responses[i] = pubsub.BuildPSubscribeResponse(pattern, counts[i]+channelCount)
 	}
 
 	duration := time.Since(start)
@@ -121,30 +118,29 @@ func (h *Handler) HandlePSubscribe(hub *pubsub.Hub, client PubSubClientState, pa
 func (h *Handler) HandlePUnsubscribe(hub *pubsub.Hub, client PubSubClientState, patterns []string) []resp.Value {
 	start := time.Now()
 
+	// With no arguments, unsubscribe from (and reply for) every pattern
+	if len(patterns) == 0 {
+		patterns = hub.GetSubscribedPatterns(client.GetID())
+	}
+
 	// Unsubscribe from patterns
 	counts := hub.PUnsubscribe(client, patterns...)
 
+	// Like Redis, the count covers channels and patterns together.
+	channelCount, patternCount := hub.GetSubscriptionCount(client.GetID())
+	if channelCount == 0 && patternCount == 0 {
+		client.ExitPubSubMode()
+	}
+
 	if len(patterns) == 0 {
 		// No patterns were subscribed
-		responses := []resp.Value{pubsub.BuildPUnsubscribeResponse("", 0)}
-		// Check if we should exit pub/sub mode
-		channelCount, patternCount := hub.GetSubscriptionCount(client.GetID())
-		if channelCount == 0 && patternCount == 0 {
-			client.ExitPubSubMode()
-		}
-		return responses
+		return []resp.Value{pubsub.BuildPUnsubscribeResponse("", channelCount)}
 	}
 
 	// Build responses for each pattern
 	responses := make([]resp.Value, len(patterns))
 	for i, pattern := range patterns {
-		responses[i] = pubsub.BuildPUnsubscribeResponse(pattern, counts[i])
-	}
-
-	// Check if we should exit pub/sub mode
-	channelCount, patternCount := hub.GetSubscriptionCount(client.GetID())
-	if channelCount == 0 && patternCount == 0 {
-		client.ExitPubSubMode()
+		responses[i] = pubsub.BuildPUnsubscribeResponse(pattern, counts[i]+channelCount)
 	}
 
 	duration := time.Since(start)

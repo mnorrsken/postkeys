@@ -85,7 +85,7 @@ func (h *Handler) setOp(ctx context.Context, ops storage.Operations, args []resp
 			i++
 			n, err := strconv.ParseInt(args[i].Bulk, 10, 64)
 			if err != nil {
-				return resp.Err("value is not an integer")
+				return resp.Err("value is not an integer or out of range")
 			}
 			switch opt {
 			case "EX":
@@ -204,7 +204,7 @@ func (h *Handler) setexOp(ctx context.Context, ops storage.Operations, args []re
 
 	secs, err := strconv.ParseInt(args[1].Bulk, 10, 64)
 	if err != nil {
-		return resp.Err("value is not an integer")
+		return resp.Err("value is not an integer or out of range")
 	}
 
 	if err := ops.Set(ctx, args[0].Bulk, args[2].Bulk, time.Duration(secs)*time.Second); err != nil {
@@ -286,7 +286,7 @@ func (h *Handler) incrbyOp(ctx context.Context, ops storage.Operations, args []r
 
 	delta, err := strconv.ParseInt(args[1].Bulk, 10, 64)
 	if err != nil {
-		return resp.Err("value is not an integer")
+		return resp.Err("value is not an integer or out of range")
 	}
 
 	val, err := ops.Incr(ctx, args[0].Bulk, delta)
@@ -303,7 +303,7 @@ func (h *Handler) decrbyOp(ctx context.Context, ops storage.Operations, args []r
 
 	delta, err := strconv.ParseInt(args[1].Bulk, 10, 64)
 	if err != nil {
-		return resp.Err("value is not an integer")
+		return resp.Err("value is not an integer or out of range")
 	}
 
 	val, err := ops.Incr(ctx, args[0].Bulk, -delta)
@@ -725,7 +725,7 @@ func (h *Handler) expireOp(ctx context.Context, ops storage.Operations, args []r
 
 	secs, err := strconv.ParseInt(args[1].Bulk, 10, 64)
 	if err != nil {
-		return resp.Err("value is not an integer")
+		return resp.Err("value is not an integer or out of range")
 	}
 	opts, errVal := parseExpireOptions(args[2:])
 	if errVal != nil {
@@ -749,7 +749,7 @@ func (h *Handler) pexpireOp(ctx context.Context, ops storage.Operations, args []
 
 	ms, err := strconv.ParseInt(args[1].Bulk, 10, 64)
 	if err != nil {
-		return resp.Err("value is not an integer")
+		return resp.Err("value is not an integer or out of range")
 	}
 	opts, errVal := parseExpireOptions(args[2:])
 	if errVal != nil {
@@ -1572,12 +1572,12 @@ func (h *Handler) lrangeOp(ctx context.Context, ops storage.Operations, args []r
 
 	start, err := strconv.ParseInt(args[1].Bulk, 10, 64)
 	if err != nil {
-		return resp.Err("value is not an integer")
+		return resp.Err("value is not an integer or out of range")
 	}
 
 	stop, err := strconv.ParseInt(args[2].Bulk, 10, 64)
 	if err != nil {
-		return resp.Err("value is not an integer")
+		return resp.Err("value is not an integer or out of range")
 	}
 
 	values, err := ops.LRange(ctx, args[0].Bulk, start, stop)
@@ -1599,7 +1599,7 @@ func (h *Handler) lindexOp(ctx context.Context, ops storage.Operations, args []r
 
 	index, err := strconv.ParseInt(args[1].Bulk, 10, 64)
 	if err != nil {
-		return resp.Err("value is not an integer")
+		return resp.Err("value is not an integer or out of range")
 	}
 
 	value, found, err := ops.LIndex(ctx, args[0].Bulk, index)
@@ -1674,7 +1674,7 @@ func (h *Handler) blockingPop(ctx context.Context, _ storage.Operations, keys []
 			return resp.Arr(resp.Bulk(poppedKey), resp.Bulk(value))
 		}
 
-		if timeout > 0 && time.Now().After(deadline) {
+		if isNoBlock(ctx) || (timeout > 0 && time.Now().After(deadline)) {
 			return resp.NullBulk()
 		}
 
@@ -1870,7 +1870,7 @@ func (h *Handler) blockingMPop(ctx context.Context, keys []string, timeout float
 			return v
 		}
 
-		if timeout > 0 && time.Now().After(deadline) {
+		if isNoBlock(ctx) || (timeout > 0 && time.Now().After(deadline)) {
 			return resp.NullArray()
 		}
 		waitTime := h.blockingPollInterval

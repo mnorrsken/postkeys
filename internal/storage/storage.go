@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
@@ -45,6 +46,7 @@ type Config struct {
 	MaxConnLifetime   time.Duration // Maximum lifetime of a connection before it's closed
 	MaxConnIdleTime   time.Duration // Maximum time a connection can be idle before it's closed
 	HealthCheckPeriod time.Duration // Period between health checks on idle connections
+	PingTimeout       time.Duration // Max wait for the liveness ping of an idle connection
 }
 
 // New creates a new Store with the given configuration
@@ -75,6 +77,12 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 	}
 	if cfg.HealthCheckPeriod > 0 {
 		poolConfig.HealthCheckPeriod = cfg.HealthCheckPeriod
+	}
+	// pgxpool pings a connection that sat idle before handing it out. Without
+	// a timeout, a connection whose peer vanished (failover, NAT drop) hangs
+	// that ping until TCP gives up, which can take many minutes.
+	if cfg.PingTimeout > 0 {
+		poolConfig.PingTimeout = cfg.PingTimeout
 	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
@@ -208,10 +216,16 @@ func (s *Store) cleanupExpiredKeys(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.deleteExpiredKeys(context.Background())
+			// Bounded so a dead connection cannot stall the loop forever.
+			runCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			s.deleteExpiredKeys(runCtx)
+			cancel()
 		}
 	}
 }
+
+// cleanupBatch bounds how many keys one cleanup cycle looks at per source.
+const cleanupBatch = 1000
 
 func (s *Store) deleteExpiredKeys(ctx context.Context) {
 	// Try to acquire an advisory lock so only one instance runs cleanup.
@@ -230,82 +244,84 @@ func (s *Store) deleteExpiredKeys(ctx context.Context) {
 
 	now := time.Now()
 
-	// Phase 1: Delete expired rows from all data tables within the transaction.
-	// Uses LIMIT to bound the number of rows locked per cycle, reducing contention.
-	dataQueries := []string{
-		"DELETE FROM kv_strings WHERE key IN (SELECT key FROM kv_strings WHERE expires_at IS NOT NULL AND expires_at <= $1 LIMIT 1000)",
-		"DELETE FROM kv_hashes WHERE key IN (SELECT DISTINCT key FROM kv_hashes WHERE expires_at IS NOT NULL AND expires_at <= $1 LIMIT 1000)",
-		"DELETE FROM kv_lists WHERE key IN (SELECT DISTINCT key FROM kv_lists WHERE expires_at IS NOT NULL AND expires_at <= $1 LIMIT 1000)",
-		"DELETE FROM kv_sets WHERE key IN (SELECT DISTINCT key FROM kv_sets WHERE expires_at IS NOT NULL AND expires_at <= $1 LIMIT 1000)",
-		"DELETE FROM kv_zsets WHERE key IN (SELECT DISTINCT key FROM kv_zsets WHERE expires_at IS NOT NULL AND expires_at <= $1 LIMIT 1000)",
-		"DELETE FROM kv_hyperloglog WHERE key IN (SELECT key FROM kv_hyperloglog WHERE expires_at IS NOT NULL AND expires_at <= $1 LIMIT 1000)",
-	}
-	for _, q := range dataQueries {
-		if _, err := tx.Exec(ctx, q, now); err != nil {
-			return
-		}
-	}
-
-	// Phase 2: Collect keys expired in kv_meta, then delete their data rows.
-	// This handles the case where expires_at was set on kv_meta but not
-	// propagated to the data table (e.g. sorted sets via EXPIRE command).
-	rows, err := tx.Query(ctx,
-		"DELETE FROM kv_meta WHERE expires_at IS NOT NULL AND expires_at <= $1 RETURNING key",
-		now,
+	// Candidates: keys expired in kv_meta, keys with expired rows in a data
+	// table (e.g. meta was never given the TTL), and kv_meta entries whose
+	// data is gone (LPOP/SREM emptied the key).
+	rows, err := tx.Query(ctx, `
+		(SELECT key FROM kv_meta WHERE expires_at IS NOT NULL AND expires_at <= $1 LIMIT $2)
+		UNION (SELECT key FROM kv_strings WHERE expires_at IS NOT NULL AND expires_at <= $1 LIMIT $2)
+		UNION (SELECT DISTINCT key FROM kv_hashes WHERE expires_at IS NOT NULL AND expires_at <= $1 LIMIT $2)
+		UNION (SELECT DISTINCT key FROM kv_lists WHERE expires_at IS NOT NULL AND expires_at <= $1 LIMIT $2)
+		UNION (SELECT DISTINCT key FROM kv_sets WHERE expires_at IS NOT NULL AND expires_at <= $1 LIMIT $2)
+		UNION (SELECT DISTINCT key FROM kv_zsets WHERE expires_at IS NOT NULL AND expires_at <= $1 LIMIT $2)
+		UNION (SELECT key FROM kv_hyperloglog WHERE expires_at IS NOT NULL AND expires_at <= $1 LIMIT $2)
+		UNION (SELECT m.key FROM kv_meta m WHERE
+			(m.key_type = 'string' AND NOT EXISTS (SELECT 1 FROM kv_strings s WHERE s.key = m.key))
+			OR (m.key_type = 'list' AND NOT EXISTS (SELECT 1 FROM kv_lists l WHERE l.key = m.key))
+			OR (m.key_type = 'hash' AND NOT EXISTS (SELECT 1 FROM kv_hashes h WHERE h.key = m.key))
+			OR (m.key_type = 'set' AND NOT EXISTS (SELECT 1 FROM kv_sets s WHERE s.key = m.key))
+			OR (m.key_type = 'zset' AND NOT EXISTS (SELECT 1 FROM kv_zsets z WHERE z.key = m.key))
+			LIMIT $2)`,
+		now, cleanupBatch,
 	)
 	if err != nil {
 		return
 	}
-	var orphanKeys []string
-	for rows.Next() {
-		var key string
-		if err := rows.Scan(&key); err != nil {
-			rows.Close()
+	candidates, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil || len(candidates) == 0 {
+		return
+	}
+
+	// Take the same per-key lock that writers take (see lockKey), but never
+	// wait for it: keys in use are skipped until a later cycle. Without this
+	// the cleanup deadlocks with writers, or deletes the kv_meta row of a key
+	// that a concurrent LPUSH/SADD just filled again.
+	rows, err = tx.Query(ctx,
+		"SELECT k FROM unnest($1::text[]) AS k WHERE pg_try_advisory_xact_lock(hashtext(k))",
+		candidates,
+	)
+	if err != nil {
+		return
+	}
+	keys, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil || len(keys) == 0 {
+		return
+	}
+
+	// With the locks held, re-check each condition on the current data.
+	rows, err = tx.Query(ctx,
+		"DELETE FROM kv_meta WHERE key = ANY($1) AND expires_at IS NOT NULL AND expires_at <= $2 RETURNING key",
+		keys, now,
+	)
+	if err != nil {
+		return
+	}
+	expired, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return
+	}
+
+	for _, table := range []string{"kv_strings", "kv_hashes", "kv_lists", "kv_sets", "kv_zsets", "kv_hyperloglog"} {
+		if _, err := tx.Exec(ctx, fmt.Sprintf(
+			`DELETE FROM %[1]s WHERE key = ANY($3) OR key IN (
+				SELECT key FROM %[1]s WHERE key = ANY($1) AND expires_at IS NOT NULL AND expires_at <= $2)`, table),
+			keys, now, expired,
+		); err != nil {
 			return
 		}
-		orphanKeys = append(orphanKeys, key)
-	}
-	rows.Close()
-
-	// Clean up any data rows for these expired meta keys
-	if len(orphanKeys) > 0 {
-		orphanQueries := []string{
-			"DELETE FROM kv_strings WHERE key = ANY($1)",
-			"DELETE FROM kv_hashes WHERE key = ANY($1)",
-			"DELETE FROM kv_lists WHERE key = ANY($1)",
-			"DELETE FROM kv_sets WHERE key = ANY($1)",
-			"DELETE FROM kv_zsets WHERE key = ANY($1)",
-			"DELETE FROM kv_hyperloglog WHERE key = ANY($1)",
-		}
-		for _, q := range orphanQueries {
-			if _, err := tx.Exec(ctx, q, orphanKeys); err != nil {
-				return
-			}
-		}
 	}
 
-	// Phase 3: Clean up orphaned kv_meta entries where data was removed but meta remains.
-	// This handles cases like LPOP/RPOP emptying a list, SREM removing all set members, etc.
-	// We batch delete to limit the impact per cleanup cycle.
-	_, _ = tx.Exec(ctx, `
-		DELETE FROM kv_meta WHERE key IN (
-			SELECT m.key FROM kv_meta m
-			WHERE m.key_type = 'string' AND NOT EXISTS (SELECT 1 FROM kv_strings s WHERE s.key = m.key)
-			UNION ALL
-			SELECT m.key FROM kv_meta m
-			WHERE m.key_type = 'list' AND NOT EXISTS (SELECT 1 FROM kv_lists l WHERE l.key = m.key)
-			UNION ALL
-			SELECT m.key FROM kv_meta m
-			WHERE m.key_type = 'hash' AND NOT EXISTS (SELECT 1 FROM kv_hashes h WHERE h.key = m.key)
-			UNION ALL
-			SELECT m.key FROM kv_meta m
-			WHERE m.key_type = 'set' AND NOT EXISTS (SELECT 1 FROM kv_sets s WHERE s.key = m.key)
-			UNION ALL
-			SELECT m.key FROM kv_meta m
-			WHERE m.key_type = 'zset' AND NOT EXISTS (SELECT 1 FROM kv_zsets z WHERE z.key = m.key)
-			LIMIT 1000
-		)
-	`)
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM kv_meta m WHERE m.key = ANY($1) AND (
+			(m.key_type = 'string' AND NOT EXISTS (SELECT 1 FROM kv_strings s WHERE s.key = m.key))
+			OR (m.key_type = 'list' AND NOT EXISTS (SELECT 1 FROM kv_lists l WHERE l.key = m.key))
+			OR (m.key_type = 'hash' AND NOT EXISTS (SELECT 1 FROM kv_hashes h WHERE h.key = m.key))
+			OR (m.key_type = 'set' AND NOT EXISTS (SELECT 1 FROM kv_sets s WHERE s.key = m.key))
+			OR (m.key_type = 'zset' AND NOT EXISTS (SELECT 1 FROM kv_zsets z WHERE z.key = m.key)))`,
+		keys,
+	); err != nil {
+		return
+	}
 
 	_ = tx.Commit(ctx)
 }
@@ -324,6 +340,13 @@ func isRetryableError(err error) bool {
 // serialization failure that can be safely retried.
 func IsRetryableError(err error) bool {
 	return isRetryableError(err)
+}
+
+// IsRetryableMessage reports whether an error message carries the SQLSTATE of
+// a deadlock or serialization failure. Used where only the error text is left,
+// such as a command reply inside MULTI/EXEC.
+func IsRetryableMessage(msg string) bool {
+	return strings.Contains(msg, "(SQLSTATE 40P01)") || strings.Contains(msg, "(SQLSTATE 40001)")
 }
 
 const maxDeadlockRetries = 3
@@ -528,7 +551,13 @@ func (s *Store) Exists(ctx context.Context, keys []string) (int64, error) {
 }
 
 func (s *Store) Expire(ctx context.Context, key string, ttl time.Duration, opts ExpireOptions) (bool, error) {
-	return s.ops.expire(ctx, s.querier(), key, ttl, opts)
+	var ok bool
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		ok, err = s.ops.expire(ctx, s.txQuerier(tx), key, ttl, opts)
+		return err
+	})
+	return ok, err
 }
 
 func (s *Store) TTL(ctx context.Context, key string) (int64, error) {
@@ -540,7 +569,13 @@ func (s *Store) PTTL(ctx context.Context, key string) (int64, error) {
 }
 
 func (s *Store) Persist(ctx context.Context, key string) (bool, error) {
-	return s.ops.persist(ctx, s.querier(), key)
+	var ok bool
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		ok, err = s.ops.persist(ctx, s.txQuerier(tx), key)
+		return err
+	})
+	return ok, err
 }
 
 func (s *Store) Keys(ctx context.Context, pattern string) ([]string, error) {
@@ -562,7 +597,13 @@ func (s *Store) Rename(ctx context.Context, oldKey, newKey string) error {
 }
 
 func (s *Store) ExpireAt(ctx context.Context, key string, timestamp time.Time, opts ExpireOptions) (bool, error) {
-	return s.ops.expireAt(ctx, s.querier(), key, timestamp, opts)
+	var ok bool
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		ok, err = s.ops.expireAt(ctx, s.txQuerier(tx), key, timestamp, opts)
+		return err
+	})
+	return ok, err
 }
 
 func (s *Store) Copy(ctx context.Context, source, destination string, replace bool) (bool, error) {
@@ -966,7 +1007,13 @@ func (s *Store) ZRemRangeByScore(ctx context.Context, key string, min, max float
 }
 
 func (s *Store) ZRemRangeByRank(ctx context.Context, key string, start, stop int64) (int64, error) {
-	return s.ops.zRemRangeByRank(ctx, s.querier(), key, start, stop)
+	var n int64
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		n, err = s.ops.zRemRangeByRank(ctx, s.txQuerier(tx), key, start, stop)
+		return err
+	})
+	return n, err
 }
 
 func (s *Store) ZIncrBy(ctx context.Context, key string, increment float64, member string) (float64, error) {
@@ -1040,7 +1087,9 @@ func (s *Store) LRem(ctx context.Context, key string, count int64, element strin
 }
 
 func (s *Store) LTrim(ctx context.Context, key string, start, stop int64) error {
-	return s.ops.lTrim(ctx, s.querier(), key, start, stop)
+	return s.withTx(ctx, func(tx pgx.Tx) error {
+		return s.ops.lTrim(ctx, s.txQuerier(tx), key, start, stop)
+	})
 }
 
 func (s *Store) RPopLPush(ctx context.Context, source, destination string) (string, bool, error) {
@@ -1076,7 +1125,13 @@ func (s *Store) LInsert(ctx context.Context, key, pivot, element string, before 
 // ============== HyperLogLog Commands ==============
 
 func (s *Store) PFAdd(ctx context.Context, key string, elements []string) (int64, error) {
-	return s.ops.pfAdd(ctx, s.querier(), key, elements)
+	var n int64
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		n, err = s.ops.pfAdd(ctx, s.txQuerier(tx), key, elements)
+		return err
+	})
+	return n, err
 }
 
 func (s *Store) PFCount(ctx context.Context, keys []string) (int64, error) {
@@ -1084,7 +1139,9 @@ func (s *Store) PFCount(ctx context.Context, keys []string) (int64, error) {
 }
 
 func (s *Store) PFMerge(ctx context.Context, destKey string, sourceKeys []string) error {
-	return s.ops.pfMerge(ctx, s.querier(), destKey, sourceKeys)
+	return s.withTx(ctx, func(tx pgx.Tx) error {
+		return s.ops.pfMerge(ctx, s.txQuerier(tx), destKey, sourceKeys)
+	})
 }
 
 // ============== Server Commands ==============
