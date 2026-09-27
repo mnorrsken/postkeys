@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.28.4] - 2026-09-27
+
+### Changed
+- **Dependency bumps (dependabot)** — Go modules: `github.com/jackc/pgx/v5` 5.10.0 → 5.11.0 (#34), `github.com/redis/go-redis/v9` 9.21.0 → 9.22.0 (#32), `github.com/prometheus/client_golang` 1.23.2 → 1.24.1 (#30). Docker: builder image `golang:1.26-alpine` → `golang:1.27-alpine` (#33). GitHub Actions: `actions/checkout` v6 → v7 (#26), `golangci/golangci-lint-action` v9.2.1 → v9.3.0 (#27), `actions/setup-go` v6 → v7 (#28), `docker/login-action` v4 → v4.5.2 (#31).
+
 ## [0.28.3] - 2026-06-26
 
 ### Changed
