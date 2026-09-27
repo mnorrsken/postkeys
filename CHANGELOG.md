@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.29.1] - 2026-09-27
+
+### Fixed
+- Data race between `Server.ServeWithListener` and `Stop` when the server is stopped right after starting. It failed the v0.29.0 publish run, so v0.29.0 was never published; v0.29.1 is the first release with the 0.29.0 changes.
+
 ## [0.29.0] - 2026-09-27
 
 ### Added

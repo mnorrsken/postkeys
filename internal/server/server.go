@@ -32,7 +32,7 @@ type Server struct {
 	traceLevel int // 0=off, 1=important only, 2=most commands, 3=everything
 	pubsub     *pubsub.Hub
 
-	// Connection tracking for graceful drain
+	// Connection tracking for graceful drain; connsMu also guards listener
 	connsMu       sync.Mutex
 	conns         map[net.Conn]struct{}
 	drainDeadline time.Time // read deadline set by DrainConnections, zero if not draining
@@ -82,25 +82,45 @@ func (s *Server) SetPubSubHub(hub *pubsub.Hub) {
 
 // Start starts the server
 func (s *Server) Start(ctx context.Context) error {
-	var err error
-	s.listener, err = net.Listen("tcp", s.addr)
+	listener, err := net.Listen("tcp", s.addr)
 	if err != nil {
 		return fmt.Errorf("failed to listen: %w", err)
+	}
+	if !s.setListener(listener) {
+		return fmt.Errorf("server is stopped")
 	}
 
 	log.Printf("Server listening on %s", s.addr)
 
-	go s.acceptLoop(ctx)
+	go s.acceptLoop(ctx, listener)
 
 	return nil
 }
 
 // ServeWithListener starts the server with an existing listener
 func (s *Server) ServeWithListener(listener net.Listener) error {
-	s.listener = listener
+	if !s.setListener(listener) {
+		return nil
+	}
 	log.Printf("Server listening on %s", listener.Addr().String())
-	s.acceptLoop(context.Background())
+	s.acceptLoop(context.Background(), listener)
 	return nil
+}
+
+// setListener records the listener so Stop and CloseListener can close it.
+// It runs on the caller's goroutine (ServeWithListener is often started with
+// go), so it takes the lock, and it refuses when Stop already ran.
+func (s *Server) setListener(listener net.Listener) bool {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	select {
+	case <-s.quit:
+		_ = listener.Close()
+		return false
+	default:
+	}
+	s.listener = listener
+	return true
 }
 
 // Close closes the server (alias for Stop)
@@ -112,10 +132,10 @@ func (s *Server) Close() {
 // active client connections, waits for handlers). Use DrainConnections for graceful
 // shutdown that lets in-flight commands complete.
 func (s *Server) Stop() {
+	s.connsMu.Lock()
 	close(s.quit)
-	if s.listener != nil {
-		_ = s.listener.Close()
-	}
+	s.connsMu.Unlock()
+	s.CloseListener()
 	if s.pubsub != nil {
 		s.pubsub.Stop()
 	}
@@ -133,6 +153,8 @@ func (s *Server) Stop() {
 // CloseListener closes the TCP listener so no new connections are accepted.
 // Existing connections remain active until drained.
 func (s *Server) CloseListener() {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
 	if s.listener != nil {
 		_ = s.listener.Close()
 	}
@@ -156,9 +178,9 @@ func (s *Server) DrainConnections(timeout time.Duration) {
 	s.wg.Wait()
 }
 
-func (s *Server) acceptLoop(ctx context.Context) {
+func (s *Server) acceptLoop(ctx context.Context, listener net.Listener) {
 	for {
-		conn, err := s.listener.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
 			// Listener closed via Stop or CloseListener — exit cleanly.
 			// Without this check, a CloseListener (which doesn't close s.quit)
