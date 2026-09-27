@@ -184,7 +184,8 @@ func scriptError(script string, err error, callErr string) error {
 		line = m[1]
 	}
 	if callErr != "" && strings.HasSuffix(msg, callErr) {
-		return fmt.Errorf("%s script: %s, on @user_script:%s.", callErr, scriptSHA1(script), line)
+		// The trailing period is part of the Redis 7 reply that clients match.
+		return fmt.Errorf("%s script: %s, on @user_script:%s.", callErr, scriptSHA1(script), line) //nolint:staticcheck // ST1005
 	}
 	return fmt.Errorf("ERR Error running script: %s", msg)
 }
