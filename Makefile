@@ -1,4 +1,4 @@
-.PHONY: build test bench docker-up docker-down test-up test-down clean docker-build deploy
+.PHONY: build test vuln bench docker-up docker-down test-up test-down clean docker-build deploy
 
 # Load local dev settings if present
 -include .dev.env
@@ -56,6 +56,10 @@ test-down:
 test: test-up
 	go test -v -tags=postgres ./tests/...
 	go test -v ./internal/...
+
+# Check dependencies and stdlib for known vulnerabilities
+vuln:
+	go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
 # Run benchmarks against PostgreSQL
 bench: test-up
