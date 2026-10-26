@@ -1,6 +1,6 @@
 module github.com/mnorrsken/postkeys
 
-go 1.25.0
+go 1.27
 
 require (
 	github.com/jackc/pgx/v5 v5.11.0

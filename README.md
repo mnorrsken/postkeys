@@ -84,7 +84,7 @@ Scripts have access to:
 
 ## Requirements
 
-- Go 1.24+
+- Go 1.27+
 - PostgreSQL 16+
 
 ## Installation
