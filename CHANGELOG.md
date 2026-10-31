@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.29.2] - 2026-10-31
+
+### Changed
+- **Dependency bumps (dependabot)** — Go modules: `github.com/prometheus/client_golang` 1.24.1 → 1.25.0 (#37), `github.com/redis/go-redis/v9` 9.22.0 → 9.23.0 (#36), `golang.org/x/text` v0.41.0 (GO-2026-6629). GitHub Actions: `docker/login-action` v4.5.2 → v4.7.0 (#38).
+- **Go 1.27 required** (README updated) and `golangci-lint` bumped to v2.15.0.
+- **`govulncheck` runs before the release tests** in `docker-publish.yml`; new `make vuln` target.
+
 ## [0.29.1] - 2026-09-27
 
 ### Fixed
