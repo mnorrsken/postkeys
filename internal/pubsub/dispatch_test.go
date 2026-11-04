@@ -350,3 +350,121 @@ func TestUnsubscribeSerializesWithInProgressDelivery(t *testing.T) {
 		})
 	}
 }
+
+// Observe detached memberships while removal is still waiting for its send;
+// this verifies other operations run with both send and unsubscribe pending.
+func awaitDetachedSubscriptions(t *testing.T, h *Hub, id uint64) {
+	t.Helper()
+	detached := make(chan struct{})
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			channels, patterns := h.GetSubscriptionCount(id)
+			if channels == 0 && patterns == 0 {
+				close(detached)
+				return
+			}
+			select {
+			case <-stop:
+				return
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}()
+	select {
+	case <-detached:
+	case <-time.After(time.Second):
+		t.Fatal("subscription removal held a global lock while waiting for client I/O")
+	}
+}
+
+func TestStalledSubscriberDoesNotBlockOtherSubscriptions(t *testing.T) {
+	for _, mode := range []string{"exact", "pattern", "remove-all"} {
+		t.Run(mode, func(t *testing.T) {
+			h := NewHub(nil, "")
+			stalled := &blockingSubscriber{entered: make(chan struct{}), release: make(chan struct{}), completed: make(chan struct{})}
+			if mode != "pattern" {
+				h.Subscribe(stalled, "route")
+			}
+			if mode != "exact" {
+				h.PSubscribe(stalled, "r*")
+			}
+			targets, _ := h.snapshotTargets(delivery{channel: "route", known: true}, 10)
+			go h.sendTarget(targets[0], delivery{channel: "route", message: "stalled"})
+			<-stalled.entered
+			released := false
+			defer func() {
+				if !released {
+					close(stalled.release)
+				}
+			}()
+			removed := make(chan struct{})
+			go func() {
+				switch mode {
+				case "exact":
+					h.Unsubscribe(stalled, "route")
+				case "pattern":
+					h.PUnsubscribe(stalled, "r*")
+				case "remove-all":
+					h.RemoveSubscriber(stalled.GetID())
+				}
+				close(removed)
+			}()
+			awaitDetachedSubscriptions(t, h, stalled.GetID())
+			select {
+			case <-removed:
+				t.Fatal("removal returned while send still pending")
+			default:
+			}
+			independent := &recordingSubscriber{id: 2, messages: make(chan receivedMessage, 4)}
+			progressed := make(chan error, 1)
+			go func() {
+				h.Subscribe(independent, "fast")
+				h.PSubscribe(independent, "f*")
+				channels, patterns := h.GetSubscriptionCount(independent.GetID())
+				if channels != 1 || patterns != 1 {
+					progressed <- fmt.Errorf("subscription counts %d,%d", channels, patterns)
+					return
+				}
+				if count := h.countSubscribers("fast"); count != 2 {
+					progressed <- fmt.Errorf("publish subscriber count %d", count)
+					return
+				}
+				routes, ok := h.snapshotTargets(delivery{channel: "fast", known: true}, 10)
+				if !ok || len(routes) != 2 {
+					progressed <- fmt.Errorf("publish routing has %d targets", len(routes))
+					return
+				}
+				for _, route := range routes {
+					h.sendTarget(route, delivery{channel: "fast", message: "independent"})
+				}
+				h.Unsubscribe(independent, "fast")
+				h.PUnsubscribe(independent, "f*")
+				progressed <- nil
+			}()
+			select {
+			case err := <-progressed:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("stalled subscriber blocked unrelated subscription or publish routing")
+			}
+			awaitMessage(t, independent, "fast", "independent")
+			awaitMessage(t, independent, "f*\x00fast", "independent")
+			select {
+			case <-removed:
+				t.Fatal("removal returned before its in-flight send completed")
+			default:
+			}
+			close(stalled.release)
+			released = true
+			select {
+			case <-removed:
+			case <-time.After(time.Second):
+				t.Fatal("removal did not finish after send released")
+			}
+		})
+	}
+}

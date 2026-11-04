@@ -154,7 +154,22 @@ type Subscriber interface {
 
 // subscription is an identity token for one active subscription generation.
 // Removing and adding the same client/channel must never revive queued routes.
-type subscription struct{ Subscriber }
+type subscription struct {
+	Subscriber
+	mu     sync.RWMutex
+	active bool
+}
+
+// invalidateSubscriptions waits for prior sends outside the hub's map locks.
+// Each removed generation owns its gate, so a concurrent re-subscription's new
+// token remains active and unrelated clients never wait behind this I/O.
+func invalidateSubscriptions(removed []*subscription) {
+	for _, sub := range removed {
+		sub.mu.Lock()
+		sub.active = false
+		sub.mu.Unlock()
+	}
+}
 
 // Hub manages pub/sub subscriptions and message routing
 type Hub struct {
@@ -282,7 +297,7 @@ func (h *Hub) Subscribe(sub Subscriber, channels ...string) []int {
 
 		// Add subscriber to channel
 		if _, exists := h.subscriptions[channel][subID]; !exists {
-			h.subscriptions[channel][subID] = &subscription{Subscriber: sub}
+			h.subscriptions[channel][subID] = &subscription{Subscriber: sub, active: true}
 		}
 		h.subscribers[subID][channel] = true
 
@@ -297,7 +312,7 @@ func (h *Hub) Subscribe(sub Subscriber, channels ...string) []int {
 // If no channels specified, unsubscribes from all
 func (h *Hub) Unsubscribe(sub Subscriber, channels ...string) []int {
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	var removed []*subscription
 
 	subID := sub.GetID()
 
@@ -316,6 +331,9 @@ func (h *Hub) Unsubscribe(sub Subscriber, channels ...string) []int {
 	for i, channel := range channels {
 		// Remove from channel's subscriber set
 		if subs, exists := h.subscriptions[channel]; exists {
+			if token := subs[subID]; token != nil {
+				removed = append(removed, token)
+			}
 			delete(subs, subID)
 			if len(subs) == 0 {
 				delete(h.subscriptions, channel)
@@ -332,6 +350,8 @@ func (h *Hub) Unsubscribe(sub Subscriber, channels ...string) []int {
 		}
 	}
 
+	h.mu.Unlock()
+	invalidateSubscriptions(removed)
 	return counts
 }
 
@@ -356,7 +376,7 @@ func (h *Hub) PSubscribe(sub Subscriber, patterns ...string) []int {
 
 		// Add subscriber to pattern
 		if _, exists := h.patterns[pattern][subID]; !exists {
-			h.patterns[pattern][subID] = &subscription{Subscriber: sub}
+			h.patterns[pattern][subID] = &subscription{Subscriber: sub, active: true}
 		}
 		h.subPatterns[subID][pattern] = true
 
@@ -370,7 +390,7 @@ func (h *Hub) PSubscribe(sub Subscriber, patterns ...string) []int {
 // PUnsubscribe removes a subscriber from pattern subscriptions
 func (h *Hub) PUnsubscribe(sub Subscriber, patterns ...string) []int {
 	h.patternMu.Lock()
-	defer h.patternMu.Unlock()
+	var removed []*subscription
 
 	subID := sub.GetID()
 
@@ -389,6 +409,9 @@ func (h *Hub) PUnsubscribe(sub Subscriber, patterns ...string) []int {
 	for i, pattern := range patterns {
 		// Remove from pattern's subscriber set
 		if subs, exists := h.patterns[pattern]; exists {
+			if token := subs[subID]; token != nil {
+				removed = append(removed, token)
+			}
 			delete(subs, subID)
 			if len(subs) == 0 {
 				delete(h.patterns, pattern)
@@ -405,6 +428,8 @@ func (h *Hub) PUnsubscribe(sub Subscriber, patterns ...string) []int {
 		}
 	}
 
+	h.patternMu.Unlock()
+	invalidateSubscriptions(removed)
 	return counts
 }
 
@@ -515,11 +540,15 @@ func (h *Hub) GetSubscribedPatterns(subID uint64) []string {
 
 // RemoveSubscriber removes a subscriber from all subscriptions
 func (h *Hub) RemoveSubscriber(subID uint64) {
+	var removed []*subscription
 	// Remove from channel subscriptions
 	h.mu.Lock()
 	if channels, exists := h.subscribers[subID]; exists {
 		for channel := range channels {
 			if subs, ok := h.subscriptions[channel]; ok {
+				if token := subs[subID]; token != nil {
+					removed = append(removed, token)
+				}
 				delete(subs, subID)
 				if len(subs) == 0 {
 					delete(h.subscriptions, channel)
@@ -535,6 +564,9 @@ func (h *Hub) RemoveSubscriber(subID uint64) {
 	if patterns, exists := h.subPatterns[subID]; exists {
 		for pattern := range patterns {
 			if subs, ok := h.patterns[pattern]; ok {
+				if token := subs[subID]; token != nil {
+					removed = append(removed, token)
+				}
 				delete(subs, subID)
 				if len(subs) == 0 {
 					delete(h.patterns, pattern)
@@ -544,6 +576,7 @@ func (h *Hub) RemoveSubscriber(subID uint64) {
 		delete(h.subPatterns, subID)
 	}
 	h.patternMu.Unlock()
+	invalidateSubscriptions(removed)
 }
 
 // listenLoop continuously waits for PostgreSQL notifications on the broadcast channel.

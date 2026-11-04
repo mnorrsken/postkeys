@@ -328,3 +328,69 @@ func TestUninterestedReferencesNeverReadMessageBody(t *testing.T) {
 	notifyTestPayload(t, sender, marker)
 	awaitMessage(t, sub, "never:*\x00never:marker", "channel mismatch released")
 }
+
+func TestStalledSubscriberDoesNotBlockPublish(t *testing.T) {
+	for _, pattern := range []bool{false, true} {
+		t.Run(fmt.Sprintf("pattern=%t", pattern), func(t *testing.T) {
+			pool, connStr := testPubSubPool(t, nil)
+			h := NewHub(pool, connStr)
+			stalled := &blockingSubscriber{entered: make(chan struct{}), release: make(chan struct{}), completed: make(chan struct{})}
+			if pattern {
+				h.PSubscribe(stalled, "r*")
+			} else {
+				h.Subscribe(stalled, "route")
+			}
+			targets, _ := h.snapshotTargets(delivery{channel: "route", known: true}, 10)
+			go h.sendTarget(targets[0], delivery{channel: "route", message: "stalled"})
+			<-stalled.entered
+			released := false
+			defer func() {
+				if !released {
+					close(stalled.release)
+				}
+			}()
+			removed := make(chan struct{})
+			go func() {
+				if pattern {
+					h.PUnsubscribe(stalled, "r*")
+				} else {
+					h.Unsubscribe(stalled, "route")
+				}
+				close(removed)
+			}()
+			awaitDetachedSubscriptions(t, h, stalled.GetID())
+			select {
+			case <-removed:
+				t.Fatal("removal returned while send still pending")
+			default:
+			}
+			independent := &recordingSubscriber{id: 2, messages: make(chan receivedMessage, 2)}
+			published := make(chan error, 1)
+			go func() {
+				h.Subscribe(independent, "fast")
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				count, err := h.Publish(ctx, "fast", "independent")
+				if err == nil && count != 1 {
+					err = fmt.Errorf("publish subscriber count %d", count)
+				}
+				published <- err
+			}()
+			select {
+			case err := <-published:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("PUBLISH waited on an unrelated client's writer")
+			}
+			close(stalled.release)
+			released = true
+			select {
+			case <-removed:
+			case <-time.After(time.Second):
+				t.Fatal("unsubscribe did not finish after send released")
+			}
+		})
+	}
+}

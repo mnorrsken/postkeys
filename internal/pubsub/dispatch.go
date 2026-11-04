@@ -25,7 +25,6 @@ type delivery struct {
 }
 type deliveryTarget struct {
 	sub       *subscription
-	channel   string
 	pattern   string
 	isPattern bool
 }
@@ -79,7 +78,7 @@ func (h *Hub) snapshotTargets(item delivery, limit int) ([]deliveryTarget, bool)
 	h.mu.RLock()
 	if item.known {
 		for _, sub := range h.subscriptions[item.channel] {
-			if !appendTarget(deliveryTarget{sub: sub, channel: item.channel}) {
+			if !appendTarget(deliveryTarget{sub: sub}) {
 				h.mu.RUnlock()
 				return nil, false
 			}
@@ -90,7 +89,7 @@ func (h *Hub) snapshotTargets(item delivery, limit int) ([]deliveryTarget, bool)
 				continue
 			}
 			for _, sub := range subs {
-				if !appendTarget(deliveryTarget{sub: sub, channel: channel}) {
+				if !appendTarget(deliveryTarget{sub: sub}) {
 					h.mu.RUnlock()
 					return nil, false
 				}
@@ -116,21 +115,13 @@ func (h *Hub) sendTarget(target deliveryTarget, item delivery) {
 	if item.skip || !target.matches(item.channel) {
 		return
 	}
-	// Keep subscription validity and the write in the same critical section.
-	// Unsubscribe must not return and acknowledge removal while a stale route
-	// can still begin writing to a connection that has left pub/sub mode.
-	if target.isPattern {
-		h.patternMu.RLock()
-		defer h.patternMu.RUnlock()
-		if h.patterns[target.pattern][target.sub.GetID()] != target.sub {
-			return
-		}
-	} else {
-		h.mu.RLock()
-		defer h.mu.RUnlock()
-		if h.subscriptions[target.channel][target.sub.GetID()] != target.sub {
-			return
-		}
+	// Serialize validity and the send only on this subscription generation.
+	// Removal waits on the same token after releasing all global map locks,
+	// preserving the acknowledgement boundary without blocking unrelated clients.
+	target.sub.mu.RLock()
+	defer target.sub.mu.RUnlock()
+	if !target.sub.active {
+		return
 	}
 	kind, channel := "message", item.channel
 	if target.isPattern {
