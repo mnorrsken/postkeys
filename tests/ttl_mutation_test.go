@@ -13,15 +13,22 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-func TestMutationPreservesTTL(t *testing.T) {
-	ts := newTestServer(t, "")
-	defer ts.Close()
+func mutationTestConn(t *testing.T) *pgx.Conn {
+	t.Helper()
 	ctx := context.Background()
 	conn, err := pgx.Connect(ctx, fmt.Sprintf("postgres://%s:%s@%s:5789/%s?sslmode=%s", getEnvOrDefault("PG_USER", "postgres"), getEnvOrDefault("PG_PASSWORD", "testingpassword"), getEnvOrDefault("PG_HOST", "localhost"), getEnvOrDefault("PG_DATABASE", "postgres"), getEnvOrDefault("PG_SSLMODE", "disable")))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close(ctx)
+	t.Cleanup(func() { conn.Close(ctx) })
+	return conn
+}
+
+func TestMutationPreservesTTL(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+	conn := mutationTestConn(t)
 	ref := redis.NewClient(&redis.Options{Addr: getEnvOrDefault("REDIS_ADDR", "localhost:6399")})
 	defer ref.Close()
 	if err := ref.Ping(ctx).Err(); err != nil {
@@ -45,6 +52,9 @@ func TestMutationPreservesTTL(t *testing.T) {
 		{"hincrbyfloat", []interface{}{"HSET", "k", "a", "1"}, []interface{}{"HINCRBYFLOAT", "k", "b", "2.1"}},
 		{"lpush", []interface{}{"LPUSH", "k", "a"}, []interface{}{"LPUSH", "k", "b"}},
 		{"rpush", []interface{}{"RPUSH", "k", "a"}, []interface{}{"RPUSH", "k", "b"}},
+		{"linsert-before", []interface{}{"RPUSH", "k", "a"}, []interface{}{"LINSERT", "k", "BEFORE", "a", "b"}},
+		{"linsert-after", []interface{}{"RPUSH", "k", "a"}, []interface{}{"LINSERT", "k", "AFTER", "a", "b"}},
+		{"rpoplpush", []interface{}{"RPUSH", "k", "a"}, []interface{}{"RPOPLPUSH", "k", "k"}},
 		{"sadd", []interface{}{"SADD", "k", "a"}, []interface{}{"SADD", "k", "b"}},
 		{"zadd", []interface{}{"ZADD", "k", 1, "a"}, []interface{}{"ZADD", "k", 2, "b"}},
 		{"zincrby", []interface{}{"ZADD", "k", 1, "a"}, []interface{}{"ZINCRBY", "k", 2, "b"}},
@@ -60,7 +70,7 @@ func TestMutationPreservesTTL(t *testing.T) {
 			if err := ref.Do(ctx, tc.setup...).Err(); err != nil {
 				t.Fatal(err)
 			}
-			if err := ref.PExpire(ctx, "k", time.Second).Err(); err != nil {
+			if err := ref.PExpire(ctx, "k", time.Minute).Err(); err != nil {
 				t.Fatal(err)
 			}
 			want := ref.Do(ctx, tc.mutate...)
@@ -73,7 +83,7 @@ func TestMutationPreservesTTL(t *testing.T) {
 			if err := c.Do(ctx, tc.setup...).Err(); err != nil {
 				t.Fatal(err)
 			}
-			if err := c.PExpire(ctx, "k", time.Second).Err(); err != nil {
+			if err := c.PExpire(ctx, "k", time.Minute).Err(); err != nil {
 				t.Fatal(err)
 			}
 			var before time.Time
@@ -87,7 +97,7 @@ func TestMutationPreservesTTL(t *testing.T) {
 			if fmt.Sprint(got.Val()) != fmt.Sprint(want.Val()) {
 				t.Fatalf("result = %v; Redis = %v", got.Val(), want.Val())
 			}
-			if ttl := ref.PTTL(ctx, "k").Val(); ttl <= 0 || ttl > time.Second {
+			if ttl := ref.PTTL(ctx, "k").Val(); ttl <= 0 || ttl > time.Minute {
 				t.Fatalf("Redis TTL = %v", ttl)
 			}
 			var after time.Time
@@ -98,7 +108,7 @@ func TestMutationPreservesTTL(t *testing.T) {
 				t.Fatalf("deadline changed from %v to %v", before, after)
 			}
 			// Every physical row must carry the same deadline as metadata.
-			table := map[string]string{"hset": "kv_hashes", "hsetnx": "kv_hashes", "hincrby": "kv_hashes", "hincrbyfloat": "kv_hashes", "lpush": "kv_lists", "rpush": "kv_lists", "sadd": "kv_sets", "zadd": "kv_zsets", "zincrby": "kv_zsets", "pfadd": "kv_hyperloglog", "pfmerge": "kv_hyperloglog"}[tc.name]
+			table := map[string]string{"hset": "kv_hashes", "hsetnx": "kv_hashes", "hincrby": "kv_hashes", "hincrbyfloat": "kv_hashes", "lpush": "kv_lists", "rpush": "kv_lists", "linsert-before": "kv_lists", "linsert-after": "kv_lists", "rpoplpush": "kv_lists", "sadd": "kv_sets", "zadd": "kv_zsets", "zincrby": "kv_zsets", "pfadd": "kv_hyperloglog", "pfmerge": "kv_hyperloglog"}[tc.name]
 			if table != "" {
 				var mismatches int
 				if err := conn.QueryRow(ctx, "SELECT count(*) FROM "+table+" d JOIN kv_meta m ON d.key=m.key WHERE d.key=$1 AND d.expires_at IS DISTINCT FROM m.expires_at", "k").Scan(&mismatches); err != nil {
@@ -109,11 +119,27 @@ func TestMutationPreservesTTL(t *testing.T) {
 				}
 			}
 			ttl := c.PTTL(ctx, "k").Val()
-			if ttl <= 0 || ttl > time.Second {
+			if ttl <= 0 || ttl > time.Minute {
 				t.Fatalf("TTL = %v", ttl)
 			}
-			// Expiring the key must hide every newly added collection row as well.
-			time.Sleep(1100 * time.Millisecond)
+			// Advance metadata and data deadlines together. Holding the advisory
+			// lock blocks cleanup until commit; readers must hide rows immediately.
+			tx, err := conn.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext('k'))"); err != nil {
+				t.Fatal(err)
+			}
+			for _, tab := range []string{"kv_meta", "kv_strings", "kv_hashes", "kv_lists", "kv_sets", "kv_zsets", "kv_hyperloglog"} {
+				if _, err := tx.Exec(ctx, "UPDATE "+tab+" SET expires_at=NOW()-interval '1 minute' WHERE key='k'"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
 			if n, err := c.Exists(ctx, "k").Result(); err != nil {
 				t.Fatal(err)
 			} else if n != 0 {
@@ -126,7 +152,7 @@ func TestMutationPreservesTTL(t *testing.T) {
 				} else if n != 0 {
 					t.Fatalf("hash rows survived: %d", n)
 				}
-			case "lpush", "rpush":
+			case "lpush", "rpush", "linsert-before", "linsert-after", "rpoplpush":
 				if n, err := c.LLen(ctx, "k").Result(); err != nil {
 					t.Fatal(err)
 				} else if n != 0 {
@@ -233,11 +259,7 @@ func TestMutationRecreatesPhysicallyRetainedExpiredKey(t *testing.T) {
 	ts := newTestServer(t, "")
 	defer ts.Close()
 	ctx := context.Background()
-	conn, err := pgx.Connect(ctx, fmt.Sprintf("postgres://%s:%s@%s:5789/%s?sslmode=%s", getEnvOrDefault("PG_USER", "postgres"), getEnvOrDefault("PG_PASSWORD", "testingpassword"), getEnvOrDefault("PG_HOST", "localhost"), getEnvOrDefault("PG_DATABASE", "postgres"), getEnvOrDefault("PG_SSLMODE", "disable")))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close(ctx)
+	conn := mutationTestConn(t)
 	for _, tc := range []struct {
 		setup, mutation []interface{}
 		result          string
@@ -296,6 +318,22 @@ func TestMutationAfterRemovingLastMember(t *testing.T) {
 			if err := c.Do(ctx, tc.remove...).Err(); err != nil {
 				t.Fatal(err)
 			}
+			for _, check := range []struct {
+				cmd  []interface{}
+				want string
+			}{
+				{[]interface{}{"EXISTS", "ghost"}, "0"},
+				{[]interface{}{"TYPE", "ghost"}, "none"},
+				{[]interface{}{"PTTL", "ghost"}, "-2"},
+			} {
+				got, err := c.Do(ctx, check.cmd...).Result()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if fmt.Sprint(got) != check.want {
+					t.Fatalf("%v = %v; want %s", check.cmd, got, check.want)
+				}
+			}
 			if err := c.Do(ctx, tc.recreate...).Err(); err != nil {
 				t.Fatal(err)
 			}
@@ -303,5 +341,188 @@ func TestMutationAfterRemovingLastMember(t *testing.T) {
 				t.Fatalf("recreated TTL = %v", ttl)
 			}
 		})
+	}
+}
+
+func TestHyperLogLogRenameAndExpiry(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+	for _, c := range []*redis.Client{ts.client, redis.NewClient(&redis.Options{Addr: getEnvOrDefault("REDIS_ADDR", "localhost:6399")})} {
+		if c != ts.client {
+			defer c.Close()
+		}
+		if err := c.Del(ctx, "hll-from", "hll-to").Err(); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.PFAdd(ctx, "hll-from", "a", "b").Err(); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.PExpire(ctx, "hll-from", time.Minute).Err(); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Rename(ctx, "hll-from", "hll-to").Err(); err != nil {
+			t.Fatal(err)
+		}
+		if n, err := c.PFCount(ctx, "hll-to").Result(); err != nil || n != 2 {
+			t.Fatalf("PFCOUNT after RENAME = %d, %v", n, err)
+		}
+		if ttl, err := c.PTTL(ctx, "hll-to").Result(); err != nil || ttl <= 0 {
+			t.Fatalf("renamed TTL = %v, %v", ttl, err)
+		}
+		if err := c.PExpire(ctx, "hll-to", 50*time.Millisecond).Err(); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(70 * time.Millisecond)
+		if n, err := c.PFCount(ctx, "hll-to").Result(); err != nil || n != 0 {
+			t.Fatalf("PFCOUNT after expiry = %d, %v", n, err)
+		}
+	}
+}
+
+func TestCollectionRemovalMetadataAndConcurrentWriter(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+	cases := []struct{ setup, remove, write []interface{} }{
+		{[]interface{}{"HSET", "g", "a", 1}, []interface{}{"HDEL", "g", "a"}, []interface{}{"HSET", "g", "b", 2}},
+		{[]interface{}{"SADD", "g", "a"}, []interface{}{"SREM", "g", "a"}, []interface{}{"SADD", "g", "b"}},
+		{[]interface{}{"RPUSH", "g", "a"}, []interface{}{"LPOP", "g"}, []interface{}{"RPUSH", "g", "b"}},
+		{[]interface{}{"RPUSH", "g", "a"}, []interface{}{"RPOP", "g"}, []interface{}{"RPUSH", "g", "b"}},
+		{[]interface{}{"RPUSH", "g", "a"}, []interface{}{"LREM", "g", 0, "a"}, []interface{}{"RPUSH", "g", "b"}},
+		{[]interface{}{"RPUSH", "g", "a"}, []interface{}{"LREM", "g", 1, "a"}, []interface{}{"RPUSH", "g", "b"}},
+		{[]interface{}{"RPUSH", "g", "a"}, []interface{}{"LTRIM", "g", 1, 0}, []interface{}{"RPUSH", "g", "b"}},
+		{[]interface{}{"RPUSH", "g", "a"}, []interface{}{"LMPOP", 1, "g", "LEFT"}, []interface{}{"RPUSH", "g", "b"}},
+		{[]interface{}{"RPUSH", "g", "a"}, []interface{}{"RPOPLPUSH", "g", "g-dst"}, []interface{}{"RPUSH", "g", "b"}},
+		{[]interface{}{"ZADD", "g", 1, "a"}, []interface{}{"ZREM", "g", "a"}, []interface{}{"ZADD", "g", 2, "b"}},
+		{[]interface{}{"ZADD", "g", 1, "a"}, []interface{}{"ZREMRANGEBYSCORE", "g", 0, 2}, []interface{}{"ZADD", "g", 2, "b"}},
+		{[]interface{}{"ZADD", "g", 1, "a"}, []interface{}{"ZREMRANGEBYRANK", "g", 0, -1}, []interface{}{"ZADD", "g", 2, "b"}},
+		{[]interface{}{"ZADD", "g", 1, "a"}, []interface{}{"ZPOPMIN", "g"}, []interface{}{"ZADD", "g", 2, "b"}},
+		{[]interface{}{"ZADD", "g", 1, "a"}, []interface{}{"ZPOPMAX", "g"}, []interface{}{"ZADD", "g", 2, "b"}},
+		{[]interface{}{"ZADD", "g", 1, "a"}, []interface{}{"ZMPOP", 1, "g", "MIN"}, []interface{}{"ZADD", "g", 2, "b"}},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprint(tc.remove), func(t *testing.T) {
+			c := ts.client
+			rounds := 6
+			// These commands can legitimately remove a concurrent new member.
+			if tc.remove[0] == "LTRIM" || tc.remove[0] == "ZREMRANGEBYSCORE" || tc.remove[0] == "ZREMRANGEBYRANK" {
+				rounds = 1
+			}
+			for round := 0; round < rounds; round++ {
+				if err := c.Del(ctx, "g", "g-dst").Err(); err != nil {
+					t.Fatal(err)
+				}
+				if err := c.Do(ctx, tc.setup...).Err(); err != nil {
+					t.Fatal(err)
+				}
+				if round == 0 {
+					if err := c.Do(ctx, tc.remove...).Err(); err != nil {
+						t.Fatal(err)
+					}
+					for _, check := range []struct {
+						cmd  []interface{}
+						want string
+					}{
+						{[]interface{}{"EXISTS", "g"}, "0"}, {[]interface{}{"TYPE", "g"}, "none"}, {[]interface{}{"PTTL", "g"}, "-2"},
+					} {
+						got, err := c.Do(ctx, check.cmd...).Result()
+						if err != nil || fmt.Sprint(got) != check.want {
+							t.Fatalf("%v=%v,%v", check.cmd, got, err)
+						}
+					}
+				} else {
+					errs := make(chan error, 2)
+					go func() { errs <- c.Do(ctx, tc.remove...).Err() }()
+					go func() { errs <- c.Do(ctx, tc.write...).Err() }()
+					for i := 0; i < 2; i++ {
+						if err := <-errs; err != nil {
+							t.Fatal(err)
+						}
+					}
+					if n, err := c.Exists(ctx, "g").Result(); err != nil || n != 1 {
+						t.Fatalf("concurrent writer key vanished: %d,%v", n, err)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestMutationRepairsLegacyEmptyMetadata(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+	conn := mutationTestConn(t)
+	if _, err := conn.Exec(ctx, "INSERT INTO kv_meta(key,key_type,expires_at) VALUES ('legacy-ghost','hash',NOW()+interval '1 hour')"); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := ts.client.Incr(ctx, "legacy-ghost").Result(); err != nil || n != 1 {
+		t.Fatalf("legacy recreation = %d,%v", n, err)
+	}
+	if ttl, err := ts.client.PTTL(ctx, "legacy-ghost").Result(); err != nil || ttl != -1 {
+		t.Fatalf("legacy recreation TTL = %v,%v", ttl, err)
+	}
+	// Older versions could leave expired rows beside newly inserted live rows.
+	if err := ts.client.HSet(ctx, "mixed-legacy", "old", "1", "live", "2").Err(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "UPDATE kv_hashes SET expires_at=NOW()-interval '1 minute' WHERE key='mixed-legacy' AND field='old'"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ts.client.HDel(ctx, "mixed-legacy", "live").Err(); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := ts.client.Exists(ctx, "mixed-legacy").Result(); err != nil || n != 0 {
+		t.Fatalf("legacy metadata survived last live member: %d,%v", n, err)
+	}
+	var retained int
+	if err := conn.QueryRow(ctx, "SELECT count(*) FROM kv_hashes WHERE key='mixed-legacy'").Scan(&retained); err != nil {
+		t.Fatal(err)
+	}
+	if retained != 0 {
+		t.Fatalf("%d orphaned expired rows", retained)
+	}
+
+}
+
+func TestListMoveDestinationPreservesTTL(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+	conn := mutationTestConn(t)
+	c := ts.client
+	if err := c.RPush(ctx, "move-src", "new").Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RPush(ctx, "move-dst", "old").Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PExpire(ctx, "move-dst", time.Minute).Err(); err != nil {
+		t.Fatal(err)
+	}
+	var before time.Time
+	if err := conn.QueryRow(ctx, "SELECT expires_at FROM kv_meta WHERE key='move-dst'").Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := c.RPopLPush(ctx, "move-src", "move-dst").Result(); err != nil || got != "new" {
+		t.Fatalf("move=%v,%v", got, err)
+	}
+	var after time.Time
+	var mismatches int
+	if err := conn.QueryRow(ctx, "SELECT expires_at FROM kv_meta WHERE key='move-dst'").Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if !before.Equal(after) {
+		t.Fatalf("move changed destination expiry: %v -> %v", before, after)
+	}
+	if err := conn.QueryRow(ctx, "SELECT count(*) FROM kv_lists WHERE key='move-dst' AND expires_at IS DISTINCT FROM $1", before).Scan(&mismatches); err != nil {
+		t.Fatal(err)
+	}
+	if mismatches != 0 {
+		t.Fatalf("%d moved rows lost expiry", mismatches)
+	}
+	if n, err := c.Exists(ctx, "move-src").Result(); err != nil || n != 0 {
+		t.Fatalf("source metadata survived: %d,%v", n, err)
 	}
 }

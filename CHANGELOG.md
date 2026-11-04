@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Fixed
+- In-place string, hash, list, set, sorted-set and HyperLogLog mutations retain the original absolute expiry, including `LINSERT` and `RPOPLPUSH` destinations.
+- Collection removals delete metadata atomically when their final member disappears, so `EXISTS`, `TYPE` and `TTL` immediately report a missing key. New writes also recover legacy empty metadata.
+- `RENAME` supports HyperLogLog keys and `EXPIRE`/`EXPIREAT` expire their data rows.
+- `INCR`/`DECR` variants and `ZINCRBY` reject keys of another type with `WRONGTYPE`; empty `SETRANGE` leaves a missing key absent.
+
 ## [0.29.2] - 2026-10-31
 
 ### Changed

@@ -667,7 +667,13 @@ func (s *Store) HSet(ctx context.Context, key string, fields map[string]string) 
 }
 
 func (s *Store) HDel(ctx context.Context, key string, fields []string) (int64, error) {
-	return s.ops.hDel(ctx, s.querier(), key, fields)
+	var result int64
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		result, err = s.ops.hDel(ctx, s.txQuerier(tx), key, fields)
+		return err
+	})
+	return result, err
 }
 
 func (s *Store) HGetAll(ctx context.Context, key string) (map[string]string, error) {
@@ -863,7 +869,13 @@ func (s *Store) SAdd(ctx context.Context, key string, members []string) (int64, 
 }
 
 func (s *Store) SRem(ctx context.Context, key string, members []string) (int64, error) {
-	return s.ops.sRem(ctx, s.querier(), key, members)
+	var result int64
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		result, err = s.ops.sRem(ctx, s.txQuerier(tx), key, members)
+		return err
+	})
+	return result, err
 }
 
 func (s *Store) SMembers(ctx context.Context, key string) ([]string, error) {
@@ -961,7 +973,13 @@ func (s *Store) ZScore(ctx context.Context, key, member string) (float64, bool, 
 }
 
 func (s *Store) ZRem(ctx context.Context, key string, members []string) (int64, error) {
-	return s.ops.zRem(ctx, s.querier(), key, members)
+	var result int64
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		result, err = s.ops.zRem(ctx, s.txQuerier(tx), key, members)
+		return err
+	})
+	return result, err
 }
 
 func (s *Store) ZCard(ctx context.Context, key string) (int64, error) {
@@ -1003,7 +1021,13 @@ func (s *Store) ZRangeStore(ctx context.Context, dst, src string, spec ZRangeSto
 }
 
 func (s *Store) ZRemRangeByScore(ctx context.Context, key string, min, max float64) (int64, error) {
-	return s.ops.zRemRangeByScore(ctx, s.querier(), key, min, max)
+	var result int64
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		result, err = s.ops.zRemRangeByScore(ctx, s.txQuerier(tx), key, min, max)
+		return err
+	})
+	return result, err
 }
 
 func (s *Store) ZRemRangeByRank(ctx context.Context, key string, start, stop int64) (int64, error) {
@@ -1083,7 +1107,13 @@ func (s *Store) ZInterStore(ctx context.Context, destination string, keys []stri
 }
 
 func (s *Store) LRem(ctx context.Context, key string, count int64, element string) (int64, error) {
-	return s.ops.lRem(ctx, s.querier(), key, count, element)
+	var result int64
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		result, err = s.ops.lRem(ctx, s.txQuerier(tx), key, count, element)
+		return err
+	})
+	return result, err
 }
 
 func (s *Store) LTrim(ctx context.Context, key string, start, stop int64) error {

@@ -185,6 +185,11 @@ func (o queryOps) setMeta(ctx context.Context, q Querier, key string, keyType Ke
 	if err := o.lockKey(ctx, q, key); err != nil {
 		return err
 	}
+	return o.setMetaLocked(ctx, q, key, keyType, expiresAt)
+}
+
+// setMetaLocked requires the caller to hold the key advisory lock.
+func (o queryOps) setMetaLocked(ctx context.Context, q Querier, key string, keyType KeyType, expiresAt *time.Time) error {
 	_, err := q.Exec(ctx,
 		`INSERT INTO kv_meta (key, key_type, expires_at) VALUES ($1, $2, $3)
 		 ON CONFLICT (key) DO UPDATE SET key_type = $2, expires_at = $3`,
@@ -202,40 +207,51 @@ func (o queryOps) prepareMutation(ctx context.Context, q Querier, key string, ex
 	}
 	var kind string
 	var expiry *time.Time
-	var expired bool
-	err := q.QueryRow(ctx, `SELECT key_type, expires_at, expires_at IS NOT NULL AND expires_at <= NOW() FROM kv_meta WHERE key = $1`, key).Scan(&kind, &expiry, &expired)
+	var expired, empty bool
+	// This statement must follow lockKey: READ COMMITTED takes a snapshot at
+	// statement start, before an advisory lock in the same statement can wait.
+	err := q.QueryRow(ctx, `SELECT key_type, expires_at,
+		expires_at IS NOT NULL AND expires_at <= NOW(),
+		CASE key_type
+		 WHEN 'hash' THEN NOT EXISTS (SELECT 1 FROM kv_hashes WHERE key=$1 AND (expires_at IS NULL OR expires_at > NOW()))
+		 WHEN 'list' THEN NOT EXISTS (SELECT 1 FROM kv_lists WHERE key=$1 AND (expires_at IS NULL OR expires_at > NOW()))
+		 WHEN 'set' THEN NOT EXISTS (SELECT 1 FROM kv_sets WHERE key=$1 AND (expires_at IS NULL OR expires_at > NOW()))
+		 WHEN 'zset' THEN NOT EXISTS (SELECT 1 FROM kv_zsets WHERE key=$1 AND (expires_at IS NULL OR expires_at > NOW()))
+		 ELSE false END
+		FROM kv_meta WHERE key=$1`, key).Scan(&kind, &expiry, &expired, &empty)
 	if err == pgx.ErrNoRows {
 		return TypeNone, nil, nil
 	}
 	if err != nil {
 		return TypeNone, nil, err
 	}
-	if expired {
+	// Keep legacy ghost recovery for databases written by earlier versions.
+	if expired || empty {
 		if err := o.deleteKeyFromAllTables(ctx, q, key); err != nil {
 			return TypeNone, nil, err
 		}
 		return TypeNone, nil, nil
 	}
-	// Removing a collection's final member can leave metadata behind. Such a
-	// key is missing to Redis, so recreation must not inherit its type or TTL.
-	switch KeyType(kind) {
-	case TypeHash, TypeList, TypeSet, TypeZSet:
-		table := dataTableForType(KeyType(kind))
-		var exists bool
-		if err := q.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM "+table+" WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW()))", key).Scan(&exists); err != nil {
-			return TypeNone, nil, err
-		}
-		if !exists {
-			if err := o.deleteKeyFromAllTables(ctx, q, key); err != nil {
-				return TypeNone, nil, err
-			}
-			return TypeNone, nil, nil
-		}
-	}
 	if KeyType(kind) != expected {
 		return TypeNone, nil, errWrongType
 	}
 	return KeyType(kind), expiry, nil
+}
+
+// removeEmptyMeta runs after a collection removal while holding every key lock.
+// This separate statement sees the preceding deletion. Legacy expired rows are
+// removed with metadata too, so recreation cannot collide with orphaned rows.
+func (o queryOps) removeEmptyMeta(ctx context.Context, q Querier, keys []string, kind KeyType) error {
+	table := dataTableForType(kind)
+	_, err := q.Exec(ctx, `WITH empty_keys AS MATERIALIZED (
+		SELECT key FROM kv_meta m WHERE key = ANY($1::text[]) AND key_type=$2
+		AND NOT EXISTS (SELECT 1 FROM `+table+` d WHERE d.key=m.key
+		  AND (d.expires_at IS NULL OR d.expires_at > NOW()))
+	), removed_data AS (
+		DELETE FROM `+table+` WHERE key IN (SELECT key FROM empty_keys)
+	)
+	DELETE FROM kv_meta WHERE key IN (SELECT key FROM empty_keys)`, keys, string(kind))
+	return err
 }
 
 // setMetaBatch sets metadata for multiple keys at once
@@ -481,7 +497,7 @@ func (o queryOps) incr(ctx context.Context, q Querier, key string, delta int64) 
 
 	result := current + delta
 
-	if err := o.setMeta(ctx, q, key, TypeString, expiresAt); err != nil {
+	if err := o.setMetaLocked(ctx, q, key, TypeString, expiresAt); err != nil {
 		return 0, err
 	}
 
@@ -504,7 +520,7 @@ func (o queryOps) appendStr(ctx context.Context, q Querier, key, value string) (
 		return 0, err
 	}
 
-	if err := o.setMeta(ctx, q, key, TypeString, expiresAt); err != nil {
+	if err := o.setMetaLocked(ctx, q, key, TypeString, expiresAt); err != nil {
 		return 0, err
 	}
 
@@ -602,7 +618,7 @@ func (o queryOps) setRange(ctx context.Context, q Querier, key string, offset in
 	copy(existing[offset:], value)
 
 	// Set meta before data table for consistent lock ordering (kv_meta before kv_strings).
-	if err := o.setMeta(ctx, q, key, TypeString, expiresAt); err != nil {
+	if err := o.setMetaLocked(ctx, q, key, TypeString, expiresAt); err != nil {
 		return 0, err
 	}
 
@@ -712,7 +728,7 @@ func (o queryOps) bitField(ctx context.Context, q Querier, key string, ops []Bit
 	}
 
 	if modified {
-		if err := o.setMeta(ctx, q, key, TypeString, expiresAt); err != nil {
+		if err := o.setMetaLocked(ctx, q, key, TypeString, expiresAt); err != nil {
 			return nil, err
 		}
 
@@ -980,7 +996,7 @@ func (o queryOps) incrByFloat(ctx context.Context, q Querier, key string, delta 
 	valueStr := strconv.FormatFloat(newValue, 'f', -1, 64)
 
 	// Set meta before data table for consistent lock ordering (kv_meta before kv_strings).
-	if err := o.setMeta(ctx, q, key, TypeString, expiresAt); err != nil {
+	if err := o.setMetaLocked(ctx, q, key, TypeString, expiresAt); err != nil {
 		return 0, err
 	}
 
@@ -1293,7 +1309,7 @@ func (o queryOps) hSet(ctx context.Context, q Querier, key string, fields map[st
 	}
 
 	// Set metadata before data table for consistent lock ordering (kv_meta before kv_hashes).
-	if err := o.setMeta(ctx, q, key, TypeHash, expiresAt); err != nil {
+	if err := o.setMetaLocked(ctx, q, key, TypeHash, expiresAt); err != nil {
 		return 0, err
 	}
 
@@ -1312,8 +1328,16 @@ func (o queryOps) hSet(ctx context.Context, q Querier, key string, fields map[st
 	return int64(len(fields)) - existingCount, nil
 }
 
-func (o queryOps) hDel(ctx context.Context, q Querier, key string, fields []string) (int64, error) {
+func (o queryOps) hDel(ctx context.Context, q Querier, key string, fields []string) (removed int64, cleanupErr error) {
 	key = encodeKey(key)
+	if _, _, err := o.prepareMutation(ctx, q, key, TypeHash); err != nil {
+		return 0, err
+	}
+	defer func() {
+		if cleanupErr == nil {
+			cleanupErr = o.removeEmptyMeta(ctx, q, []string{key}, TypeHash)
+		}
+	}()
 	// Encode field names for PostgreSQL
 	encFields := make([]string, len(fields))
 	for i, f := range fields {
@@ -1501,7 +1525,7 @@ func (o queryOps) hIncrBy(ctx context.Context, q Querier, key, field string, inc
 	newValue := currentValue + increment
 
 	// Set metadata before data table for consistent lock ordering (kv_meta before kv_hashes).
-	if err := o.setMeta(ctx, q, key, TypeHash, expiresAt); err != nil {
+	if err := o.setMetaLocked(ctx, q, key, TypeHash, expiresAt); err != nil {
 		return 0, err
 	}
 
@@ -1552,7 +1576,7 @@ func (o queryOps) hIncrByFloat(ctx context.Context, q Querier, key, field string
 	valueStr := strconv.FormatFloat(newValue, 'f', -1, 64)
 
 	// Set metadata before data table for consistent lock ordering (kv_meta before kv_hashes).
-	if err := o.setMeta(ctx, q, key, TypeHash, expiresAt); err != nil {
+	if err := o.setMetaLocked(ctx, q, key, TypeHash, expiresAt); err != nil {
 		return 0, err
 	}
 
@@ -1581,7 +1605,7 @@ func (o queryOps) hSetNX(ctx context.Context, q Querier, key, field, value strin
 
 	// Set metadata before data table for consistent lock ordering (kv_meta before kv_hashes).
 	// Use DO UPDATE to ensure meta exists (harmless if key already exists with correct type).
-	if err := o.setMeta(ctx, q, key, TypeHash, expiresAt); err != nil {
+	if err := o.setMetaLocked(ctx, q, key, TypeHash, expiresAt); err != nil {
 		return false, err
 	}
 
@@ -1635,7 +1659,7 @@ func (o queryOps) lPush(ctx context.Context, q Querier, key string, values []str
 	}
 
 	// Set meta before data table for consistent lock ordering (kv_meta before kv_lists).
-	if err := o.setMeta(ctx, q, key, TypeList, expiresAt); err != nil {
+	if err := o.setMetaLocked(ctx, q, key, TypeList, expiresAt); err != nil {
 		return 0, err
 	}
 
@@ -1689,7 +1713,7 @@ func (o queryOps) rPush(ctx context.Context, q Querier, key string, values []str
 	}
 
 	// Set meta before data table for consistent lock ordering (kv_meta before kv_lists).
-	if err := o.setMeta(ctx, q, key, TypeList, expiresAt); err != nil {
+	if err := o.setMetaLocked(ctx, q, key, TypeList, expiresAt); err != nil {
 		return 0, err
 	}
 
@@ -1712,8 +1736,16 @@ func (o queryOps) rPush(ctx context.Context, q Querier, key string, values []str
 	return length, nil
 }
 
-func (o queryOps) lPop(ctx context.Context, q Querier, key string) (string, bool, error) {
+func (o queryOps) lPop(ctx context.Context, q Querier, key string) (poppedValue string, found bool, cleanupErr error) {
 	key = encodeKey(key)
+	if _, _, err := o.prepareMutation(ctx, q, key, TypeList); err != nil {
+		return "", false, err
+	}
+	defer func() {
+		if cleanupErr == nil {
+			cleanupErr = o.removeEmptyMeta(ctx, q, []string{key}, TypeList)
+		}
+	}()
 	// Find and delete the leftmost element in a single query using CTE
 	// Use FOR UPDATE SKIP LOCKED to prevent deadlocks when multiple clients pop concurrently
 	var value []byte
@@ -1739,8 +1771,16 @@ func (o queryOps) lPop(ctx context.Context, q Querier, key string) (string, bool
 	return string(value), true, nil
 }
 
-func (o queryOps) rPop(ctx context.Context, q Querier, key string) (string, bool, error) {
+func (o queryOps) rPop(ctx context.Context, q Querier, key string) (poppedValue string, found bool, cleanupErr error) {
 	key = encodeKey(key)
+	if _, _, err := o.prepareMutation(ctx, q, key, TypeList); err != nil {
+		return "", false, err
+	}
+	defer func() {
+		if cleanupErr == nil {
+			cleanupErr = o.removeEmptyMeta(ctx, q, []string{key}, TypeList)
+		}
+	}()
 	// Find and delete the rightmost element in a single query using CTE
 	// Use FOR UPDATE SKIP LOCKED to prevent deadlocks when multiple clients pop concurrently
 	var value []byte
@@ -1769,7 +1809,7 @@ func (o queryOps) rPop(ctx context.Context, q Querier, key string) (string, bool
 // popMulti pops a single element from the first non-empty list among keys
 // (in caller order) using one SQL round-trip. order is "ASC" for LPop
 // semantics (leftmost element of the first non-empty key) or "DESC" for RPop.
-func (o queryOps) popMulti(ctx context.Context, q Querier, keys []string, order string) (string, string, bool, error) {
+func (o queryOps) popMulti(ctx context.Context, q Querier, keys []string, order string) (resultKey string, resultValue string, found bool, cleanupErr error) {
 	if len(keys) == 0 {
 		return "", "", false, nil
 	}
@@ -1777,6 +1817,14 @@ func (o queryOps) popMulti(ctx context.Context, q Querier, keys []string, order 
 	encoded := make([]string, len(keys))
 	copy(encoded, keys)
 	encoded = encodeKeys(encoded)
+	if err := o.lockKeys(ctx, q, encoded); err != nil {
+		return "", "", false, err
+	}
+	defer func() {
+		if cleanupErr == nil {
+			cleanupErr = o.removeEmptyMeta(ctx, q, encoded, TypeList)
+		}
+	}()
 
 	// array_position orders candidate rows by the caller's key order so we
 	// always pop from the earliest non-empty list. Within that list, idx ASC
@@ -1819,13 +1867,21 @@ func (o queryOps) rPopMulti(ctx context.Context, q Querier, keys []string) (stri
 // non-empty key among keys (in caller order) and pops up to count elements
 // from that one key in one SQL round-trip. order is "ASC" for LMPOP (left)
 // or "DESC" for RMPOP (right).
-func (o queryOps) popMultiN(ctx context.Context, q Querier, keys []string, order string, count int64) (string, []string, bool, error) {
+func (o queryOps) popMultiN(ctx context.Context, q Querier, keys []string, order string, count int64) (resultKey string, resultValues []string, found bool, cleanupErr error) {
 	if len(keys) == 0 || count <= 0 {
 		return "", nil, false, nil
 	}
 	encoded := make([]string, len(keys))
 	copy(encoded, keys)
 	encoded = encodeKeys(encoded)
+	if err := o.lockKeys(ctx, q, encoded); err != nil {
+		return "", nil, false, err
+	}
+	defer func() {
+		if cleanupErr == nil {
+			cleanupErr = o.removeEmptyMeta(ctx, q, encoded, TypeList)
+		}
+	}()
 
 	// winner: the first non-empty key (precedence by array_position).
 	// target: rows from that key in pop order, capped at count.
@@ -1885,13 +1941,21 @@ func (o queryOps) rMPop(ctx context.Context, q Querier, keys []string, count int
 
 // zMPop is the ZMPOP analogue: identify the first non-empty zset, then pop
 // up to count members by score (DESC for MAX, ASC for MIN) in one round-trip.
-func (o queryOps) zMPop(ctx context.Context, q Querier, keys []string, order string, count int64) (string, []ZMember, bool, error) {
+func (o queryOps) zMPop(ctx context.Context, q Querier, keys []string, order string, count int64) (resultKey string, resultMembers []ZMember, found bool, cleanupErr error) {
 	if len(keys) == 0 || count <= 0 {
 		return "", nil, false, nil
 	}
 	encoded := make([]string, len(keys))
 	copy(encoded, keys)
 	encoded = encodeKeys(encoded)
+	if err := o.lockKeys(ctx, q, encoded); err != nil {
+		return "", nil, false, err
+	}
+	defer func() {
+		if cleanupErr == nil {
+			cleanupErr = o.removeEmptyMeta(ctx, q, encoded, TypeZSet)
+		}
+	}()
 
 	sql := `WITH winner AS (
 		SELECT key FROM kv_zsets
@@ -2095,7 +2159,7 @@ func (o queryOps) sAdd(ctx context.Context, q Querier, key string, members []str
 	}
 
 	// Set meta before data table for consistent lock ordering (kv_meta before kv_sets).
-	if err := o.setMeta(ctx, q, key, TypeSet, expiresAt); err != nil {
+	if err := o.setMetaLocked(ctx, q, key, TypeSet, expiresAt); err != nil {
 		return 0, err
 	}
 
@@ -2118,8 +2182,16 @@ func (o queryOps) sAdd(ctx context.Context, q Querier, key string, members []str
 	return added, nil
 }
 
-func (o queryOps) sRem(ctx context.Context, q Querier, key string, members []string) (int64, error) {
+func (o queryOps) sRem(ctx context.Context, q Querier, key string, members []string) (removed int64, cleanupErr error) {
 	key = encodeKey(key)
+	if _, _, err := o.prepareMutation(ctx, q, key, TypeSet); err != nil {
+		return 0, err
+	}
+	defer func() {
+		if cleanupErr == nil {
+			cleanupErr = o.removeEmptyMeta(ctx, q, []string{key}, TypeSet)
+		}
+	}()
 	memberBytes := make([][]byte, len(members))
 	for i, m := range members {
 		memberBytes[i] = []byte(m)
@@ -2214,13 +2286,13 @@ func (o queryOps) zAdd(ctx context.Context, q Querier, key string, members []ZMe
 		return 0, nil
 	}
 
-	// setMeta takes the key advisory lock, serializing the per-member
+	// prepareMutation holds the key advisory lock, serializing the per-member
 	// read-modify-write below for the duration of the transaction (so the
 	// existence check and conditional write are atomic against other writers).
 	// Set meta before the data table for consistent lock ordering. When the key
 	// is new this is only reached without XX, where at least one member is always
 	// added, so no phantom empty key is created.
-	if err := o.setMeta(ctx, q, key, TypeZSet, expiresAt); err != nil {
+	if err := o.setMetaLocked(ctx, q, key, TypeZSet, expiresAt); err != nil {
 		return 0, err
 	}
 
@@ -2387,8 +2459,16 @@ func (o queryOps) zScore(ctx context.Context, q Querier, key, member string) (fl
 	return score, true, nil
 }
 
-func (o queryOps) zRem(ctx context.Context, q Querier, key string, members []string) (int64, error) {
+func (o queryOps) zRem(ctx context.Context, q Querier, key string, members []string) (removed int64, cleanupErr error) {
 	key = encodeKey(key)
+	if _, _, err := o.prepareMutation(ctx, q, key, TypeZSet); err != nil {
+		return 0, err
+	}
+	defer func() {
+		if cleanupErr == nil {
+			cleanupErr = o.removeEmptyMeta(ctx, q, []string{key}, TypeZSet)
+		}
+	}()
 	memberBytes := make([][]byte, len(members))
 	for i, m := range members {
 		memberBytes[i] = []byte(m)
@@ -2724,8 +2804,16 @@ func (o queryOps) zRevRangeByScore(ctx context.Context, q Querier, key string, m
 	return members, nil
 }
 
-func (o queryOps) zRemRangeByScore(ctx context.Context, q Querier, key string, min, max float64) (int64, error) {
+func (o queryOps) zRemRangeByScore(ctx context.Context, q Querier, key string, min, max float64) (removed int64, cleanupErr error) {
 	key = encodeKey(key)
+	if _, _, err := o.prepareMutation(ctx, q, key, TypeZSet); err != nil {
+		return 0, err
+	}
+	defer func() {
+		if cleanupErr == nil {
+			cleanupErr = o.removeEmptyMeta(ctx, q, []string{key}, TypeZSet)
+		}
+	}()
 	result, err := q.Exec(ctx,
 		"DELETE FROM kv_zsets WHERE key = $1 AND score >= $2 AND score <= $3",
 		key, min, max,
@@ -2736,8 +2824,16 @@ func (o queryOps) zRemRangeByScore(ctx context.Context, q Querier, key string, m
 	return result.RowsAffected(), nil
 }
 
-func (o queryOps) zRemRangeByRank(ctx context.Context, q Querier, key string, start, stop int64) (int64, error) {
+func (o queryOps) zRemRangeByRank(ctx context.Context, q Querier, key string, start, stop int64) (removed int64, cleanupErr error) {
 	key = encodeKey(key)
+	if _, _, err := o.prepareMutation(ctx, q, key, TypeZSet); err != nil {
+		return 0, err
+	}
+	defer func() {
+		if cleanupErr == nil {
+			cleanupErr = o.removeEmptyMeta(ctx, q, []string{key}, TypeZSet)
+		}
+	}()
 	if err := o.lockKey(ctx, q, key); err != nil {
 		return 0, err
 	}
@@ -2791,7 +2887,7 @@ func (o queryOps) zIncrBy(ctx context.Context, q Querier, key string, increment 
 		return 0, err
 	}
 
-	if err := o.setMeta(ctx, q, key, TypeZSet, expiresAt); err != nil {
+	if err := o.setMetaLocked(ctx, q, key, TypeZSet, expiresAt); err != nil {
 		return 0, err
 	}
 
@@ -2805,8 +2901,16 @@ func (o queryOps) zIncrBy(ctx context.Context, q Querier, key string, increment 
 	return newScore, err
 }
 
-func (o queryOps) zPopMin(ctx context.Context, q Querier, key string, count int64) ([]ZMember, error) {
+func (o queryOps) zPopMin(ctx context.Context, q Querier, key string, count int64) (resultMembers []ZMember, cleanupErr error) {
 	key = encodeKey(key)
+	if _, _, err := o.prepareMutation(ctx, q, key, TypeZSet); err != nil {
+		return nil, err
+	}
+	defer func() {
+		if cleanupErr == nil {
+			cleanupErr = o.removeEmptyMeta(ctx, q, []string{key}, TypeZSet)
+		}
+	}()
 	// Get the lowest-scored members
 	rows, err := q.Query(ctx,
 		`SELECT member, score FROM kv_zsets 
@@ -2848,8 +2952,16 @@ func (o queryOps) zPopMin(ctx context.Context, q Querier, key string, count int6
 	return members, nil
 }
 
-func (o queryOps) lRem(ctx context.Context, q Querier, key string, count int64, element string) (int64, error) {
+func (o queryOps) lRem(ctx context.Context, q Querier, key string, count int64, element string) (removed int64, cleanupErr error) {
 	key = encodeKey(key)
+	if _, _, err := o.prepareMutation(ctx, q, key, TypeList); err != nil {
+		return 0, err
+	}
+	defer func() {
+		if cleanupErr == nil {
+			cleanupErr = o.removeEmptyMeta(ctx, q, []string{key}, TypeList)
+		}
+	}()
 	// count > 0: Remove count elements from head
 	// count < 0: Remove -count elements from tail
 	// count = 0: Remove all elements
@@ -2902,12 +3014,23 @@ func (o queryOps) rPopLPush(ctx context.Context, q Querier, source, destination 
 	if err := o.lockKeys(ctx, q, []string{source, destination}); err != nil {
 		return "", false, err
 	}
+	sourceType, _, err := o.prepareMutation(ctx, q, source, TypeList)
+	if err != nil {
+		return "", false, err
+	}
+	if sourceType == TypeNone {
+		return "", false, nil
+	}
+	_, expiresAt, err := o.prepareMutation(ctx, q, destination, TypeList)
+	if err != nil {
+		return "", false, err
+	}
 	// Pop from source (right)
 	// Use FOR UPDATE SKIP LOCKED to prevent deadlocks when multiple clients pop concurrently
 	var value []byte
 	var idx int64
 
-	err := q.QueryRow(ctx,
+	err = q.QueryRow(ctx,
 		`SELECT value, idx FROM kv_lists 
 		 WHERE key = $1 
 		 ORDER BY idx DESC 
@@ -2931,25 +3054,23 @@ func (o queryOps) rPopLPush(ctx context.Context, q Querier, source, destination 
 		return "", false, err
 	}
 
-	// Ensure meta entry exists for destination
-	_, err = q.Exec(ctx,
-		`INSERT INTO kv_meta (key, key_type) VALUES ($1, 'list') ON CONFLICT (key) DO NOTHING`,
-		destination,
-	)
-	if err != nil {
+	if err := o.setMetaLocked(ctx, q, destination, TypeList, expiresAt); err != nil {
 		return "", false, err
 	}
 
 	// Push to destination (left) using atomic subquery
 	_, err = q.Exec(ctx,
-		`INSERT INTO kv_lists (key, idx, value) 
-		 VALUES ($1, COALESCE((SELECT MIN(idx) FROM kv_lists WHERE key = $1), 0) - 1, $2)`,
-		destination, value,
+		`INSERT INTO kv_lists (key, idx, value, expires_at)
+		 VALUES ($1, COALESCE((SELECT MIN(idx) FROM kv_lists WHERE key = $1), 0) - 1, $2, $3)`,
+		destination, value, expiresAt,
 	)
 	if err != nil {
 		return "", false, err
 	}
 
+	if err := o.removeEmptyMeta(ctx, q, []string{source}, TypeList); err != nil {
+		return "", false, err
+	}
 	return string(value), true, nil
 }
 
@@ -3103,21 +3224,22 @@ func (o queryOps) lSet(ctx context.Context, q Querier, key string, index int64, 
 // LInsert inserts an element before or after a pivot element
 func (o queryOps) lInsert(ctx context.Context, q Querier, key, pivot, element string, before bool) (int64, error) {
 	key = encodeKey(key)
+	kind, expiresAt, err := o.prepareMutation(ctx, q, key, TypeList)
+	if err != nil {
+		return 0, err
+	}
+	if kind == TypeNone {
+		return 0, nil
+	}
 	// Find the pivot element
 	var pivotIdx int64
-	err := q.QueryRow(ctx,
+	err = q.QueryRow(ctx,
 		`SELECT idx FROM kv_lists WHERE key = $1 AND value = $2 ORDER BY idx LIMIT 1`,
 		key, []byte(pivot),
 	).Scan(&pivotIdx)
 	if err == pgx.ErrNoRows {
 		return -1, nil // Pivot not found
 	}
-	if err != nil {
-		return 0, err
-	}
-
-	// Use advisory lock to serialize list operations
-	_, err = q.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", key)
 	if err != nil {
 		return 0, err
 	}
@@ -3135,8 +3257,8 @@ func (o queryOps) lInsert(ctx context.Context, q Querier, key, pivot, element st
 		}
 		// Insert at the original pivot position (pivot has moved up)
 		_, err = q.Exec(ctx,
-			"INSERT INTO kv_lists (key, idx, value) VALUES ($1, $2, $3)",
-			key, pivotIdx, []byte(element),
+			"INSERT INTO kv_lists (key, idx, value, expires_at) VALUES ($1, $2, $3, $4)",
+			key, pivotIdx, []byte(element), expiresAt,
 		)
 	} else {
 		// AFTER: Insert after the pivot
@@ -3150,8 +3272,8 @@ func (o queryOps) lInsert(ctx context.Context, q Querier, key, pivot, element st
 		}
 		// Insert right after the pivot
 		_, err = q.Exec(ctx,
-			"INSERT INTO kv_lists (key, idx, value) VALUES ($1, $2, $3)",
-			key, pivotIdx+1, []byte(element),
+			"INSERT INTO kv_lists (key, idx, value, expires_at) VALUES ($1, $2, $3, $4)",
+			key, pivotIdx+1, []byte(element), expiresAt,
 		)
 	}
 	if err != nil {
@@ -3599,8 +3721,16 @@ func (o queryOps) sInterCard(ctx context.Context, q Querier, keys []string, limi
 
 // ============== Sorted Set Extensions ==============
 
-func (o queryOps) zPopMax(ctx context.Context, q Querier, key string, count int64) ([]ZMember, error) {
+func (o queryOps) zPopMax(ctx context.Context, q Querier, key string, count int64) (resultMembers []ZMember, cleanupErr error) {
 	key = encodeKey(key)
+	if _, _, err := o.prepareMutation(ctx, q, key, TypeZSet); err != nil {
+		return nil, err
+	}
+	defer func() {
+		if cleanupErr == nil {
+			cleanupErr = o.removeEmptyMeta(ctx, q, []string{key}, TypeZSet)
+		}
+	}()
 	// Get the highest-scored members
 	rows, err := q.Query(ctx,
 		`SELECT member, score FROM kv_zsets 
@@ -4166,7 +4296,7 @@ func (o queryOps) setBit(ctx context.Context, q Querier, key string, offset int6
 	}
 
 	// Set meta before data table for consistent lock ordering (kv_meta before kv_strings).
-	if err := o.setMeta(ctx, q, key, TypeString, expiresAt); err != nil {
+	if err := o.setMetaLocked(ctx, q, key, TypeString, expiresAt); err != nil {
 		return 0, err
 	}
 
@@ -4496,7 +4626,7 @@ func (o queryOps) pfAdd(ctx context.Context, q Querier, key string, elements []s
 	}
 
 	// Update metadata before data table for consistent lock ordering (kv_meta before kv_hyperloglog).
-	err = o.setMeta(ctx, q, key, "hyperloglog", expiresAt)
+	err = o.setMetaLocked(ctx, q, key, "hyperloglog", expiresAt)
 	if err != nil {
 		return 0, err
 	}
@@ -4602,7 +4732,7 @@ func (o queryOps) pfMerge(ctx context.Context, q Querier, destKey string, source
 	}
 
 	// Update metadata before data table for consistent lock ordering (kv_meta before kv_hyperloglog).
-	if err := o.setMeta(ctx, q, destKey, "hyperloglog", expiresAt); err != nil {
+	if err := o.setMetaLocked(ctx, q, destKey, "hyperloglog", expiresAt); err != nil {
 		return err
 	}
 
