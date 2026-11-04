@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"strings"
 	"sync"
@@ -198,6 +199,14 @@ func (s *Store) initSchema(ctx context.Context) error {
 			expires_at TIMESTAMPTZ
 		);
 		CREATE INDEX IF NOT EXISTS idx_kv_hyperloglog_expires ON kv_hyperloglog(expires_at) WHERE expires_at IS NOT NULL;
+
+		CREATE TABLE IF NOT EXISTS pubsub_messages (
+			id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+			channel BYTEA NOT NULL,
+			message BYTEA NOT NULL,
+			expires_at TIMESTAMPTZ NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_pubsub_messages_expires ON pubsub_messages(expires_at);
 	`
 	_, err := s.pool.Exec(ctx, schema)
 	return err
@@ -220,8 +229,28 @@ func (s *Store) cleanupExpiredKeys(ctx context.Context) {
 			runCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			s.deleteExpiredKeys(runCtx)
 			cancel()
+			runCtx, cancel = context.WithTimeout(ctx, 30*time.Second)
+			if err := s.deleteExpiredPubSubMessages(runCtx); err != nil && ctx.Err() == nil {
+				log.Printf("pubsub message cleanup failed: %v", err)
+			}
+			cancel()
 		}
 	}
+}
+
+// deleteExpiredPubSubMessages uses its own transaction so key cleanup cannot
+// prevent transport cleanup. Concurrent sweepers skip rows already locked.
+func (s *Store) deleteExpiredPubSubMessages(ctx context.Context) error {
+	return s.execTx(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			DELETE FROM pubsub_messages WHERE id IN (
+				SELECT id FROM pubsub_messages
+				WHERE expires_at <= statement_timestamp()
+				ORDER BY expires_at, id
+				LIMIT $1 FOR UPDATE SKIP LOCKED
+			)`, cleanupBatch)
+		return err
+	})
 }
 
 // cleanupBatch bounds how many keys one cleanup cycle looks at per source.

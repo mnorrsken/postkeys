@@ -560,3 +560,10 @@ For deployment examples, including usage with CloudNativePG, see the [examples/]
 - **Cache**: Optional in-memory cache with distributed invalidation for multi-pod deployments
 - **Lua Scripts**: EVAL/EVALSHA scripting engine with script caching
 
+Pub/sub messages that fit in a PostgreSQL notification are sent inline. Larger
+messages are stored temporarily in PostgreSQL and notifications carry a reference
+to them. Stored messages expire after five minutes and are removed by background
+cleanup. Delivery is best effort: disconnected listeners and failed or delayed
+fetches can miss messages, and there is no replay. Upgrade all instances sharing
+a database together before publishing large messages, since older instances do
+not understand references.

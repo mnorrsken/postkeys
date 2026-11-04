@@ -2,12 +2,14 @@
 package pubsub
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +30,88 @@ type broadcastPayload struct {
 	Channel string `json:"c"`
 	Message string `json:"m"`
 	Binary  bool   `json:"b,omitempty"` // when true, c and m are base64-encoded (binary-safe)
+}
+
+// inlinePayloadFits computes the full outer base64 size without encoding either input.
+func inlinePayloadFits(channelLen, messageLen int) bool {
+	if channelLen >= 8000 || messageLen >= 8000 {
+		return false
+	}
+	jsonLen := len(`{"c":"","m":"","b":true}`) + base64.StdEncoding.EncodedLen(channelLen) + base64.StdEncoding.EncodedLen(messageLen)
+	return base64.StdEncoding.EncodedLen(jsonLen) < 8000
+}
+
+func encodeInline(channel, message string) (string, error) {
+	bp := broadcastPayload{Channel: base64.StdEncoding.EncodeToString([]byte(channel)), Message: base64.StdEncoding.EncodeToString([]byte(message)), Binary: true}
+	data, err := json.Marshal(bp)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(data), nil
+}
+
+// decodeBroadcast preserves legacy inline decoding while requiring references to be unambiguous.
+func decodeBroadcast(payload string) (channel, message string, id int64, err error) {
+	data, err := base64.StdEncoding.DecodeString(payload)
+	if err != nil {
+		return "", "", 0, err
+	}
+	var fields map[string]json.RawMessage
+	if err = json.Unmarshal(data, &fields); err != nil || fields == nil {
+		if err == nil {
+			err = errors.New("invalid envelope")
+		}
+		return "", "", 0, err
+	}
+	if raw, ok := fields["r"]; ok {
+		decoder := json.NewDecoder(bytes.NewReader(data))
+		_, _ = decoder.Token() // opening object, already validated by Unmarshal
+		keys := 0
+		for decoder.More() {
+			if _, err := decoder.Token(); err != nil {
+				return "", "", 0, err
+			}
+			var value json.RawMessage
+			if err := decoder.Decode(&value); err != nil {
+				return "", "", 0, err
+			}
+			keys++
+		}
+		if keys != 1 {
+			return "", "", 0, errors.New("mixed reference envelope")
+		}
+		if len(fields) != 1 {
+			return "", "", 0, errors.New("mixed reference envelope")
+		}
+		var ref string
+		if err = json.Unmarshal(raw, &ref); err != nil || len(ref) == 0 {
+			return "", "", 0, errors.New("invalid reference")
+		}
+		for _, c := range ref {
+			if c < '0' || c > '9' {
+				return "", "", 0, errors.New("invalid reference")
+			}
+		}
+		id, err = strconv.ParseInt(ref, 10, 64)
+		if err != nil || id <= 0 {
+			return "", "", 0, errors.New("invalid reference")
+		}
+		return "", "", id, nil
+	}
+	var bp broadcastPayload
+	if err = json.Unmarshal(data, &bp); err != nil {
+		return "", "", 0, err
+	}
+	channel, message = bp.Channel, bp.Message
+	if bp.Binary {
+		if decoded, e := base64.StdEncoding.DecodeString(bp.Channel); e == nil {
+			channel = string(decoded)
+		}
+		if decoded, e := base64.StdEncoding.DecodeString(bp.Message); e == nil {
+			message = string(decoded)
+		}
+	}
+	return channel, message, 0, nil
 }
 
 // Subscriber represents a client that can receive pub/sub messages
@@ -261,26 +345,35 @@ func (h *Hub) PUnsubscribe(sub Subscriber, patterns ...string) []int {
 
 // Publish publishes a message to a channel, returns the number of local subscribers that received it.
 func (h *Hub) Publish(ctx context.Context, channel, message string) (int64, error) {
-	// Wrap channel + message into a JSON payload and send via the broadcast channel.
-	// All postkeys instances LISTEN on this single channel, so every instance
-	// receives every message and can match against both exact and pattern subscriptions.
-	// Channel and message are base64-encoded because Redis pub/sub payloads can be
-	// arbitrary binary data, and json.Marshal replaces invalid UTF-8 with U+FFFD.
-	bp := broadcastPayload{
-		Channel: base64.StdEncoding.EncodeToString([]byte(channel)),
-		Message: base64.StdEncoding.EncodeToString([]byte(message)),
-		Binary:  true,
-	}
-	jsonBytes, err := json.Marshal(bp)
-	if err != nil {
-		return 0, fmt.Errorf("failed to encode broadcast payload: %w", err)
-	}
-
-	payload := base64.StdEncoding.EncodeToString(jsonBytes)
-
-	_, err = h.pool.Exec(ctx, "SELECT pg_notify($1, $2)", broadcastChannel, payload)
-	if err != nil {
-		return 0, fmt.Errorf("failed to publish: %w", err)
+	if inlinePayloadFits(len(channel), len(message)) {
+		payload, err := encodeInline(channel, message)
+		if err != nil {
+			return 0, fmt.Errorf("failed to encode broadcast payload: %w", err)
+		}
+		if _, err := h.pool.Exec(ctx, "SELECT pg_notify($1, $2)", broadcastChannel, payload); err != nil {
+			return 0, fmt.Errorf("failed to publish: %w", err)
+		}
+	} else {
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("failed to begin publish: %w", err)
+		}
+		defer func() {
+			rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = tx.Rollback(rollbackCtx)
+		}()
+		var id int64
+		if err := tx.QueryRow(ctx, `INSERT INTO pubsub_messages (channel, message, expires_at) VALUES ($1, $2, clock_timestamp() + interval '5 minutes') RETURNING id`, []byte(channel), []byte(message)).Scan(&id); err != nil {
+			return 0, fmt.Errorf("failed to store broadcast payload: %w", err)
+		}
+		payload := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf(`{"r":"%d"}`, id)))
+		if _, err := tx.Exec(ctx, "SELECT pg_notify($1, $2)", broadcastChannel, payload); err != nil {
+			return 0, fmt.Errorf("failed to notify: %w", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return 0, fmt.Errorf("failed to commit publish: %w", err)
+		}
 	}
 
 	// Return local subscriber count (same semantics as Redis: count of clients
@@ -469,29 +562,21 @@ func (h *Hub) listenLoop() {
 			continue
 		}
 
-		// Decode the broadcast payload
-		jsonBytes, err := base64.StdEncoding.DecodeString(notification.Payload)
+		channel, message, id, err := decodeBroadcast(notification.Payload)
 		if err != nil {
 			log.Printf("Warning: failed to decode broadcast payload: %v", err)
 			continue
 		}
-
-		var bp broadcastPayload
-		if err := json.Unmarshal(jsonBytes, &bp); err != nil {
-			log.Printf("Warning: failed to unmarshal broadcast payload: %v", err)
-			continue
-		}
-
-		// Decode channel and message (base64 when Binary flag is set)
-		channel := bp.Channel
-		message := bp.Message
-		if bp.Binary {
-			if chBytes, err := base64.StdEncoding.DecodeString(bp.Channel); err == nil {
-				channel = string(chBytes)
+		if id != 0 {
+			ctx, cancel := context.WithTimeout(h.ctx, 10*time.Second)
+			var ch, msg []byte
+			err := h.pool.QueryRow(ctx, "SELECT channel, message FROM pubsub_messages WHERE id = $1", id).Scan(&ch, &msg)
+			cancel()
+			if err != nil {
+				log.Printf("Warning: failed to fetch pub/sub message %d: %v", id, err)
+				continue
 			}
-			if msgBytes, err := base64.StdEncoding.DecodeString(bp.Message); err == nil {
-				message = string(msgBytes)
-			}
+			channel, message = string(ch), string(msg)
 		}
 
 		if h.debug {
