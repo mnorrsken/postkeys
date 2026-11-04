@@ -77,6 +77,7 @@ Scripts have access to:
 - `redis.call(cmd, ...)` - execute Redis command (raises error on failure)
 - `redis.pcall(cmd, ...)` - execute Redis command (returns error as table)
 - `redis.sha1hex(str)` - compute SHA1 hash
+- `cjson.encode(value)`, `cjson.decode(json)`, and `cjson.null` - encode and decode strict JSON. This subset does not include cjson configuration APIs. Empty Lua tables encode as `{}`; positive integer-keyed tables encode as arrays, with gaps encoded as null (excessively sparse arrays are rejected).
 
 **Note**: Each script runs in one PostgreSQL transaction and locks every key in `KEYS` first, so scripts on the same keys run one at a time and their writes appear together. As in Redis, declare every key the script touches in `KEYS`; keys the script uses without declaring them are not locked. Blocking commands (`BLPOP`, `BRPOP`, `BLMPOP`, `BZMPOP`) return nil at once instead of waiting, as in Redis. Certain commands are blocked from scripts: `SUBSCRIBE`, `PUBLISH`, `MULTI`, `EXEC`, `WATCH`, nested `EVAL`/`EVALSHA`.
 

@@ -112,6 +112,8 @@ func openSafeLibs(L *lua.LState) {
 		L.Call(1, 0)
 	}
 
+	openCJSON(L)
+
 	// Remove dangerous base functions that can access the filesystem
 	L.SetGlobal("dofile", lua.LNil)
 	L.SetGlobal("loadfile", lua.LNil)
