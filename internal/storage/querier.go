@@ -99,6 +99,8 @@ func dataTableForType(kt KeyType) string {
 		return "kv_sets"
 	case TypeZSet:
 		return "kv_zsets"
+	case "hyperloglog":
+		return "kv_hyperloglog"
 	default:
 		return ""
 	}
@@ -189,6 +191,51 @@ func (o queryOps) setMeta(ctx context.Context, q Querier, key string, keyType Ke
 		key, string(keyType), expiresAt,
 	)
 	return err
+}
+
+// prepareMutation serializes a read-modify-write and returns the live key's
+// expiry. Expired rows must be removed before recreating a key, including
+// rows belonging to a different former type.
+func (o queryOps) prepareMutation(ctx context.Context, q Querier, key string, expected KeyType) (KeyType, *time.Time, error) {
+	if err := o.lockKey(ctx, q, key); err != nil {
+		return TypeNone, nil, err
+	}
+	var kind string
+	var expiry *time.Time
+	var expired bool
+	err := q.QueryRow(ctx, `SELECT key_type, expires_at, expires_at IS NOT NULL AND expires_at <= NOW() FROM kv_meta WHERE key = $1`, key).Scan(&kind, &expiry, &expired)
+	if err == pgx.ErrNoRows {
+		return TypeNone, nil, nil
+	}
+	if err != nil {
+		return TypeNone, nil, err
+	}
+	if expired {
+		if err := o.deleteKeyFromAllTables(ctx, q, key); err != nil {
+			return TypeNone, nil, err
+		}
+		return TypeNone, nil, nil
+	}
+	// Removing a collection's final member can leave metadata behind. Such a
+	// key is missing to Redis, so recreation must not inherit its type or TTL.
+	switch KeyType(kind) {
+	case TypeHash, TypeList, TypeSet, TypeZSet:
+		table := dataTableForType(KeyType(kind))
+		var exists bool
+		if err := q.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM "+table+" WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW()))", key).Scan(&exists); err != nil {
+			return TypeNone, nil, err
+		}
+		if !exists {
+			if err := o.deleteKeyFromAllTables(ctx, q, key); err != nil {
+				return TypeNone, nil, err
+			}
+			return TypeNone, nil, nil
+		}
+	}
+	if KeyType(kind) != expected {
+		return TypeNone, nil, errWrongType
+	}
+	return KeyType(kind), expiry, nil
 }
 
 // setMetaBatch sets metadata for multiple keys at once
@@ -409,8 +456,13 @@ func (o queryOps) mSet(ctx context.Context, q Querier, pairs map[string]string) 
 
 func (o queryOps) incr(ctx context.Context, q Querier, key string, delta int64) (int64, error) {
 	key = encodeKey(key)
+	_, expiresAt, err := o.prepareMutation(ctx, q, key, TypeString)
+	if err != nil {
+		return 0, err
+	}
+
 	var value []byte
-	err := q.QueryRow(ctx,
+	err = q.QueryRow(ctx,
 		"SELECT value FROM kv_strings WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
 		key,
 	).Scan(&value)
@@ -429,14 +481,14 @@ func (o queryOps) incr(ctx context.Context, q Querier, key string, delta int64) 
 
 	result := current + delta
 
-	if err := o.setMeta(ctx, q, key, TypeString, nil); err != nil {
+	if err := o.setMeta(ctx, q, key, TypeString, expiresAt); err != nil {
 		return 0, err
 	}
 
 	_, err = q.Exec(ctx,
-		`INSERT INTO kv_strings (key, value) VALUES ($1, $2)
+		`INSERT INTO kv_strings (key, value, expires_at) VALUES ($1, $2, $3)
 		 ON CONFLICT (key) DO UPDATE SET value = $2`,
-		key, []byte(strconv.FormatInt(result, 10)),
+		key, []byte(strconv.FormatInt(result, 10)), expiresAt,
 	)
 	if err != nil {
 		return 0, err
@@ -447,14 +499,19 @@ func (o queryOps) incr(ctx context.Context, q Querier, key string, delta int64) 
 
 func (o queryOps) appendStr(ctx context.Context, q Querier, key, value string) (int64, error) {
 	key = encodeKey(key)
-	if err := o.setMeta(ctx, q, key, TypeString, nil); err != nil {
+	_, expiresAt, err := o.prepareMutation(ctx, q, key, TypeString)
+	if err != nil {
 		return 0, err
 	}
 
-	_, err := q.Exec(ctx,
-		`INSERT INTO kv_strings (key, value) VALUES ($1, $2)
+	if err := o.setMeta(ctx, q, key, TypeString, expiresAt); err != nil {
+		return 0, err
+	}
+
+	_, err = q.Exec(ctx,
+		`INSERT INTO kv_strings (key, value, expires_at) VALUES ($1, $2, $3)
 		 ON CONFLICT (key) DO UPDATE SET value = kv_strings.value || $2`,
-		key, []byte(value),
+		key, []byte(value), expiresAt,
 	)
 	if err != nil {
 		return 0, err
@@ -512,9 +569,14 @@ func (o queryOps) getRange(ctx context.Context, q Querier, key string, start, en
 
 func (o queryOps) setRange(ctx context.Context, q Querier, key string, offset int64, value string) (int64, error) {
 	key = encodeKey(key)
+	_, expiresAt, err := o.prepareMutation(ctx, q, key, TypeString)
+	if err != nil {
+		return 0, err
+	}
+
 	// Get existing value or create empty
 	var existing []byte
-	err := q.QueryRow(ctx,
+	err = q.QueryRow(ctx,
 		"SELECT value FROM kv_strings WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
 		key,
 	).Scan(&existing)
@@ -522,6 +584,10 @@ func (o queryOps) setRange(ctx context.Context, q Querier, key string, offset in
 		existing = []byte{}
 	} else if err != nil {
 		return 0, err
+	}
+
+	if len(value) == 0 {
+		return int64(len(existing)), nil
 	}
 
 	// Extend buffer if needed
@@ -536,15 +602,15 @@ func (o queryOps) setRange(ctx context.Context, q Querier, key string, offset in
 	copy(existing[offset:], value)
 
 	// Set meta before data table for consistent lock ordering (kv_meta before kv_strings).
-	if err := o.setMeta(ctx, q, key, TypeString, nil); err != nil {
+	if err := o.setMeta(ctx, q, key, TypeString, expiresAt); err != nil {
 		return 0, err
 	}
 
 	// Save back
 	_, err = q.Exec(ctx,
-		`INSERT INTO kv_strings (key, value) VALUES ($1, $2)
+		`INSERT INTO kv_strings (key, value, expires_at) VALUES ($1, $2, $3)
 		 ON CONFLICT (key) DO UPDATE SET value = $2`,
-		key, existing,
+		key, existing, expiresAt,
 	)
 	if err != nil {
 		return 0, err
@@ -555,16 +621,19 @@ func (o queryOps) setRange(ctx context.Context, q Querier, key string, offset in
 
 func (o queryOps) bitField(ctx context.Context, q Querier, key string, ops []BitFieldOp) ([]*int64, error) {
 	key = encodeKey(key)
+	_, expiresAt, err := o.prepareMutation(ctx, q, key, TypeString)
+	if err != nil {
+		return nil, err
+	}
+
 	// Get existing value or create empty
 	var value []byte
-	isNewKey := false
-	err := q.QueryRow(ctx,
+	err = q.QueryRow(ctx,
 		"SELECT value FROM kv_strings WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
 		key,
 	).Scan(&value)
 	if err == pgx.ErrNoRows {
 		value = []byte{}
-		isNewKey = true
 	} else if err != nil {
 		return nil, err
 	}
@@ -643,22 +712,14 @@ func (o queryOps) bitField(ctx context.Context, q Querier, key string, ops []Bit
 	}
 
 	if modified {
-		if isNewKey {
-			// Only upsert meta for new keys; existing keys already have the correct meta row.
-			if err := o.setMeta(ctx, q, key, TypeString, nil); err != nil {
-				return nil, err
-			}
-		} else {
-			// Still need the advisory lock for write serialization on existing keys.
-			if err := o.lockKey(ctx, q, key); err != nil {
-				return nil, err
-			}
+		if err := o.setMeta(ctx, q, key, TypeString, expiresAt); err != nil {
+			return nil, err
 		}
 
 		_, err = q.Exec(ctx,
-			`INSERT INTO kv_strings (key, value) VALUES ($1, $2)
+			`INSERT INTO kv_strings (key, value, expires_at) VALUES ($1, $2, $3)
 			 ON CONFLICT (key) DO UPDATE SET value = $2`,
-			key, value,
+			key, value, expiresAt,
 		)
 		if err != nil {
 			return nil, err
@@ -892,13 +953,9 @@ func (o queryOps) getSet(ctx context.Context, q Querier, key, value string) (str
 
 func (o queryOps) incrByFloat(ctx context.Context, q Querier, key string, delta float64) (float64, error) {
 	key = encodeKey(key)
-	// Check key type
-	keyType, err := o.getKeyType(ctx, q, key)
+	_, expiresAt, err := o.prepareMutation(ctx, q, key, TypeString)
 	if err != nil {
 		return 0, err
-	}
-	if keyType != TypeNone && keyType != TypeString {
-		return 0, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
 
 	var currentValue float64 = 0
@@ -923,14 +980,14 @@ func (o queryOps) incrByFloat(ctx context.Context, q Querier, key string, delta 
 	valueStr := strconv.FormatFloat(newValue, 'f', -1, 64)
 
 	// Set meta before data table for consistent lock ordering (kv_meta before kv_strings).
-	if err := o.setMeta(ctx, q, key, TypeString, nil); err != nil {
+	if err := o.setMeta(ctx, q, key, TypeString, expiresAt); err != nil {
 		return 0, err
 	}
 
 	_, err = q.Exec(ctx,
-		`INSERT INTO kv_strings (key, value) VALUES ($1, $2)
+		`INSERT INTO kv_strings (key, value, expires_at) VALUES ($1, $2, $3)
 		 ON CONFLICT (key) DO UPDATE SET value = $2`,
-		key, []byte(valueStr),
+		key, []byte(valueStr), expiresAt,
 	)
 	if err != nil {
 		return 0, err
@@ -1208,17 +1265,13 @@ func (o queryOps) hGet(ctx context.Context, q Querier, key, field string) (strin
 
 func (o queryOps) hSet(ctx context.Context, q Querier, key string, fields map[string]string) (int64, error) {
 	key = encodeKey(key)
-	if len(fields) == 0 {
-		return 0, nil
-	}
-
-	// Check if key exists but is wrong type
-	keyType, err := o.getKeyType(ctx, q, key)
+	_, expiresAt, err := o.prepareMutation(ctx, q, key, TypeHash)
 	if err != nil {
 		return 0, err
 	}
-	if keyType != TypeNone && keyType != TypeHash {
-		return 0, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
+
+	if len(fields) == 0 {
+		return 0, nil
 	}
 
 	// Collect fields and values for batch insert
@@ -1240,16 +1293,16 @@ func (o queryOps) hSet(ctx context.Context, q Querier, key string, fields map[st
 	}
 
 	// Set metadata before data table for consistent lock ordering (kv_meta before kv_hashes).
-	if err := o.setMeta(ctx, q, key, TypeHash, nil); err != nil {
+	if err := o.setMeta(ctx, q, key, TypeHash, expiresAt); err != nil {
 		return 0, err
 	}
 
 	// Batch upsert all fields at once
 	_, err = q.Exec(ctx,
-		`INSERT INTO kv_hashes (key, field, value)
-		 SELECT $1, unnest($2::text[]), unnest($3::bytea[])
+		`INSERT INTO kv_hashes (key, field, value, expires_at)
+		 SELECT $1, unnest($2::text[]), unnest($3::bytea[]), $4
 		 ON CONFLICT (key, field) DO UPDATE SET value = EXCLUDED.value`,
-		key, fieldNames, fieldValues,
+		key, fieldNames, fieldValues, expiresAt,
 	)
 	if err != nil {
 		return 0, err
@@ -1419,13 +1472,9 @@ func (o queryOps) hLen(ctx context.Context, q Querier, key string) (int64, error
 
 func (o queryOps) hIncrBy(ctx context.Context, q Querier, key, field string, increment int64) (int64, error) {
 	key = encodeKey(key)
-	// Check if key exists but is wrong type
-	keyType, err := o.getKeyType(ctx, q, key)
+	_, expiresAt, err := o.prepareMutation(ctx, q, key, TypeHash)
 	if err != nil {
 		return 0, err
-	}
-	if keyType != TypeNone && keyType != TypeHash {
-		return 0, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
 
 	// Encode field name for PostgreSQL
@@ -1452,15 +1501,15 @@ func (o queryOps) hIncrBy(ctx context.Context, q Querier, key, field string, inc
 	newValue := currentValue + increment
 
 	// Set metadata before data table for consistent lock ordering (kv_meta before kv_hashes).
-	if err := o.setMeta(ctx, q, key, TypeHash, nil); err != nil {
+	if err := o.setMeta(ctx, q, key, TypeHash, expiresAt); err != nil {
 		return 0, err
 	}
 
 	// Upsert the new value
 	_, err = q.Exec(ctx,
-		`INSERT INTO kv_hashes (key, field, value) VALUES ($1, $2, $3)
+		`INSERT INTO kv_hashes (key, field, value, expires_at) VALUES ($1, $2, $3, $4)
 		 ON CONFLICT (key, field) DO UPDATE SET value = $3`,
-		key, encField, []byte(strconv.FormatInt(newValue, 10)),
+		key, encField, []byte(strconv.FormatInt(newValue, 10)), expiresAt,
 	)
 	if err != nil {
 		return 0, err
@@ -1471,13 +1520,9 @@ func (o queryOps) hIncrBy(ctx context.Context, q Querier, key, field string, inc
 
 func (o queryOps) hIncrByFloat(ctx context.Context, q Querier, key, field string, increment float64) (float64, error) {
 	key = encodeKey(key)
-	// Check if key exists but is wrong type
-	keyType, err := o.getKeyType(ctx, q, key)
+	_, expiresAt, err := o.prepareMutation(ctx, q, key, TypeHash)
 	if err != nil {
 		return 0, err
-	}
-	if keyType != TypeNone && keyType != TypeHash {
-		return 0, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
 
 	// Encode field name for PostgreSQL
@@ -1507,15 +1552,15 @@ func (o queryOps) hIncrByFloat(ctx context.Context, q Querier, key, field string
 	valueStr := strconv.FormatFloat(newValue, 'f', -1, 64)
 
 	// Set metadata before data table for consistent lock ordering (kv_meta before kv_hashes).
-	if err := o.setMeta(ctx, q, key, TypeHash, nil); err != nil {
+	if err := o.setMeta(ctx, q, key, TypeHash, expiresAt); err != nil {
 		return 0, err
 	}
 
 	// Upsert the new value
 	_, err = q.Exec(ctx,
-		`INSERT INTO kv_hashes (key, field, value) VALUES ($1, $2, $3)
+		`INSERT INTO kv_hashes (key, field, value, expires_at) VALUES ($1, $2, $3, $4)
 		 ON CONFLICT (key, field) DO UPDATE SET value = $3`,
-		key, encField, []byte(valueStr),
+		key, encField, []byte(valueStr), expiresAt,
 	)
 	if err != nil {
 		return 0, err
@@ -1526,13 +1571,9 @@ func (o queryOps) hIncrByFloat(ctx context.Context, q Querier, key, field string
 
 func (o queryOps) hSetNX(ctx context.Context, q Querier, key, field, value string) (bool, error) {
 	key = encodeKey(key)
-	// Check if key exists but is wrong type
-	keyType, err := o.getKeyType(ctx, q, key)
+	_, expiresAt, err := o.prepareMutation(ctx, q, key, TypeHash)
 	if err != nil {
 		return false, err
-	}
-	if keyType != TypeNone && keyType != TypeHash {
-		return false, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
 
 	// Encode field name for PostgreSQL
@@ -1540,15 +1581,15 @@ func (o queryOps) hSetNX(ctx context.Context, q Querier, key, field, value strin
 
 	// Set metadata before data table for consistent lock ordering (kv_meta before kv_hashes).
 	// Use DO UPDATE to ensure meta exists (harmless if key already exists with correct type).
-	if err := o.setMeta(ctx, q, key, TypeHash, nil); err != nil {
+	if err := o.setMeta(ctx, q, key, TypeHash, expiresAt); err != nil {
 		return false, err
 	}
 
 	// Try to insert only if not exists
 	result, err := q.Exec(ctx,
-		`INSERT INTO kv_hashes (key, field, value) VALUES ($1, $2, $3)
+		`INSERT INTO kv_hashes (key, field, value, expires_at) VALUES ($1, $2, $3, $4)
 		 ON CONFLICT (key, field) DO NOTHING`,
-		key, encField, []byte(value),
+		key, encField, []byte(value), expiresAt,
 	)
 	if err != nil {
 		return false, err
@@ -1564,28 +1605,18 @@ func (o queryOps) hSetNX(ctx context.Context, q Querier, key, field, value strin
 
 func (o queryOps) lPush(ctx context.Context, q Querier, key string, values []string) (int64, error) {
 	key = encodeKey(key)
-	keyType, err := o.getKeyType(ctx, q, key)
+	_, expiresAt, err := o.prepareMutation(ctx, q, key, TypeList)
 	if err != nil {
 		return 0, err
-	}
-	if keyType != TypeNone && keyType != TypeList {
-		return 0, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
 
 	if len(values) == 0 {
 		// Just return current length
 		var length int64
-		if err := q.QueryRow(ctx, "SELECT COUNT(*) FROM kv_lists WHERE key = $1", key).Scan(&length); err != nil {
+		if err = q.QueryRow(ctx, "SELECT COUNT(*) FROM kv_lists WHERE key = $1", key).Scan(&length); err != nil {
 			return 0, fmt.Errorf("failed to get list length: %w", err)
 		}
 		return length, nil
-	}
-
-	// Use advisory lock to serialize list operations on this key
-	// hashtext returns int4, we need int8 for pg_advisory_xact_lock
-	_, err = q.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", key)
-	if err != nil {
-		return 0, err
 	}
 
 	// Get current min index
@@ -1604,15 +1635,15 @@ func (o queryOps) lPush(ctx context.Context, q Querier, key string, values []str
 	}
 
 	// Set meta before data table for consistent lock ordering (kv_meta before kv_lists).
-	if err := o.setMeta(ctx, q, key, TypeList, nil); err != nil {
+	if err := o.setMeta(ctx, q, key, TypeList, expiresAt); err != nil {
 		return 0, err
 	}
 
 	// Batch insert all values at once
 	_, err = q.Exec(ctx,
-		`INSERT INTO kv_lists (key, idx, value)
-		 SELECT $1, unnest($2::bigint[]), unnest($3::bytea[])`,
-		key, indices, valueBytes,
+		`INSERT INTO kv_lists (key, idx, value, expires_at)
+		 SELECT $1, unnest($2::bigint[]), unnest($3::bytea[]), $4`,
+		key, indices, valueBytes, expiresAt,
 	)
 	if err != nil {
 		return 0, err
@@ -1629,27 +1660,18 @@ func (o queryOps) lPush(ctx context.Context, q Querier, key string, values []str
 
 func (o queryOps) rPush(ctx context.Context, q Querier, key string, values []string) (int64, error) {
 	key = encodeKey(key)
-	keyType, err := o.getKeyType(ctx, q, key)
+	_, expiresAt, err := o.prepareMutation(ctx, q, key, TypeList)
 	if err != nil {
 		return 0, err
-	}
-	if keyType != TypeNone && keyType != TypeList {
-		return 0, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
 
 	if len(values) == 0 {
 		// Just return current length
 		var length int64
-		if err := q.QueryRow(ctx, "SELECT COUNT(*) FROM kv_lists WHERE key = $1", key).Scan(&length); err != nil {
+		if err = q.QueryRow(ctx, "SELECT COUNT(*) FROM kv_lists WHERE key = $1", key).Scan(&length); err != nil {
 			return 0, fmt.Errorf("failed to get list length: %w", err)
 		}
 		return length, nil
-	}
-
-	// Use advisory lock to serialize list operations on this key
-	_, err = q.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", key)
-	if err != nil {
-		return 0, err
 	}
 
 	// Get current max index
@@ -1667,15 +1689,15 @@ func (o queryOps) rPush(ctx context.Context, q Querier, key string, values []str
 	}
 
 	// Set meta before data table for consistent lock ordering (kv_meta before kv_lists).
-	if err := o.setMeta(ctx, q, key, TypeList, nil); err != nil {
+	if err := o.setMeta(ctx, q, key, TypeList, expiresAt); err != nil {
 		return 0, err
 	}
 
 	// Batch insert all values at once
 	_, err = q.Exec(ctx,
-		`INSERT INTO kv_lists (key, idx, value)
-		 SELECT $1, unnest($2::bigint[]), unnest($3::bytea[])`,
-		key, indices, valueBytes,
+		`INSERT INTO kv_lists (key, idx, value, expires_at)
+		 SELECT $1, unnest($2::bigint[]), unnest($3::bytea[]), $4`,
+		key, indices, valueBytes, expiresAt,
 	)
 	if err != nil {
 		return 0, err
@@ -2057,16 +2079,13 @@ func (o queryOps) lIndex(ctx context.Context, q Querier, key string, index int64
 
 func (o queryOps) sAdd(ctx context.Context, q Querier, key string, members []string) (int64, error) {
 	key = encodeKey(key)
-	if len(members) == 0 {
-		return 0, nil
-	}
-
-	keyType, err := o.getKeyType(ctx, q, key)
+	_, expiresAt, err := o.prepareMutation(ctx, q, key, TypeSet)
 	if err != nil {
 		return 0, err
 	}
-	if keyType != TypeNone && keyType != TypeSet {
-		return 0, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
+
+	if len(members) == 0 {
+		return 0, nil
 	}
 
 	// Convert members to bytes for batch insert
@@ -2076,7 +2095,7 @@ func (o queryOps) sAdd(ctx context.Context, q Querier, key string, members []str
 	}
 
 	// Set meta before data table for consistent lock ordering (kv_meta before kv_sets).
-	if err := o.setMeta(ctx, q, key, TypeSet, nil); err != nil {
+	if err := o.setMeta(ctx, q, key, TypeSet, expiresAt); err != nil {
 		return 0, err
 	}
 
@@ -2084,13 +2103,13 @@ func (o queryOps) sAdd(ctx context.Context, q Querier, key string, members []str
 	var added int64
 	err = q.QueryRow(ctx,
 		`WITH inserted AS (
-			INSERT INTO kv_sets (key, member)
-			SELECT $1, unnest($2::bytea[])
+			INSERT INTO kv_sets (key, member, expires_at)
+			SELECT $1, unnest($2::bytea[]), $3
 			ON CONFLICT (key, member) DO NOTHING
 			RETURNING 1
 		)
 		SELECT COUNT(*) FROM inserted`,
-		key, memberBytes,
+		key, memberBytes, expiresAt,
 	).Scan(&added)
 	if err != nil {
 		return 0, err
@@ -2185,12 +2204,9 @@ func (o queryOps) sCard(ctx context.Context, q Querier, key string) (int64, erro
 
 func (o queryOps) zAdd(ctx context.Context, q Querier, key string, members []ZMember, opts ZAddOptions) (int64, error) {
 	key = encodeKey(key)
-	keyType, err := o.getKeyType(ctx, q, key)
+	keyType, expiresAt, err := o.prepareMutation(ctx, q, key, TypeZSet)
 	if err != nil {
 		return 0, err
-	}
-	if keyType != TypeNone && keyType != TypeZSet {
-		return 0, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
 
 	// XX on a non-existent key adds nothing and must not create the key.
@@ -2204,7 +2220,7 @@ func (o queryOps) zAdd(ctx context.Context, q Querier, key string, members []ZMe
 	// Set meta before the data table for consistent lock ordering. When the key
 	// is new this is only reached without XX, where at least one member is always
 	// added, so no phantom empty key is created.
-	if err := o.setMeta(ctx, q, key, TypeZSet, nil); err != nil {
+	if err := o.setMeta(ctx, q, key, TypeZSet, expiresAt); err != nil {
 		return 0, err
 	}
 
@@ -2212,7 +2228,7 @@ func (o queryOps) zAdd(ctx context.Context, q Querier, key string, members []ZMe
 	for _, m := range members {
 		var oldScore float64
 		exists := true
-		err := q.QueryRow(ctx,
+		err = q.QueryRow(ctx,
 			`SELECT score FROM kv_zsets WHERE key = $1 AND member = $2`,
 			key, []byte(m.Member),
 		).Scan(&oldScore)
@@ -2237,7 +2253,7 @@ func (o queryOps) zAdd(ctx context.Context, q Querier, key string, members []ZMe
 			if m.Score == oldScore {
 				continue // no change, not counted by CH
 			}
-			if _, err := q.Exec(ctx,
+			if _, err = q.Exec(ctx,
 				`UPDATE kv_zsets SET score = $3 WHERE key = $1 AND member = $2`,
 				key, []byte(m.Member), m.Score,
 			); err != nil {
@@ -2250,8 +2266,8 @@ func (o queryOps) zAdd(ctx context.Context, q Querier, key string, members []ZMe
 				continue
 			}
 			if _, err := q.Exec(ctx,
-				`INSERT INTO kv_zsets (key, member, score) VALUES ($1, $2, $3)`,
-				key, []byte(m.Member), m.Score,
+				`INSERT INTO kv_zsets (key, member, score, expires_at) VALUES ($1, $2, $3, $4)`,
+				key, []byte(m.Member), m.Score, expiresAt,
 			); err != nil {
 				return 0, err
 			}
@@ -2770,24 +2786,21 @@ func (o queryOps) zRemRangeByRank(ctx context.Context, q Querier, key string, st
 
 func (o queryOps) zIncrBy(ctx context.Context, q Querier, key string, increment float64, member string) (float64, error) {
 	key = encodeKey(key)
-	if err := o.lockKey(ctx, q, key); err != nil {
+	_, expiresAt, err := o.prepareMutation(ctx, q, key, TypeZSet)
+	if err != nil {
 		return 0, err
 	}
-	// Ensure meta entry exists
-	_, err := q.Exec(ctx,
-		`INSERT INTO kv_meta (key, key_type) VALUES ($1, 'zset') ON CONFLICT (key) DO NOTHING`,
-		key,
-	)
-	if err != nil {
+
+	if err := o.setMeta(ctx, q, key, TypeZSet, expiresAt); err != nil {
 		return 0, err
 	}
 
 	var newScore float64
 	err = q.QueryRow(ctx,
-		`INSERT INTO kv_zsets (key, member, score) VALUES ($1, $2, $3)
+		`INSERT INTO kv_zsets (key, member, score, expires_at) VALUES ($1, $2, $3, $4)
 		 ON CONFLICT (key, member) DO UPDATE SET score = kv_zsets.score + EXCLUDED.score
 		 RETURNING score`,
-		key, []byte(member), increment,
+		key, []byte(member), increment, expiresAt,
 	).Scan(&newScore)
 	return newScore, err
 }
@@ -4116,9 +4129,14 @@ func (o queryOps) copyKey(ctx context.Context, q Querier, source, destination st
 
 func (o queryOps) setBit(ctx context.Context, q Querier, key string, offset int64, value int) (int64, error) {
 	key = encodeKey(key)
+	_, expiresAt, err := o.prepareMutation(ctx, q, key, TypeString)
+	if err != nil {
+		return 0, err
+	}
+
 	// Get existing value or create empty
 	var data []byte
-	err := q.QueryRow(ctx,
+	err = q.QueryRow(ctx,
 		"SELECT value FROM kv_strings WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
 		key,
 	).Scan(&data)
@@ -4148,15 +4166,15 @@ func (o queryOps) setBit(ctx context.Context, q Querier, key string, offset int6
 	}
 
 	// Set meta before data table for consistent lock ordering (kv_meta before kv_strings).
-	if err := o.setMeta(ctx, q, key, TypeString, nil); err != nil {
+	if err := o.setMeta(ctx, q, key, TypeString, expiresAt); err != nil {
 		return 0, err
 	}
 
 	// Save back
 	_, err = q.Exec(ctx,
-		`INSERT INTO kv_strings (key, value) VALUES ($1, $2)
+		`INSERT INTO kv_strings (key, value, expires_at) VALUES ($1, $2, $3)
 		 ON CONFLICT (key) DO UPDATE SET value = $2`,
-		key, data,
+		key, data, expiresAt,
 	)
 	if err != nil {
 		return 0, err
@@ -4449,17 +4467,9 @@ func (o queryOps) bitPos(ctx context.Context, q Querier, key string, bit int, st
 
 func (o queryOps) pfAdd(ctx context.Context, q Querier, key string, elements []string) (int64, error) {
 	key = encodeKey(key)
-	// Lock before reading the registers so concurrent PFADDs don't lose updates.
-	if err := o.lockKey(ctx, q, key); err != nil {
-		return 0, err
-	}
-	// Check key type if exists
-	keyType, err := o.getKeyType(ctx, q, key)
+	_, expiresAt, err := o.prepareMutation(ctx, q, key, "hyperloglog")
 	if err != nil {
 		return 0, err
-	}
-	if keyType != TypeNone && keyType != "hyperloglog" {
-		return 0, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
 
 	// Get existing HLL or create new one
@@ -4486,16 +4496,16 @@ func (o queryOps) pfAdd(ctx context.Context, q Querier, key string, elements []s
 	}
 
 	// Update metadata before data table for consistent lock ordering (kv_meta before kv_hyperloglog).
-	err = o.setMeta(ctx, q, key, "hyperloglog", nil)
+	err = o.setMeta(ctx, q, key, "hyperloglog", expiresAt)
 	if err != nil {
 		return 0, err
 	}
 
 	// Save updated HLL
 	_, err = q.Exec(ctx,
-		`INSERT INTO kv_hyperloglog (key, registers) VALUES ($1, $2)
+		`INSERT INTO kv_hyperloglog (key, registers, expires_at) VALUES ($1, $2, $3)
 		 ON CONFLICT (key) DO UPDATE SET registers = $2`,
-		key, hll.ToBytes(),
+		key, hll.ToBytes(), expiresAt,
 	)
 	if err != nil {
 		return 0, err
@@ -4557,13 +4567,9 @@ func (o queryOps) pfMerge(ctx context.Context, q Querier, destKey string, source
 	if err := o.lockKeys(ctx, q, append([]string{destKey}, sourceKeys...)); err != nil {
 		return err
 	}
-	// Check dest key type if exists
-	keyType, err := o.getKeyType(ctx, q, destKey)
+	_, expiresAt, err := o.prepareMutation(ctx, q, destKey, "hyperloglog")
 	if err != nil {
 		return err
-	}
-	if keyType != TypeNone && keyType != "hyperloglog" {
-		return fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
 
 	// Start with dest key's existing HLL (if any)
@@ -4581,7 +4587,7 @@ func (o queryOps) pfMerge(ctx context.Context, q Querier, destKey string, source
 
 	// Merge all source keys
 	for _, key := range sourceKeys {
-		err := q.QueryRow(ctx,
+		err = q.QueryRow(ctx,
 			"SELECT registers FROM kv_hyperloglog WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
 			key,
 		).Scan(&registers)
@@ -4596,15 +4602,15 @@ func (o queryOps) pfMerge(ctx context.Context, q Querier, destKey string, source
 	}
 
 	// Update metadata before data table for consistent lock ordering (kv_meta before kv_hyperloglog).
-	if err := o.setMeta(ctx, q, destKey, "hyperloglog", nil); err != nil {
+	if err := o.setMeta(ctx, q, destKey, "hyperloglog", expiresAt); err != nil {
 		return err
 	}
 
 	// Save merged HLL to dest
 	_, err = q.Exec(ctx,
-		`INSERT INTO kv_hyperloglog (key, registers) VALUES ($1, $2)
+		`INSERT INTO kv_hyperloglog (key, registers, expires_at) VALUES ($1, $2, $3)
 		 ON CONFLICT (key) DO UPDATE SET registers = $2`,
-		destKey, merged.ToBytes(),
+		destKey, merged.ToBytes(), expiresAt,
 	)
 	return err
 }
