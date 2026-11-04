@@ -110,7 +110,7 @@ func TestCJSONBinaryStorageAndNullArguments(t *testing.T) {
 		t.Fatalf("binary round trip = %q, %v; want %q", got, err, binary)
 	}
 	stored, err := ts.client.Get(ctx, key).Result()
-	if err != nil || stored != `"\u0000\u0001`+string([]byte{127, 128, 254, 255})+`\/<>&"` {
+	if err != nil || stored != `"\u0000\u0001\u007f`+string([]byte{128, 254, 255})+`\/<>&"` {
 		t.Fatalf("stored value changed or escaped incorrectly: %q, %v", stored, err)
 	}
 }

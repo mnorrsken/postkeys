@@ -149,3 +149,23 @@ func TestLuaCJSONInvalidRedisArguments(t *testing.T) {
 		t.Fatalf("unexpected response: %#v", got)
 	}
 }
+
+func TestLuaCJSONByteEscapeBoundaries(t *testing.T) {
+	L := lua.NewState()
+	defer L.Close()
+	openCJSON(L)
+	// Redis escapes C0 controls and DEL, but preserves neighboring bytes,
+	// including bytes above ASCII that are not valid UTF-8 on their own.
+	input := string([]byte{0x1f, 0x20, 0x21, 0x7e, 0x7f, 0x80, 0x81})
+	want := `"\u001f !~\u007f` + string([]byte{0x80, 0x81}) + `"`
+	L.SetGlobal("input", lua.LString(input))
+	L.SetGlobal("want", lua.LString(want))
+	if err := L.DoString(`
+  assert(cjson.encode(input) == want)
+  assert(cjson.decode(want) == input)
+  local t = {}; t[input] = input
+  assert(cjson.encode(t) == '{' .. want .. ':' .. want .. '}')
+ `); err != nil {
+		t.Fatal(err)
+	}
+}

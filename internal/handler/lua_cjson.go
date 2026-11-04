@@ -327,7 +327,7 @@ func writeJSONString(b *bytes.Buffer, s string) {
 		case '\t':
 			b.WriteString(`\t`)
 		default:
-			if c < 0x20 {
+			if c < 0x20 || c == 0x7f {
 				b.WriteString(`\u00`)
 				b.WriteByte(hex[c>>4])
 				b.WriteByte(hex[c&15])
