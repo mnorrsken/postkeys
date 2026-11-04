@@ -5,15 +5,32 @@ package storage
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/url"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+func testPubSubDatabaseURL() string {
+	env := func(key, fallback string) string {
+		if value := os.Getenv(key); value != "" {
+			return value
+		}
+		return fallback
+	}
+	u := url.URL{Scheme: "postgres", User: url.UserPassword(env("PG_USER", "postgres"), env("PG_PASSWORD", "testingpassword")), Host: net.JoinHostPort(env("PG_HOST", "localhost"), env("PG_PORT", "5789")), Path: "/" + env("PG_DATABASE", "postgres")}
+	q := u.Query()
+	q.Set("sslmode", env("PG_SSLMODE", "disable"))
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
 func TestPubSubCleanup(t *testing.T) {
 	ctx := context.Background()
-	cfg, err := pgxpool.ParseConfig("postgres://postgres:testingpassword@localhost:5789/postgres?sslmode=disable")
+	cfg, err := pgxpool.ParseConfig(testPubSubDatabaseURL())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +55,7 @@ func TestPubSubCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = pool.Exec(ctx, `INSERT INTO pubsub_messages(channel, message, expires_at)
- SELECT decode('00ff','hex'), decode('ff00','hex'), now() - interval '1 hour' + n * interval '1 microsecond' FROM generate_series(1,1002) n`)
+ SELECT decode('00ff','hex'), decode('ff00','hex'), now() - interval '1 hour' + n * interval '1 microsecond' FROM generate_series(1,16002) n`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,6 +75,28 @@ func TestPubSubCleanup(t *testing.T) {
 	if err := s.FlushDB(ctx); err != nil {
 		t.Fatal(err)
 	}
+	// A second instance holding the transport cleanup advisory lock prevents
+	// this sweep, even though ordinary expired-key cleanup uses a different lock.
+	leader, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := leader.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", advisoryLockPubSubCleanup); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.deleteExpiredPubSubMessages(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var before int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM pubsub_messages").Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if before != 16003 {
+		t.Fatalf("nonleader deleted rows: %d", before)
+	}
+	if err := leader.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.deleteExpiredPubSubMessages(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +105,7 @@ func TestPubSubCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	if count != 3 {
-		t.Fatalf("after first cleanup got %d rows, want locked, one expired and one live", count)
+		t.Fatalf("after first cleanup got %d rows, want two expired (including locked) and one live", count)
 	}
 	if err := tx.Rollback(ctx); err != nil {
 		t.Fatal(err)

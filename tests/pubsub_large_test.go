@@ -4,7 +4,7 @@ package integration
 
 import (
 	"context"
-	"encoding/base64"
+	"crypto/sha256"
 	"fmt"
 	"strings"
 	"testing"
@@ -99,7 +99,7 @@ func TestPubSubLongChannelAndMissingReference(t *testing.T) {
 	if _, err := sub.Receive(ctx); err != nil {
 		t.Fatalf("subscription acknowledgement: %v", err)
 	}
-	missing := base64.StdEncoding.EncodeToString([]byte(`{"r":"9223372036854775807"}`))
+	missing := fmt.Sprintf(`!pk1:{"r":9223372036854775807,"s":0,"n":%d,"k":"%x"}`, len(channel), sha256.Sum256([]byte(channel)))
 	if _, err := store.Pool().Exec(ctx, "SELECT pg_notify($1, $2)", "postkeys_pubsub", missing); err != nil {
 		t.Fatalf("notify missing reference: %v", err)
 	}

@@ -2,14 +2,15 @@
 package pubsub
 
 import (
-	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mnorrsken/postkeys/internal/resp"
+	"github.com/mnorrsken/postkeys/internal/storage"
 )
 
 // broadcastChannel is the single PostgreSQL LISTEN/NOTIFY channel used for all
@@ -27,9 +29,10 @@ const broadcastChannel = "postkeys_pubsub"
 
 // broadcastPayload is the JSON envelope sent via pg_notify on the broadcast channel.
 type broadcastPayload struct {
-	Channel string `json:"c"`
-	Message string `json:"m"`
-	Binary  bool   `json:"b,omitempty"` // when true, c and m are base64-encoded (binary-safe)
+	Channel   string          `json:"c"`
+	Message   string          `json:"m"`
+	Reference json.RawMessage `json:"r,omitempty"`
+	Binary    bool            `json:"b,omitempty"` // when true, c and m are base64-encoded (binary-safe)
 }
 
 // inlinePayloadFits computes the full outer base64 size without encoding either input.
@@ -50,57 +53,84 @@ func encodeInline(channel, message string) (string, error) {
 	return base64.StdEncoding.EncodeToString(data), nil
 }
 
-// decodeBroadcast preserves legacy inline decoding while requiring references to be unambiguous.
+// References intentionally cannot be decoded as base64 by old instances. A
+// coordinated upgrade is required for delivery, but old pods never emit fake
+// empty messages to PSUBSCRIBE * clients.
+const referencePrefix = "!pk1:"
+
+type referencePayload struct {
+	ID          int64   `json:"r"`
+	Channel     *string `json:"c,omitempty"`
+	Key         string  `json:"k"`
+	Size        *int64  `json:"s"`
+	ChannelSize *int64  `json:"n"`
+}
+
+func channelKey(channel string) string { return fmt.Sprintf("%x", sha256.Sum256([]byte(channel))) }
+func referenceChannelFits(headerLen, channelLen int) bool {
+	// Guard before EncodedLen's arithmetic, including synthetic near-MaxInt sizes.
+	return channelLen < 8000 && len(referencePrefix)+headerLen+len(`,"c":""`)+base64.StdEncoding.EncodedLen(channelLen) < 8000
+}
+func encodeReference(id int64, channel string, size int64) string {
+	channelSize := int64(len(channel))
+	ref := referencePayload{ID: id, Key: channelKey(channel), Size: &size, ChannelSize: &channelSize}
+	data, _ := json.Marshal(ref)
+	// Check before encoding: a Redis channel can itself be hundreds of MiB.
+	// Base64 never needs JSON escaping, so its encoded length is exact here.
+	if referenceChannelFits(len(data), len(channel)) {
+		encoded := base64.StdEncoding.EncodeToString([]byte(channel))
+		ref.Channel = &encoded
+		data, _ = json.Marshal(ref)
+	}
+	return referencePrefix + string(data)
+}
+
+func decodeReference(payload string) (referencePayload, error) {
+	var ref referencePayload
+	decoder := json.NewDecoder(strings.NewReader(strings.TrimPrefix(payload, referencePrefix)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&ref); err != nil {
+		return ref, err
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return ref, errors.New("trailing reference data")
+	}
+	if _, err := hex.DecodeString(ref.Key); err != nil {
+		return ref, err
+	}
+	if ref.ID <= 0 || len(ref.Key) != 64 || ref.Size == nil || *ref.Size < 0 || *ref.Size > resp.MaxBulkLen || ref.ChannelSize == nil || *ref.ChannelSize < 0 || *ref.ChannelSize > resp.MaxBulkLen {
+		return ref, errors.New("invalid reference")
+	}
+	if ref.Channel != nil {
+		ch, err := base64.StdEncoding.DecodeString(*ref.Channel)
+		if err != nil || int64(len(ch)) != *ref.ChannelSize || channelKey(string(ch)) != ref.Key {
+			return ref, errors.New("invalid reference channel")
+		}
+		channel := string(ch)
+		ref.Channel = &channel
+	}
+	return ref, nil
+}
+
+// decodeBroadcast decodes inline messages once and preserves the legacy wire.
 func decodeBroadcast(payload string) (channel, message string, id int64, err error) {
+	if strings.HasPrefix(payload, referencePrefix) {
+		ref, e := decodeReference(payload)
+		if ref.Channel != nil {
+			channel = *ref.Channel
+		}
+		return channel, "", ref.ID, e
+	}
 	data, err := base64.StdEncoding.DecodeString(payload)
 	if err != nil {
 		return "", "", 0, err
 	}
-	var fields map[string]json.RawMessage
-	if err = json.Unmarshal(data, &fields); err != nil || fields == nil {
-		if err == nil {
-			err = errors.New("invalid envelope")
-		}
-		return "", "", 0, err
-	}
-	if raw, ok := fields["r"]; ok {
-		decoder := json.NewDecoder(bytes.NewReader(data))
-		_, _ = decoder.Token() // opening object, already validated by Unmarshal
-		keys := 0
-		for decoder.More() {
-			if _, err := decoder.Token(); err != nil {
-				return "", "", 0, err
-			}
-			var value json.RawMessage
-			if err := decoder.Decode(&value); err != nil {
-				return "", "", 0, err
-			}
-			keys++
-		}
-		if keys != 1 {
-			return "", "", 0, errors.New("mixed reference envelope")
-		}
-		if len(fields) != 1 {
-			return "", "", 0, errors.New("mixed reference envelope")
-		}
-		var ref string
-		if err = json.Unmarshal(raw, &ref); err != nil || len(ref) == 0 {
-			return "", "", 0, errors.New("invalid reference")
-		}
-		for _, c := range ref {
-			if c < '0' || c > '9' {
-				return "", "", 0, errors.New("invalid reference")
-			}
-		}
-		id, err = strconv.ParseInt(ref, 10, 64)
-		if err != nil || id <= 0 {
-			return "", "", 0, errors.New("invalid reference")
-		}
-		return "", "", id, nil
-	}
-	var bp broadcastPayload
+	var bp *broadcastPayload
 	if err = json.Unmarshal(data, &bp); err != nil {
 		return "", "", 0, err
+	}
+	if bp == nil || bp.Reference != nil {
+		return "", "", 0, errors.New("invalid envelope")
 	}
 	channel, message = bp.Channel, bp.Message
 	if bp.Binary {
@@ -138,6 +168,10 @@ type Hub struct {
 
 	// Listener connection (dedicated for LISTEN/NOTIFY)
 	listenerConn *pgx.Conn
+	fetchPool    *pgxpool.Pool
+	incoming     chan delivery
+	fetchJobs    chan *pendingDelivery
+	fetched      chan *pendingDelivery
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -183,6 +217,26 @@ func (h *Hub) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to LISTEN on broadcast channel: %w", err)
 	}
 
+	cfg, err := pgxpool.ParseConfig(h.connStr)
+	if err != nil {
+		_ = listenerConn.Close(ctx)
+		return err
+	}
+	cfg.MaxConns = 4
+	cfg.MinConns = 0
+	h.fetchPool, err = pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		_ = listenerConn.Close(ctx)
+		return err
+	}
+	h.incoming = make(chan delivery, 256)
+	h.fetchJobs = make(chan *pendingDelivery)
+	h.fetched = make(chan *pendingDelivery)
+	h.wg.Add(5)
+	go h.dispatchLoop()
+	for i := 0; i < 4; i++ {
+		go h.fetchLoop()
+	}
 	// Start the notification listener goroutine
 	h.wg.Add(1)
 	go h.listenLoop()
@@ -197,6 +251,9 @@ func (h *Hub) Stop() {
 
 	if h.listenerConn != nil {
 		_ = h.listenerConn.Close(context.Background())
+	}
+	if h.fetchPool != nil {
+		h.fetchPool.Close()
 	}
 }
 
@@ -363,11 +420,11 @@ func (h *Hub) Publish(ctx context.Context, channel, message string) (int64, erro
 			defer cancel()
 			_ = tx.Rollback(rollbackCtx)
 		}()
-		var id int64
-		if err := tx.QueryRow(ctx, `INSERT INTO pubsub_messages (channel, message, expires_at) VALUES ($1, $2, clock_timestamp() + interval '5 minutes') RETURNING id`, []byte(channel), []byte(message)).Scan(&id); err != nil {
+		id, err := storage.StorePubSubMessage(ctx, tx, channel, message)
+		if err != nil {
 			return 0, fmt.Errorf("failed to store broadcast payload: %w", err)
 		}
-		payload := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf(`{"r":"%d"}`, id)))
+		payload := encodeReference(id, channel, int64(len(message)))
 		if _, err := tx.Exec(ctx, "SELECT pg_notify($1, $2)", broadcastChannel, payload); err != nil {
 			return 0, fmt.Errorf("failed to notify: %w", err)
 		}
@@ -562,32 +619,18 @@ func (h *Hub) listenLoop() {
 			continue
 		}
 
-		channel, message, id, err := decodeBroadcast(notification.Payload)
+		item, err := decodeDelivery(notification.Payload)
 		if err != nil {
 			log.Printf("Warning: failed to decode broadcast payload: %v", err)
 			continue
 		}
-		if id != 0 {
-			ctx, cancel := context.WithTimeout(h.ctx, 10*time.Second)
-			var ch, msg []byte
-			err := h.pool.QueryRow(ctx, "SELECT channel, message FROM pubsub_messages WHERE id = $1", id).Scan(&ch, &msg)
-			cancel()
-			if err != nil {
-				log.Printf("Warning: failed to fetch pub/sub message %d: %v", id, err)
-				continue
-			}
-			channel, message = string(ch), string(msg)
+		// Pub/sub is best effort. Drop the incoming notification when capacity is
+		// exhausted rather than blocking LISTEN or retaining unbounded payloads.
+		select {
+		case h.incoming <- item:
+		default:
+			log.Printf("Warning: pub/sub dispatch queue full; dropping notification")
 		}
-
-		if h.debug {
-			log.Printf("[DEBUG] Received pub/sub broadcast: channel=%s", channel)
-		}
-
-		// Deliver to channel subscribers
-		h.deliverToChannel(channel, message)
-
-		// Deliver to pattern subscribers
-		h.deliverToPatterns(channel, message)
 	}
 }
 
@@ -636,55 +679,6 @@ func isTimeoutError(err error) bool {
 	// Also check error string for wrapped timeout messages from pgx
 	errStr := err.Error()
 	return strings.Contains(errStr, "context deadline exceeded")
-}
-
-// deliverToChannel delivers a message to all subscribers of a channel
-func (h *Hub) deliverToChannel(channel, payload string) {
-	h.mu.RLock()
-	subs := h.subscriptions[channel]
-	// Make a copy to avoid holding the lock during delivery
-	subscribers := make([]Subscriber, 0, len(subs))
-	for _, sub := range subs {
-		subscribers = append(subscribers, sub)
-	}
-	h.mu.RUnlock()
-
-	for _, sub := range subscribers {
-		if err := sub.SendPubSubMessage("message", channel, payload); err != nil {
-			if h.debug {
-				log.Printf("[DEBUG] Failed to deliver message to subscriber %d: %v", sub.GetID(), err)
-			}
-		}
-	}
-}
-
-// deliverToPatterns delivers a message to all pattern subscribers whose pattern matches the channel
-func (h *Hub) deliverToPatterns(channel, payload string) {
-	h.patternMu.RLock()
-	var matches []struct {
-		pattern string
-		sub     Subscriber
-	}
-	for pattern, subs := range h.patterns {
-		if matchPattern(pattern, channel) {
-			for _, sub := range subs {
-				matches = append(matches, struct {
-					pattern string
-					sub     Subscriber
-				}{pattern, sub})
-			}
-		}
-	}
-	h.patternMu.RUnlock()
-
-	for _, match := range matches {
-		// For pattern matches, send pmessage
-		if err := match.sub.SendPubSubMessage("pmessage", match.pattern+"\x00"+channel, payload); err != nil {
-			if h.debug {
-				log.Printf("[DEBUG] Failed to deliver pmessage to subscriber %d: %v", match.sub.GetID(), err)
-			}
-		}
-	}
 }
 
 // matchPattern checks if a channel matches a Redis-style glob pattern

@@ -561,9 +561,35 @@ For deployment examples, including usage with CloudNativePG, see the [examples/]
 - **Lua Scripts**: EVAL/EVALSHA scripting engine with script caching
 
 Pub/sub messages that fit in a PostgreSQL notification are sent inline. Larger
-messages are stored temporarily in PostgreSQL and notifications carry a reference
-to them. Stored messages expire after five minutes and are removed by background
-cleanup. Delivery is best effort: disconnected listeners and failed or delayed
-fetches can miss messages, and there is no replay. Upgrade all instances sharing
-a database together before publishing large messages, since older instances do
-not understand references.
+messages are stored temporarily in an UNLOGGED PostgreSQL table and notifications
+carry a versioned reference with channel metadata. Replicas fetch bodies only
+when local exact or pattern subscribers match; oversized channel names use a
+metadata query first. Stored messages expire after five minutes. One elected
+sweeper drains at most 16 batches of 1000 expired rows per cleanup cycle.
+Delivery is best effort: disconnected listeners, crash recovery, failed or delayed
+fetches, and saturated dispatch queues can lose messages, and there is no replay.
+Each instance has four dedicated fetch connections and bounded queues (256
+incoming and 256 pending notifications, plus at most 4096 subscriber delivery
+reservations). Referenced channel and body bytes reserve at most 64 MiB in total;
+one reference above 64 MiB is admitted only when no other referenced bytes are
+reserved. Each field still supports the RESP 512 MiB limit. Excess notifications are dropped with a warning. Retained messages
+preserve each client's order across both exact and pattern subscriptions. A client
+that does not match a pending large message can receive inline messages while
+that fetch waits. Oversized channel metadata conservatively reserves pattern
+clients until its channel is known.
+
+Upgrade all instances sharing a database together before publishing large
+messages, since older instances do not understand references. The Helm Deployment
+uses `Recreate`, which stops its old pods before starting new ones and causes
+service downtime during upgrades. If multiple Deployments or releases share a
+database, stop all their old instances before starting any new version; Recreate
+coordinates only one Deployment. The reference prefix makes older decoders reject
+references, preventing fake empty pattern messages during accidental overlap,
+but does not make mixed-version delivery supported.
+
+For installations using a pre-release version that already created a logged
+`pubsub_messages` table, the initializer leaves that existing table intact. During
+the coordinated shutdown, before restarting instances, run
+`ALTER TABLE pubsub_messages SET UNLOGGED` in the configured schema to convert it.
+Do not convert while instances are publishing: the operation takes an exclusive
+table lock. Key/value tables remain logged and durable.

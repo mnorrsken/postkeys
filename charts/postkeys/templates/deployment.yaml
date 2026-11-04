@@ -5,6 +5,10 @@ metadata:
   labels:
     {{- include "postkeys.labels" . | nindent 4 }}
 spec:
+  # Stop all previous protocol versions before starting this deployment.
+  strategy:
+    type: Recreate
+    rollingUpdate: null
   {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
   {{- end }}
