@@ -99,3 +99,53 @@ func TestLuaCJSONExecutor(t *testing.T) {
 		t.Fatalf("unexpected response: %#v", got)
 	}
 }
+
+func TestLuaCJSONBinaryStrings(t *testing.T) {
+	L := lua.NewState()
+	defer L.Close()
+	openCJSON(L)
+	// Cover every byte, including malformed UTF-8 and embedded NUL, as both
+	// values and keys. Compare bytes directly, not through a JSON decoder.
+	var binary strings.Builder
+	for i := 0; i < 256; i++ {
+		binary.WriteByte(byte(i))
+	}
+	L.SetGlobal("binary", lua.LString(binary.String()))
+	if err := L.DoString(`
+  assert(cjson.decode(cjson.encode(binary)) == binary)
+  local object = {}; object[binary] = binary
+  assert(cjson.decode(cjson.encode(object))[binary] == binary)
+  assert(cjson.decode('"' .. string.char(255,254) .. 'abc"') == string.char(255,254) .. 'abc')
+  assert(cjson.encode('<>&/"\\\b\f\n\r\t') == '"<>&\\/\\"\\\\\\b\\f\\n\\r\\t"')
+  assert(cjson.decode('"\\uD834\\uDD1E"') == '𝄞')
+  for _, s in ipairs({'"\\uD800"','"\\uDC00"','"\\uD800\\u0041"','"\\uD800x"'}) do
+   assert(not pcall(cjson.decode,s), s)
+  end
+  local nested = cjson.decode('{"a:b,c":["x",{"escaped\\"key":"v"}],"last":"z"}')
+  assert(nested['a:b,c'][2]['escaped"key'] == 'v' and nested.last == 'z')
+ `); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLuaCJSONInvalidRedisArguments(t *testing.T) {
+	le := newLuaExecutor(context.Background(), nil, nil, nil, nil)
+	got, err := le.Execute(`
+  local expected = 'ERR Lua redis lib command arguments must be strings or integers'
+  local values = {cjson.null, {}, true, false, function() end}
+  for _, v in ipairs(values) do
+   assert(redis.pcall('SET', 'key', v).err == expected)
+   local ok, msg = pcall(redis.call, 'SET', 'key', v)
+   assert(not ok and string.find(msg, expected, 1, true))
+   assert(redis.pcall(v).err == expected)
+  end
+  assert(redis.pcall('SET','key',nil).err == expected)
+  return 'ok'
+ `)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Bulk != "ok" {
+		t.Fatalf("unexpected response: %#v", got)
+	}
+}

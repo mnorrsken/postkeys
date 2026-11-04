@@ -91,3 +91,26 @@ func TestCJSONFHIRcastCompareAndSet(t *testing.T) {
 		})
 	}
 }
+
+func TestCJSONBinaryStorageAndNullArguments(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+	const key = "cjson:binary"
+	binary := string([]byte{0, 1, 127, 128, 254, 255}) + "/<>&"
+	script := `
+  redis.call('SET', KEYS[1], cjson.encode(ARGV[1]))
+  local decoded = cjson.decode(redis.call('GET', KEYS[1]))
+  local result = redis.pcall('SET', KEYS[1], cjson.null)
+  assert(result.err == 'ERR Lua redis lib command arguments must be strings or integers')
+  return decoded
+ `
+	got, err := ts.client.Eval(ctx, script, []string{key}, binary).Text()
+	if err != nil || got != binary {
+		t.Fatalf("binary round trip = %q, %v; want %q", got, err, binary)
+	}
+	stored, err := ts.client.Get(ctx, key).Result()
+	if err != nil || stored != `"\u0000\u0001`+string([]byte{127, 128, 254, 255})+`\/<>&"` {
+		t.Fatalf("stored value changed or escaped incorrectly: %q, %v", stored, err)
+	}
+}
