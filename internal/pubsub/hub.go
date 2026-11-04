@@ -152,19 +152,23 @@ type Subscriber interface {
 	GetID() uint64
 }
 
+// subscription is an identity token for one active subscription generation.
+// Removing and adding the same client/channel must never revive queued routes.
+type subscription struct{ Subscriber }
+
 // Hub manages pub/sub subscriptions and message routing
 type Hub struct {
 	pool    *pgxpool.Pool
 	connStr string
 
 	mu            sync.RWMutex
-	subscriptions map[string]map[uint64]Subscriber // channel -> subscriberID -> subscriber
-	subscribers   map[uint64]map[string]bool       // subscriberID -> channels
+	subscriptions map[string]map[uint64]*subscription // channel -> subscriberID -> subscriber
+	subscribers   map[uint64]map[string]bool          // subscriberID -> channels
 
 	// Pattern subscriptions (for PSUBSCRIBE)
 	patternMu   sync.RWMutex
-	patterns    map[string]map[uint64]Subscriber // pattern -> subscriberID -> subscriber
-	subPatterns map[uint64]map[string]bool       // subscriberID -> patterns
+	patterns    map[string]map[uint64]*subscription // pattern -> subscriberID -> subscriber
+	subPatterns map[uint64]map[string]bool          // subscriberID -> patterns
 
 	// Listener connection (dedicated for LISTEN/NOTIFY)
 	listenerConn *pgx.Conn
@@ -185,9 +189,9 @@ func NewHub(pool *pgxpool.Pool, connStr string) *Hub {
 	return &Hub{
 		pool:          pool,
 		connStr:       connStr,
-		subscriptions: make(map[string]map[uint64]Subscriber),
+		subscriptions: make(map[string]map[uint64]*subscription),
 		subscribers:   make(map[uint64]map[string]bool),
-		patterns:      make(map[string]map[uint64]Subscriber),
+		patterns:      make(map[string]map[uint64]*subscription),
 		subPatterns:   make(map[uint64]map[string]bool),
 		ctx:           ctx,
 		cancel:        cancel,
@@ -273,11 +277,13 @@ func (h *Hub) Subscribe(sub Subscriber, channels ...string) []int {
 	for i, channel := range channels {
 		// Initialize channel's subscriber set if needed
 		if _, exists := h.subscriptions[channel]; !exists {
-			h.subscriptions[channel] = make(map[uint64]Subscriber)
+			h.subscriptions[channel] = make(map[uint64]*subscription)
 		}
 
 		// Add subscriber to channel
-		h.subscriptions[channel][subID] = sub
+		if _, exists := h.subscriptions[channel][subID]; !exists {
+			h.subscriptions[channel][subID] = &subscription{Subscriber: sub}
+		}
 		h.subscribers[subID][channel] = true
 
 		// Count total subscriptions for this subscriber
@@ -345,11 +351,13 @@ func (h *Hub) PSubscribe(sub Subscriber, patterns ...string) []int {
 	for i, pattern := range patterns {
 		// Initialize pattern's subscriber set if needed
 		if _, exists := h.patterns[pattern]; !exists {
-			h.patterns[pattern] = make(map[uint64]Subscriber)
+			h.patterns[pattern] = make(map[uint64]*subscription)
 		}
 
 		// Add subscriber to pattern
-		h.patterns[pattern][subID] = sub
+		if _, exists := h.patterns[pattern][subID]; !exists {
+			h.patterns[pattern][subID] = &subscription{Subscriber: sub}
+		}
 		h.subPatterns[subID][pattern] = true
 
 		// Count total pattern subscriptions for this subscriber

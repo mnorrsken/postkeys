@@ -1,6 +1,7 @@
 package pubsub
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -194,4 +195,158 @@ func TestDispatchBodyBudgetAndOversizedAdmission(t *testing.T) {
 	complete(take())
 	h.incoming <- delivery{channel: "body", known: true, message: "released"}
 	awaitMessage(t, sub, "body", "released")
+}
+
+func TestDelayedReferenceInvalidatedByUnsubscribe(t *testing.T) {
+	for _, mode := range []string{"exact", "pattern", "remove-all"} {
+		for _, resubscribe := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/resubscribe=%t", mode, resubscribe), func(t *testing.T) {
+				h := NewHub(nil, "")
+				h.incoming = make(chan delivery, 256)
+				h.fetchJobs = make(chan *pendingDelivery)
+				h.fetched = make(chan *pendingDelivery)
+				sub := &recordingSubscriber{id: 1, messages: make(chan receivedMessage, 10)}
+				observer := &recordingSubscriber{id: 2, messages: make(chan receivedMessage, 10)}
+				h.Subscribe(observer, "marker")
+				subscribe := func() {
+					if mode != "pattern" {
+						h.Subscribe(sub, "route")
+					}
+					if mode != "exact" {
+						h.PSubscribe(sub, "r*")
+					}
+				}
+				subscribe()
+				h.wg.Add(1)
+				go h.dispatchLoop()
+				defer h.Stop()
+				h.incoming <- delivery{channel: "route", known: true, id: 1}
+				var pending *pendingDelivery
+				select {
+				case pending = <-h.fetchJobs:
+				case <-time.After(time.Second):
+					t.Fatal("reference not pending")
+				}
+				switch mode {
+				case "exact":
+					h.Unsubscribe(sub, "route")
+				case "pattern":
+					h.PUnsubscribe(sub, "r*")
+				case "remove-all":
+					h.RemoveSubscriber(sub.GetID())
+				}
+				// Unsubscribe has returned: a real handler may now acknowledge removal and
+				// reuse RESP2 for ordinary commands. Reusing the same client and route must
+				// create a fresh generation instead of reviving the pending reference.
+				if resubscribe {
+					subscribe()
+				}
+				pending.message = "stale"
+				h.fetched <- pending
+				h.incoming <- delivery{channel: "route", known: true, message: "new generation"}
+				h.incoming <- delivery{channel: "marker", known: true, message: "processed"}
+				awaitMessage(t, observer, "marker", "processed")
+				if resubscribe {
+					if mode != "pattern" {
+						awaitMessage(t, sub, "route", "new generation")
+					}
+					if mode != "exact" {
+						awaitMessage(t, sub, "r*\x00route", "new generation")
+					}
+				}
+				select {
+				case got := <-sub.messages:
+					t.Fatalf("delivery survived subscription removal: %+v", got)
+				default:
+				}
+			})
+		}
+	}
+}
+
+func TestDuplicateSubscribePreservesPendingGeneration(t *testing.T) {
+	for _, pattern := range []bool{false, true} {
+		t.Run(fmt.Sprintf("pattern=%t", pattern), func(t *testing.T) {
+			h := NewHub(nil, "")
+			sub := &recordingSubscriber{messages: make(chan receivedMessage, 2)}
+			subscribe := func() {
+				if pattern {
+					h.PSubscribe(sub, "r*")
+				} else {
+					h.Subscribe(sub, "route")
+				}
+			}
+			subscribe()
+			targets, ok := h.snapshotTargets(delivery{channel: "route", known: true}, 10)
+			if !ok || len(targets) != 1 {
+				t.Fatal("missing route")
+			}
+			subscribe()
+			h.sendTarget(targets[0], delivery{channel: "route", message: "retained"})
+			channel := "route"
+			if pattern {
+				channel = "r*\x00route"
+			}
+			awaitMessage(t, sub, channel, "retained")
+		})
+	}
+}
+
+type blockingSubscriber struct{ entered, release, completed chan struct{} }
+
+func (*blockingSubscriber) GetID() uint64 { return 1 }
+func (s *blockingSubscriber) SendPubSubMessage(_, _, _ string) error {
+	close(s.entered)
+	<-s.release
+	close(s.completed)
+	return nil
+}
+func TestUnsubscribeSerializesWithInProgressDelivery(t *testing.T) {
+	for _, pattern := range []bool{false, true} {
+		t.Run(fmt.Sprintf("pattern=%t", pattern), func(t *testing.T) {
+			h := NewHub(nil, "")
+			sub := &blockingSubscriber{entered: make(chan struct{}), release: make(chan struct{}), completed: make(chan struct{})}
+			if pattern {
+				h.PSubscribe(sub, "r*")
+			} else {
+				h.Subscribe(sub, "route")
+			}
+			targets, _ := h.snapshotTargets(delivery{channel: "route", known: true}, 10)
+			go h.sendTarget(targets[0], delivery{channel: "route", message: "before unsubscribe"})
+			<-sub.entered
+			released := false
+			defer func() {
+				if !released {
+					close(sub.release)
+				}
+			}()
+			// Removal cannot be acknowledged while an earlier send can still write.
+			removed := make(chan struct{})
+			go func() {
+				if pattern {
+					h.PUnsubscribe(sub, "r*")
+				} else {
+					h.Unsubscribe(sub, "route")
+				}
+				close(removed)
+			}()
+			select {
+			case <-removed:
+				t.Error("unsubscribe returned while a delivery could still write")
+			case <-time.After(20 * time.Millisecond):
+			}
+			close(sub.release)
+			released = true
+			select {
+			case <-removed:
+			case <-time.After(time.Second):
+				t.Fatal("unsubscribe blocked after send completed")
+			}
+			select {
+			case <-sub.completed:
+			default:
+				t.Fatal("removal acknowledged before send completed")
+			}
+		})
+	}
 }
