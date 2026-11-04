@@ -1334,7 +1334,7 @@ func (o queryOps) hDel(ctx context.Context, q Querier, key string, fields []stri
 		return 0, err
 	}
 	defer func() {
-		if cleanupErr == nil {
+		if cleanupErr == nil && removed > 0 {
 			cleanupErr = o.removeEmptyMeta(ctx, q, []string{key}, TypeHash)
 		}
 	}()
@@ -1742,7 +1742,7 @@ func (o queryOps) lPop(ctx context.Context, q Querier, key string) (poppedValue 
 		return "", false, err
 	}
 	defer func() {
-		if cleanupErr == nil {
+		if cleanupErr == nil && found {
 			cleanupErr = o.removeEmptyMeta(ctx, q, []string{key}, TypeList)
 		}
 	}()
@@ -1777,7 +1777,7 @@ func (o queryOps) rPop(ctx context.Context, q Querier, key string) (poppedValue 
 		return "", false, err
 	}
 	defer func() {
-		if cleanupErr == nil {
+		if cleanupErr == nil && found {
 			cleanupErr = o.removeEmptyMeta(ctx, q, []string{key}, TypeList)
 		}
 	}()
@@ -2188,7 +2188,7 @@ func (o queryOps) sRem(ctx context.Context, q Querier, key string, members []str
 		return 0, err
 	}
 	defer func() {
-		if cleanupErr == nil {
+		if cleanupErr == nil && removed > 0 {
 			cleanupErr = o.removeEmptyMeta(ctx, q, []string{key}, TypeSet)
 		}
 	}()
@@ -2465,7 +2465,7 @@ func (o queryOps) zRem(ctx context.Context, q Querier, key string, members []str
 		return 0, err
 	}
 	defer func() {
-		if cleanupErr == nil {
+		if cleanupErr == nil && removed > 0 {
 			cleanupErr = o.removeEmptyMeta(ctx, q, []string{key}, TypeZSet)
 		}
 	}()
@@ -2810,7 +2810,7 @@ func (o queryOps) zRemRangeByScore(ctx context.Context, q Querier, key string, m
 		return 0, err
 	}
 	defer func() {
-		if cleanupErr == nil {
+		if cleanupErr == nil && removed > 0 {
 			cleanupErr = o.removeEmptyMeta(ctx, q, []string{key}, TypeZSet)
 		}
 	}()
@@ -2830,13 +2830,10 @@ func (o queryOps) zRemRangeByRank(ctx context.Context, q Querier, key string, st
 		return 0, err
 	}
 	defer func() {
-		if cleanupErr == nil {
+		if cleanupErr == nil && removed > 0 {
 			cleanupErr = o.removeEmptyMeta(ctx, q, []string{key}, TypeZSet)
 		}
 	}()
-	if err := o.lockKey(ctx, q, key); err != nil {
-		return 0, err
-	}
 	// Get total count first to handle negative indices
 	var count int64
 	err := q.QueryRow(ctx,
@@ -2907,7 +2904,7 @@ func (o queryOps) zPopMin(ctx context.Context, q Querier, key string, count int6
 		return nil, err
 	}
 	defer func() {
-		if cleanupErr == nil {
+		if cleanupErr == nil && len(resultMembers) > 0 {
 			cleanupErr = o.removeEmptyMeta(ctx, q, []string{key}, TypeZSet)
 		}
 	}()
@@ -2958,7 +2955,7 @@ func (o queryOps) lRem(ctx context.Context, q Querier, key string, count int64, 
 		return 0, err
 	}
 	defer func() {
-		if cleanupErr == nil {
+		if cleanupErr == nil && removed > 0 {
 			cleanupErr = o.removeEmptyMeta(ctx, q, []string{key}, TypeList)
 		}
 	}()
@@ -3727,7 +3724,7 @@ func (o queryOps) zPopMax(ctx context.Context, q Querier, key string, count int6
 		return nil, err
 	}
 	defer func() {
-		if cleanupErr == nil {
+		if cleanupErr == nil && len(resultMembers) > 0 {
 			cleanupErr = o.removeEmptyMeta(ctx, q, []string{key}, TypeZSet)
 		}
 	}()

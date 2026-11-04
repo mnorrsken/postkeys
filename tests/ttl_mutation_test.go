@@ -484,6 +484,24 @@ func TestMutationRepairsLegacyEmptyMetadata(t *testing.T) {
 		t.Fatalf("%d orphaned expired rows", retained)
 	}
 
+	for _, tc := range []struct {
+		kind string
+		cmd  []interface{}
+	}{
+		{"list", []interface{}{"LMPOP", 1, "legacy-pop", "LEFT"}},
+		{"zset", []interface{}{"ZMPOP", 1, "legacy-pop", "MIN"}},
+	} {
+		if _, err := conn.Exec(ctx, "INSERT INTO kv_meta(key,key_type,expires_at) VALUES ('legacy-pop',$1,NOW()+interval '1 hour')", tc.kind); err != nil {
+			t.Fatal(err)
+		}
+		if err := ts.client.Do(ctx, tc.cmd...).Err(); err != redis.Nil {
+			t.Fatalf("legacy empty pop: %v", err)
+		}
+		if n, err := ts.client.Exists(ctx, "legacy-pop").Result(); err != nil || n != 0 {
+			t.Fatalf("legacy pop metadata survived: %d,%v", n, err)
+		}
+	}
+
 }
 
 func TestListMoveDestinationPreservesTTL(t *testing.T) {
@@ -524,5 +542,89 @@ func TestListMoveDestinationPreservesTTL(t *testing.T) {
 	}
 	if n, err := c.Exists(ctx, "move-src").Result(); err != nil || n != 0 {
 		t.Fatalf("source metadata survived: %d,%v", n, err)
+	}
+}
+
+func TestNoopCollectionRemovalPreservesStateAndTTL(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+	conn := mutationTestConn(t)
+	c := ts.client
+	cases := []struct{ setup, remove, read []interface{} }{
+		{[]interface{}{"HSET", "noop", "a", 1}, []interface{}{"HDEL", "noop", "missing"}, []interface{}{"HGETALL", "noop"}},
+		{[]interface{}{"SADD", "noop", "a"}, []interface{}{"SREM", "noop", "missing"}, []interface{}{"SMEMBERS", "noop"}},
+		{[]interface{}{"RPUSH", "noop", "a"}, []interface{}{"LREM", "noop", 0, "missing"}, []interface{}{"LRANGE", "noop", 0, -1}},
+		{[]interface{}{"RPUSH", "noop", "a"}, []interface{}{"LREM", "noop", 1, "missing"}, []interface{}{"LRANGE", "noop", 0, -1}},
+		{[]interface{}{"ZADD", "noop", 1, "a"}, []interface{}{"ZREM", "noop", "missing"}, []interface{}{"ZRANGE", "noop", 0, -1, "WITHSCORES"}},
+		{[]interface{}{"ZADD", "noop", 1, "a"}, []interface{}{"ZREMRANGEBYSCORE", "noop", 10, 20}, []interface{}{"ZRANGE", "noop", 0, -1, "WITHSCORES"}},
+		{[]interface{}{"ZADD", "noop", 1, "a"}, []interface{}{"ZREMRANGEBYRANK", "noop", 10, 20}, []interface{}{"ZRANGE", "noop", 0, -1, "WITHSCORES"}},
+		{[]interface{}{"ZADD", "noop", 1, "a"}, []interface{}{"ZPOPMIN", "noop", 0}, []interface{}{"ZRANGE", "noop", 0, -1, "WITHSCORES"}},
+		{[]interface{}{"ZADD", "noop", 1, "a"}, []interface{}{"ZPOPMAX", "noop", 0}, []interface{}{"ZRANGE", "noop", 0, -1, "WITHSCORES"}},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprint(tc.remove), func(t *testing.T) {
+			if err := c.Del(ctx, "noop").Err(); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Do(ctx, tc.setup...).Err(); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.PExpire(ctx, "noop", time.Minute).Err(); err != nil {
+				t.Fatal(err)
+			}
+			want, err := c.Do(ctx, tc.read...).Result()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var before, after time.Time
+			if err := conn.QueryRow(ctx, "SELECT expires_at FROM kv_meta WHERE key='noop'").Scan(&before); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Do(ctx, tc.remove...).Err(); err != nil {
+				t.Fatal(err)
+			}
+			got, err := c.Do(ctx, tc.read...).Result()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Fatalf("no-op changed state: %v -> %v", want, got)
+			}
+			if err := conn.QueryRow(ctx, "SELECT expires_at FROM kv_meta WHERE key='noop'").Scan(&after); err != nil {
+				t.Fatal(err)
+			}
+			if !before.Equal(after) {
+				t.Fatalf("no-op changed expiry: %v -> %v", before, after)
+			}
+		})
+	}
+	for _, cmd := range [][]interface{}{
+		{"HDEL", "wrong-removal", "a"}, {"SREM", "wrong-removal", "a"}, {"ZREM", "wrong-removal", "a"},
+		{"LPOP", "wrong-removal"}, {"RPOP", "wrong-removal"}, {"LREM", "wrong-removal", 1, "a"},
+		{"ZREMRANGEBYSCORE", "wrong-removal", 0, 1}, {"ZREMRANGEBYRANK", "wrong-removal", 0, -1},
+		{"ZPOPMIN", "wrong-removal", 0}, {"ZPOPMAX", "wrong-removal", 0},
+	} {
+		if err := c.Set(ctx, "wrong-removal", "value", time.Minute).Err(); err != nil {
+			t.Fatal(err)
+		}
+		err := c.Do(ctx, cmd...).Err()
+		if err == nil || err.Error() != "WRONGTYPE Operation against a key holding the wrong kind of value" {
+			t.Fatalf("%v error=%v", cmd, err)
+		}
+		if got, err := c.Get(ctx, "wrong-removal").Result(); err != nil || got != "value" {
+			t.Fatalf("wrongtype changed state: %q,%v", got, err)
+		}
+		if ttl, err := c.PTTL(ctx, "wrong-removal").Result(); err != nil || ttl <= 0 {
+			t.Fatalf("wrongtype changed TTL: %v,%v", ttl, err)
+		}
+	}
+	for _, cmd := range [][]interface{}{{"HDEL", "missing-noop", "a"}, {"SREM", "missing-noop", "a"}, {"ZREM", "missing-noop", "a"}, {"LPOP", "missing-noop"}, {"RPOP", "missing-noop"}, {"LREM", "missing-noop", 0, "a"}, {"ZREMRANGEBYRANK", "missing-noop", 0, -1}, {"LMPOP", 1, "missing-noop", "LEFT"}, {"ZMPOP", 1, "missing-noop", "MIN"}} {
+		if err := c.Do(ctx, cmd...).Err(); err != nil && err != redis.Nil {
+			t.Fatalf("%v: %v", cmd, err)
+		}
+		if n, err := c.Exists(ctx, "missing-noop").Result(); err != nil || n != 0 {
+			t.Fatalf("no-op created missing key: %v,%v", n, err)
+		}
 	}
 }

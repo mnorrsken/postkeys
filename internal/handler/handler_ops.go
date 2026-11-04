@@ -1177,6 +1177,9 @@ func (h *Handler) hdelOp(ctx context.Context, ops storage.Operations, args []res
 
 	deleted, err := ops.HDel(ctx, key, fields)
 	if err != nil {
+		if strings.Contains(err.Error(), "WRONGTYPE") {
+			return resp.ErrWrongType()
+		}
 		return resp.Err(err.Error())
 	}
 	return resp.Int(deleted)
@@ -1530,6 +1533,9 @@ func (h *Handler) lpopOp(ctx context.Context, ops storage.Operations, args []res
 
 	value, found, err := ops.LPop(ctx, args[0].Bulk)
 	if err != nil {
+		if strings.Contains(err.Error(), "WRONGTYPE") {
+			return resp.ErrWrongType()
+		}
 		return resp.Err(err.Error())
 	}
 	if !found {
@@ -1545,6 +1551,9 @@ func (h *Handler) rpopOp(ctx context.Context, ops storage.Operations, args []res
 
 	value, found, err := ops.RPop(ctx, args[0].Bulk)
 	if err != nil {
+		if strings.Contains(err.Error(), "WRONGTYPE") {
+			return resp.ErrWrongType()
+		}
 		return resp.Err(err.Error())
 	}
 	if !found {
@@ -2035,6 +2044,9 @@ func (h *Handler) sremOp(ctx context.Context, ops storage.Operations, args []res
 
 	removed, err := ops.SRem(ctx, key, members)
 	if err != nil {
+		if strings.Contains(err.Error(), "WRONGTYPE") {
+			return resp.ErrWrongType()
+		}
 		return resp.Err(err.Error())
 	}
 	return resp.Int(removed)
