@@ -340,7 +340,7 @@ func TestStalledSubscriberDoesNotBlockPublish(t *testing.T) {
 			} else {
 				h.Subscribe(stalled, "route")
 			}
-			targets, _ := h.snapshotTargets(delivery{channel: "route", known: true}, 10)
+			targets := h.snapshotTargets(delivery{channel: "route", known: true})
 			go h.sendTarget(targets[0], delivery{channel: "route", message: "stalled"})
 			<-stalled.entered
 			released := false
@@ -393,4 +393,31 @@ func TestStalledSubscriberDoesNotBlockPublish(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPublishFanoutBeyond4096Subscriptions(t *testing.T) {
+	pool, connStr := testPubSubPool(t, nil)
+	h := startTestHub(t, pool, connStr)
+	const clients = 4097
+	messages := make(chan receivedMessage, clients)
+	for id := 1; id <= clients; id++ {
+		h.Subscribe(&recordingSubscriber{id: uint64(id), messages: messages}, "fanout-all")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	if count, err := h.Publish(ctx, "fanout-all", "all"); err != nil || count != clients {
+		t.Fatalf("publish count %d, error%v", count, err)
+	}
+	for i := 0; i < clients; i++ {
+		select {
+		case msg := <-messages:
+			if msg != (receivedMessage{"fanout-all", "all"}) {
+				t.Fatalf("unexpected delivery %+v", msg)
+			}
+		case <-ctx.Done():
+			t.Fatalf("delivered only%d/%d", i, clients)
+		}
+	}
+	t.Logf("actual LISTEN/dispatch fanout: %d/%d in%s", clients, clients, time.Since(start))
 }

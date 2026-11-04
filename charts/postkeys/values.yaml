@@ -1,6 +1,14 @@
 # Default values for postkeys
 replicaCount: 1
 
+# Set type=Recreate for a coordinated protocol migration, then restore
+# RollingUpdate for subsequent compatible releases.
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 25%
+    maxUnavailable: 25%
+
 image:
   repository: ghcr.io/mnorrsken/postkeys
   pullPolicy: IfNotPresent

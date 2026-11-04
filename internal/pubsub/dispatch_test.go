@@ -2,6 +2,7 @@ package pubsub
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -38,6 +39,8 @@ func TestDispatchReferencePreservesChannelOrderWithoutBlockingInline(t *testing.
 	h.incoming = make(chan delivery, 256)
 	h.fetchJobs = make(chan *pendingDelivery)
 	h.fetched = make(chan *pendingDelivery)
+	h.released = make(chan *pendingDelivery, dispatchCapacity)
+	h.enableOutputs()
 	sub := &recordingSubscriber{messages: make(chan receivedMessage, 10)}
 	h.Subscribe(sub, "slow")
 	independent := &recordingSubscriber{messages: make(chan receivedMessage, 10), id: 2}
@@ -75,128 +78,6 @@ func TestDispatchReferencePreservesChannelOrderWithoutBlockingInline(t *testing.
 	awaitMessage(t, pattern, "*\x00slow", "second")
 	awaitMessage(t, pattern, "*\x00fast", "independent")
 }
-func TestDispatchStopWithSaturatedWorkQueue(t *testing.T) {
-	h := NewHub(nil, "")
-	h.incoming = make(chan delivery, 256)
-	h.fetchJobs = make(chan *pendingDelivery)
-	h.fetched = make(chan *pendingDelivery)
-	sub := &recordingSubscriber{messages: make(chan receivedMessage, 10)}
-	h.Subscribe(sub, "blocked")
-	h.wg.Add(1)
-	go h.dispatchLoop()
-	for i := 0; i < dispatchCapacity+8; i++ {
-		select {
-		case h.incoming <- delivery{key: channelKey("blocked"), channel: "blocked", known: true, id: 1}:
-		case <-time.After(time.Second):
-			t.Fatal("dispatcher blocked on fetch queue")
-		}
-	}
-	done := make(chan struct{})
-	go func() { h.Stop(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("Stop blocked with saturated queues")
-	}
-}
-
-func TestDispatchBoundsSubscriberReservations(t *testing.T) {
-	h := NewHub(nil, "")
-	h.incoming = make(chan delivery, 256)
-	h.fetchJobs = make(chan *pendingDelivery)
-	h.fetched = make(chan *pendingDelivery)
-	first := &recordingSubscriber{id: 1, messages: make(chan receivedMessage, 2)}
-	h.Subscribe(first, "broadcast", "marker")
-	for i := 1; i <= dispatchRouteCapacity; i++ {
-		h.Subscribe(&recordingSubscriber{id: uint64(i + 1)}, "broadcast")
-	}
-	h.wg.Add(1)
-	go h.dispatchLoop()
-	defer h.Stop()
-	h.incoming <- delivery{channel: "broadcast", known: true, id: 1}
-	h.incoming <- delivery{channel: "marker", known: true, message: "still responsive"}
-	awaitMessage(t, first, "marker", "still responsive")
-	select {
-	case <-h.fetchJobs:
-		t.Fatal("over-capacity notification was retained")
-	default:
-	}
-}
-
-func TestDispatchBodyBudgetAndOversizedAdmission(t *testing.T) {
-	h := NewHub(nil, "")
-	h.incoming = make(chan delivery, 256)
-	h.fetchJobs = make(chan *pendingDelivery)
-	h.fetched = make(chan *pendingDelivery)
-	sub := &recordingSubscriber{messages: make(chan receivedMessage, 10), id: 1}
-	h.Subscribe(sub, "body")
-	observer := &recordingSubscriber{messages: make(chan receivedMessage, 10), id: 2}
-	h.Subscribe(observer, "marker")
-	h.wg.Add(1)
-	go h.dispatchLoop()
-	defer h.Stop()
-	reference := func(channel string, size int64) {
-		h.incoming <- delivery{channel: channel, known: true, id: 1, size: size}
-	}
-	marker := func() {
-		h.incoming <- delivery{channel: "marker", known: true, message: "processed"}
-		awaitMessage(t, observer, "marker", "processed")
-	}
-	take := func() *pendingDelivery {
-		t.Helper()
-		select {
-		case pending := <-h.fetchJobs:
-			return pending
-		case <-time.After(time.Second):
-			t.Fatal("expected admitted reference")
-			return nil
-		}
-	}
-	none := func() {
-		t.Helper()
-		select {
-		case <-h.fetchJobs:
-			t.Fatal("over-budget or uninterested reference was retained")
-		case <-time.After(20 * time.Millisecond):
-		}
-	}
-	complete := func(pending *pendingDelivery) { pending.skip = true; h.fetched <- pending }
-	// No allocation scales with these declared body sizes. An uninterested
-	// maximum-size reference must not consume the byte reservation budget.
-	reference("uninterested", 512<<20)
-	marker()
-	none()
-	reference("body", 512<<20)
-	oversized := take()
-	reference("body", 1)
-	marker()
-	none()
-	complete(oversized)
-	// A huge channel with an empty body consumes the same byte budget; no
-	// 512 MiB string is allocated to exercise this admission rule.
-	h.incoming <- delivery{channel: "body", known: true, id: 1, channelSize: 512 << 20}
-	hugeChannel := take()
-	reference("body", 1)
-	marker()
-	none()
-	complete(hugeChannel)
-	reference("body", dispatchBodyCapacity)
-	normal := take()
-	// Aggregate normal references obey the cap; a reference declaring zero
-	// channel and body bytes consumes no additional byte reservation.
-	reference("body", 1)
-	reference("body", 0)
-	zero := take()
-	marker()
-	none()
-	complete(zero)
-	complete(normal)
-	reference("body", 1)
-	complete(take())
-	h.incoming <- delivery{channel: "body", known: true, message: "released"}
-	awaitMessage(t, sub, "body", "released")
-}
-
 func TestDelayedReferenceInvalidatedByUnsubscribe(t *testing.T) {
 	for _, mode := range []string{"exact", "pattern", "remove-all"} {
 		for _, resubscribe := range []bool{false, true} {
@@ -205,6 +86,8 @@ func TestDelayedReferenceInvalidatedByUnsubscribe(t *testing.T) {
 				h.incoming = make(chan delivery, 256)
 				h.fetchJobs = make(chan *pendingDelivery)
 				h.fetched = make(chan *pendingDelivery)
+				h.released = make(chan *pendingDelivery, dispatchCapacity)
+				h.enableOutputs()
 				sub := &recordingSubscriber{id: 1, messages: make(chan receivedMessage, 10)}
 				observer := &recordingSubscriber{id: 2, messages: make(chan receivedMessage, 10)}
 				h.Subscribe(observer, "marker")
@@ -246,6 +129,7 @@ func TestDelayedReferenceInvalidatedByUnsubscribe(t *testing.T) {
 				h.incoming <- delivery{channel: "route", known: true, message: "new generation"}
 				h.incoming <- delivery{channel: "marker", known: true, message: "processed"}
 				awaitMessage(t, observer, "marker", "processed")
+				waitConsumed(t, pending)
 				if resubscribe {
 					if mode != "pattern" {
 						awaitMessage(t, sub, "route", "new generation")
@@ -277,8 +161,8 @@ func TestDuplicateSubscribePreservesPendingGeneration(t *testing.T) {
 				}
 			}
 			subscribe()
-			targets, ok := h.snapshotTargets(delivery{channel: "route", known: true}, 10)
-			if !ok || len(targets) != 1 {
+			targets := h.snapshotTargets(delivery{channel: "route", known: true})
+			if len(targets) != 1 {
 				t.Fatal("missing route")
 			}
 			subscribe()
@@ -311,7 +195,7 @@ func TestUnsubscribeSerializesWithInProgressDelivery(t *testing.T) {
 			} else {
 				h.Subscribe(sub, "route")
 			}
-			targets, _ := h.snapshotTargets(delivery{channel: "route", known: true}, 10)
+			targets := h.snapshotTargets(delivery{channel: "route", known: true})
 			go h.sendTarget(targets[0], delivery{channel: "route", message: "before unsubscribe"})
 			<-sub.entered
 			released := false
@@ -390,7 +274,7 @@ func TestStalledSubscriberDoesNotBlockOtherSubscriptions(t *testing.T) {
 			if mode != "exact" {
 				h.PSubscribe(stalled, "r*")
 			}
-			targets, _ := h.snapshotTargets(delivery{channel: "route", known: true}, 10)
+			targets := h.snapshotTargets(delivery{channel: "route", known: true})
 			go h.sendTarget(targets[0], delivery{channel: "route", message: "stalled"})
 			<-stalled.entered
 			released := false
@@ -431,8 +315,8 @@ func TestStalledSubscriberDoesNotBlockOtherSubscriptions(t *testing.T) {
 					progressed <- fmt.Errorf("publish subscriber count %d", count)
 					return
 				}
-				routes, ok := h.snapshotTargets(delivery{channel: "fast", known: true}, 10)
-				if !ok || len(routes) != 2 {
+				routes := h.snapshotTargets(delivery{channel: "fast", known: true})
+				if len(routes) != 2 {
 					progressed <- fmt.Errorf("publish routing has %d targets", len(routes))
 					return
 				}
@@ -466,5 +350,201 @@ func TestStalledSubscriberDoesNotBlockOtherSubscriptions(t *testing.T) {
 				t.Fatal("removal did not finish after send released")
 			}
 		})
+	}
+}
+
+func waitConsumed(t *testing.T, pending *pendingDelivery) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for pending.remaining.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("client output did not release message")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+func TestReferenceBudgetAdmitsInNotificationOrder(t *testing.T) {
+	h := NewHub(nil, "")
+	h.incoming = make(chan delivery, 256)
+	h.fetchJobs = make(chan *pendingDelivery)
+	h.fetched = make(chan *pendingDelivery)
+	h.released = make(chan *pendingDelivery, dispatchCapacity)
+	h.enableOutputs()
+	blocked := &blockingSubscriber{entered: make(chan struct{}), release: make(chan struct{}), completed: make(chan struct{})}
+	h.Subscribe(blocked, "a")
+	b := &recordingSubscriber{id: 2, messages: make(chan receivedMessage, 2)}
+	h.Subscribe(b, "b")
+	c := &recordingSubscriber{id: 3, messages: make(chan receivedMessage, 2)}
+	h.Subscribe(c, "c")
+	observer := &recordingSubscriber{id: 4, messages: make(chan receivedMessage, 2)}
+	h.Subscribe(observer, "marker")
+	h.wg.Add(1)
+	go h.dispatchLoop()
+	released := false
+	defer func() {
+		if !released {
+			close(blocked.release)
+		}
+		h.Stop()
+	}()
+	take := func() *pendingDelivery {
+		t.Helper()
+		select {
+		case p := <-h.fetchJobs:
+			return p
+		case <-time.After(time.Second):
+			t.Fatal("reference not admitted")
+			return nil
+		}
+	}
+	h.incoming <- delivery{channel: "a", known: true, id: 1, size: 32 << 20}
+	a := take()
+	a.message = "a"
+	h.fetched <- a
+	<-blocked.entered
+	h.incoming <- delivery{channel: "b", known: true, id: 2, size: 64 << 20}
+	h.incoming <- delivery{channel: "c", known: true, id: 3, size: 1}
+	h.incoming <- delivery{channel: "marker", known: true, message: "inline proceeds"}
+	awaitMessage(t, observer, "marker", "inline proceeds")
+	select {
+	case p := <-h.fetchJobs:
+		t.Fatalf("reference %d bypassed earlier byte reservation", p.id)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(blocked.release)
+	released = true
+	next := take()
+	if next.id != 2 {
+		t.Fatalf("admitted %d before2", next.id)
+	}
+	next.skip = true
+	h.fetched <- next
+	last := take()
+	if last.id != 3 {
+		t.Fatalf("admitted %d before3", last.id)
+	}
+	last.message = "c"
+	h.fetched <- last
+	awaitMessage(t, c, "c", "c")
+	waitConsumed(t, a)
+	waitConsumed(t, next)
+	waitConsumed(t, last)
+	// The same budget handles a huge channel with zero body without allocating
+	// that channel in the test; after a skipped fetch its permit is reusable.
+	h.incoming <- delivery{channel: "c", known: true, id: 4, channelSize: 512 << 20}
+	huge := take()
+	huge.skip = true
+	h.fetched <- huge
+	waitConsumed(t, huge)
+	h.incoming <- delivery{channel: "c", known: true, id: 5, size: 1}
+	after := take()
+	after.message = "after"
+	h.fetched <- after
+	awaitMessage(t, c, "c", "after")
+}
+
+type disconnectRecordingSubscriber struct {
+	recordingSubscriber
+	disconnected chan struct{}
+}
+
+func (sub *disconnectRecordingSubscriber) DisconnectPubSub() {
+	select {
+	case <-sub.disconnected:
+	default:
+		close(sub.disconnected)
+	}
+}
+func TestOutputOverflowDisconnectsOnlyItsClient(t *testing.T) {
+	h := NewHub(nil, "")
+	h.incoming = make(chan delivery, 256)
+	h.fetchJobs = make(chan *pendingDelivery)
+	h.fetched = make(chan *pendingDelivery)
+	h.released = make(chan *pendingDelivery, dispatchCapacity)
+	h.enableOutputs()
+	slow := &disconnectRecordingSubscriber{recordingSubscriber: recordingSubscriber{id: 1, messages: make(chan receivedMessage, 1)}, disconnected: make(chan struct{})}
+	h.Subscribe(slow, "slow")
+	healthy := &recordingSubscriber{id: 2, messages: make(chan receivedMessage, 2)}
+	h.Subscribe(healthy, "healthy")
+	h.wg.Add(1)
+	go h.dispatchLoop()
+	defer h.Stop()
+	h.incoming <- delivery{channel: "slow", known: true, id: 1, channelSize: 512 << 20}
+	var pending *pendingDelivery
+	select {
+	case pending = <-h.fetchJobs:
+	case <-time.After(time.Second):
+		t.Fatal("oversized entry not admitted")
+	}
+	h.incoming <- delivery{channel: "slow", known: true, message: "exceeds sole oversized exception"}
+	h.incoming <- delivery{channel: "healthy", known: true, message: "still delivered"}
+	awaitMessage(t, healthy, "healthy", "still delivered")
+	select {
+	case <-slow.disconnected:
+	case <-time.After(time.Second):
+		t.Fatal("overflowing client was not disconnected")
+	}
+	pending.skip = true
+	h.fetched <- pending
+	waitConsumed(t, pending)
+}
+
+type disconnectBlockingSubscriber struct {
+	blockingSubscriber
+	unblock     sync.Once
+	disconnects int
+}
+
+func (sub *disconnectBlockingSubscriber) DisconnectPubSub() {
+	sub.disconnects++
+	sub.unblock.Do(func() { close(sub.release) })
+}
+func TestStopInterruptsRetiredOutputWriter(t *testing.T) {
+	h := NewHub(nil, "")
+	h.incoming = make(chan delivery, 256)
+	h.fetchJobs = make(chan *pendingDelivery)
+	h.fetched = make(chan *pendingDelivery)
+	h.released = make(chan *pendingDelivery, dispatchCapacity)
+	h.enableOutputs()
+	sub := &disconnectBlockingSubscriber{blockingSubscriber: blockingSubscriber{entered: make(chan struct{}), release: make(chan struct{}), completed: make(chan struct{})}}
+	h.Subscribe(sub, "retired")
+	output := h.output(sub.GetID())
+	h.wg.Add(1)
+	go h.dispatchLoop()
+	defer func() { sub.unblock.Do(func() { close(sub.release) }); h.Stop() }()
+	h.incoming <- delivery{channel: "retired", known: true, message: "blocked writer"}
+	select {
+	case <-sub.entered:
+	case <-time.After(time.Second):
+		t.Fatal("mailbox writer did not start")
+	}
+	removed := make(chan struct{})
+	go func() { h.RemoveSubscriber(sub.GetID()); close(removed) }()
+	// Synchronize the precise lifecycle race: removal has closed/detached its
+	// mailbox, but the in-flight write still prevents removal from returning.
+	select {
+	case <-output.stop:
+	case <-time.After(time.Second):
+		t.Fatal("mailbox was not retired")
+	}
+	select {
+	case <-removed:
+		t.Fatal("removal returned while its writer was blocked")
+	default:
+	}
+	stopped := make(chan struct{})
+	go func() { h.Stop(); close(stopped) }()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("Stop lost the retired writer's connection interrupt")
+	}
+	select {
+	case <-removed:
+	case <-time.After(time.Second):
+		t.Fatal("removal stayed blocked after Stop")
+	}
+	if sub.disconnects != 1 {
+		t.Fatalf("connection interrupt called %d times", sub.disconnects)
 	}
 }

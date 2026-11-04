@@ -486,6 +486,7 @@ Renders a `PrometheusRule` CRD (requires `prometheus-operator`). All alerts are 
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
+| `updateStrategy.type` | Deployment upgrade strategy. Use Recreate once for the inline-only protocol migration, then RollingUpdate for compatible upgrades. | `RollingUpdate` |
 | `leaderElection.enabled` | Enable Kubernetes Lease based leader election. The leader patches its own pod with `postkeys/role=leader`; the Service selector routes traffic exclusively to that pod, guaranteeing cache coherency with multiple replicas. Automatically creates the required RBAC on pods and `coordination.k8s.io/leases`. | `false` |
 
 #### Graceful Shutdown
@@ -562,34 +563,41 @@ For deployment examples, including usage with CloudNativePG, see the [examples/]
 
 Pub/sub messages that fit in a PostgreSQL notification are sent inline. Larger
 messages are stored temporarily in an UNLOGGED PostgreSQL table and notifications
-carry a versioned reference with channel metadata. Replicas fetch bodies only
-when local exact or pattern subscribers match; oversized channel names use a
-metadata query first. Stored messages expire after five minutes. One elected
-sweeper drains at most 16 batches of 1000 expired rows per cleanup cycle.
-Delivery is best effort: disconnected listeners, crash recovery, failed or delayed
-fetches, and saturated dispatch queues can lose messages, and there is no replay.
-Each instance has four dedicated fetch connections and bounded queues (256
-incoming and 256 pending notifications, plus at most 4096 subscriber delivery
-reservations). Referenced channel and body bytes reserve at most 64 MiB in total;
-one reference above 64 MiB is admitted only when no other referenced bytes are
-reserved. Each field still supports the RESP 512 MiB limit. Excess notifications are dropped with a warning. Retained messages
-preserve each client's order across both exact and pattern subscriptions. A client
-that does not match a pending large message can receive inline messages while
-that fetch waits. Oversized channel metadata conservatively reserves pattern
-clients until its channel is known.
+carry a versioned reference with binary-safe channel metadata. Replicas fetch
+bodies only for local matching subscriptions; oversized channels use an indexed
+hash lookup and a metadata query first. Stored messages expire after five minutes.
+One elected sweeper drains at most 16 batches of 1000 expired rows per cleanup cycle.
 
-Upgrade all instances sharing a database together before publishing large
-messages, since older instances do not understand references. The Helm Deployment
-uses `Recreate`, which stops its old pods before starting new ones and causes
-service downtime during upgrades. If multiple Deployments or releases share a
-database, stop all their old instances before starting any new version; Recreate
-coordinates only one Deployment. The reference prefix makes older decoders reject
-references, preventing fake empty pattern messages during accidental overlap,
-but does not make mixed-version delivery supported.
+Each subscribed connection has its own lazy output FIFO and writer, so a stalled
+reader does not block other clients. Queued and in-flight output counts toward a
+32 MiB / 8192-entry limit per client; exceeding either limit disconnects that
+client. One oversized entry is allowed when its output buffer is otherwise empty,
+so channel and message fields still support the RESP 512 MiB limit each. Delivery
+preserves each client's order across exact and pattern subscriptions. Unsubscribe
+invalidates that generation's queued routes before its acknowledgement.
 
-For installations using a pre-release version that already created a logged
-`pubsub_messages` table, the initializer leaves that existing table intact. During
-the coordinated shutdown, before restarting instances, run
-`ALTER TABLE pubsub_messages SET UNLOGGED` in the configured schema to convert it.
-Do not convert while instances are publishing: the operation takes an exclusive
-table lock. Key/value tables remain logged and durable.
+Ingress uses bounded backpressure rather than dropping inline notifications.
+PostgreSQL buffers notifications while the listener waits for local capacity.
+Up to 256 referenced messages await or hold fetched data. Four dedicated fetch
+connections reserve channel and body bytes in notification order, at most 64 MiB
+total; one oversized reference is admitted only when no other referenced bytes
+are reserved. Inline traffic can proceed while references wait for this budget;
+when the reference backlog is full, ingress backpressures globally. Connection
+loss, PostgreSQL crash recovery and failed fetches can still lose pub/sub messages;
+there is no replay.
+
+The Helm chart defaults to `updateStrategy.type=RollingUpdate` for compatible
+upgrades. For the first upgrade from the old inline-only protocol, keep the
+coordinated migration: stop all old instances sharing the database before any new
+instance publishes large messages. Temporarily use
+`--set updateStrategy.type=Recreate` for that upgrade, then restore RollingUpdate
+for later compatible releases. Recreate causes downtime and coordinates only one
+Deployment; multiple Deployments/releases sharing a database require manual
+coordination. The `!pk1:` reference prefix makes old decoders reject references
+rather than emit fake empty messages, but mixed-version large delivery is unsupported.
+
+For pre-release installations that already created a logged `pubsub_messages`
+table, the initializer leaves it intact. During coordinated shutdown run
+`ALTER TABLE pubsub_messages SET UNLOGGED` in the configured schema before
+restarting instances. It takes an exclusive table lock; key/value tables remain
+logged and durable.

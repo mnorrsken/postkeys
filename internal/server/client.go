@@ -237,11 +237,18 @@ func (c *ClientState) WriteResponses(values ...resp.Value) error {
 	return c.writer.Flush()
 }
 
-// SendPubSubMessage sends a pub/sub message to the client
-// This implements the pubsub.Subscriber interface
+// DisconnectPubSub interrupts both socket writes and a pub/sub writer waiting
+// behind an ordinary RESP3 response. Connection cleanup removes subscriptions.
+func (c *ClientState) DisconnectPubSub() { _ = c.conn.Close() }
+
+// SendPubSubMessage sends a pub/sub message and implements pubsub.Subscriber.
 func (c *ClientState) SendPubSubMessage(msgType, channel, payload string) error {
+	// Include time spent waiting behind another response's writerMu. Setting the
+	// deadline before the lock also interrupts that response if it stops draining.
+	_ = c.conn.SetWriteDeadline(time.Now().Add(pubSubWriteTimeout))
 	c.writerMu.Lock()
 	defer c.writerMu.Unlock()
+	defer func() { _ = c.conn.SetWriteDeadline(time.Time{}) }()
 
 	if c.writer == nil {
 		return fmt.Errorf("no writer set for client")
@@ -285,12 +292,10 @@ func (c *ClientState) SendPubSubMessage(msgType, channel, payload string) error 
 		return fmt.Errorf("unknown message type: %s", msgType)
 	}
 
-	_ = c.conn.SetWriteDeadline(time.Now().Add(pubSubWriteTimeout))
 	err := c.writer.WriteValue(response)
 	if err == nil {
 		err = c.writer.Flush()
 	}
-	_ = c.conn.SetWriteDeadline(time.Time{})
 	if err != nil {
 		// The writer is unusable after a failed write. Close the connection;
 		// its handler then exits and removes the subscriptions.

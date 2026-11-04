@@ -37,24 +37,21 @@ func TestBroadcastDecoding(t *testing.T) {
 	}
 	cases := []struct {
 		payload, channel, message string
-		id                        int64
 		bad                       bool
 	}{
-		{inline, "\x00\xff", "hello\x00", 0, false},
-		{base64.StdEncoding.EncodeToString([]byte(`{"c":"legacy","m":"text"}`)), "legacy", "text", 0, false},
-		{encodeReference(42, "channel", 0), "channel", "", 42, false},
+		{inline, "\x00\xff", "hello\x00", false},
+		{base64.StdEncoding.EncodeToString([]byte(`{"c":"legacy","m":"text"}`)), "legacy", "text", false},
 	}
 	for _, raw := range []string{`{"r":"0"}`, `{"r":"-1"}`, `{"r":"+1"}`, `{"r":1}`, `{"r":null}`, `{"r":"9223372036854775808"}`, `{"r":"1","c":"x"}`, `{"r":"1","extra":true}`, `{"r":"1","r":"2"}`} {
 		cases = append(cases, struct {
 			payload, channel, message string
-			id                        int64
 			bad                       bool
-		}{base64.StdEncoding.EncodeToString([]byte(raw)), "", "", 0, true})
+		}{base64.StdEncoding.EncodeToString([]byte(raw)), "", "", true})
 	}
 	for _, tc := range cases {
-		c, m, id, err := decodeBroadcast(tc.payload)
-		if (err != nil) != tc.bad || (!tc.bad && (c != tc.channel || m != tc.message || id != tc.id)) {
-			t.Errorf("decode %q = %q %q %d %v", tc.payload, c, m, id, err)
+		c, m, err := decodeBroadcast(tc.payload)
+		if (err != nil) != tc.bad || (!tc.bad && (c != tc.channel || m != tc.message)) {
+			t.Errorf("decode %q = %q %q %v", tc.payload, c, m, err)
 		}
 	}
 }
@@ -66,7 +63,7 @@ func TestMalformedBroadcast(t *testing.T) {
 		base64.StdEncoding.EncodeToString([]byte(`[]`)),
 		base64.StdEncoding.EncodeToString([]byte(`{`)),
 	} {
-		if _, _, _, err := decodeBroadcast(payload); err == nil {
+		if _, _, err := decodeBroadcast(payload); err == nil {
 			t.Errorf("accepted malformed payload %q", payload)
 		}
 	}
@@ -138,8 +135,8 @@ func TestInlineAllBinaryBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	channel, message, id, err := decodeBroadcast(payload)
-	if err != nil || channel != string(binary) || message != string(binary) || id != 0 {
+	channel, message, err := decodeBroadcast(payload)
+	if err != nil || channel != string(binary) || message != string(binary) {
 		t.Fatal("binary inline roundtrip failed")
 	}
 }

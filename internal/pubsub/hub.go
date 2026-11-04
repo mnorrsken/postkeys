@@ -113,24 +113,17 @@ func decodeReference(payload string) (referencePayload, error) {
 }
 
 // decodeBroadcast decodes inline messages once and preserves the legacy wire.
-func decodeBroadcast(payload string) (channel, message string, id int64, err error) {
-	if strings.HasPrefix(payload, referencePrefix) {
-		ref, e := decodeReference(payload)
-		if ref.Channel != nil {
-			channel = *ref.Channel
-		}
-		return channel, "", ref.ID, e
-	}
+func decodeBroadcast(payload string) (channel, message string, err error) {
 	data, err := base64.StdEncoding.DecodeString(payload)
 	if err != nil {
-		return "", "", 0, err
+		return "", "", err
 	}
 	var bp *broadcastPayload
 	if err = json.Unmarshal(data, &bp); err != nil {
-		return "", "", 0, err
+		return "", "", err
 	}
 	if bp == nil || bp.Reference != nil {
-		return "", "", 0, errors.New("invalid envelope")
+		return "", "", errors.New("invalid envelope")
 	}
 	channel, message = bp.Channel, bp.Message
 	if bp.Binary {
@@ -141,7 +134,7 @@ func decodeBroadcast(payload string) (channel, message string, id int64, err err
 			message = string(decoded)
 		}
 	}
-	return channel, message, 0, nil
+	return channel, message, nil
 }
 
 // Subscriber represents a client that can receive pub/sub messages
@@ -186,11 +179,19 @@ type Hub struct {
 	subPatterns map[uint64]map[string]bool          // subscriberID -> patterns
 
 	// Listener connection (dedicated for LISTEN/NOTIFY)
-	listenerConn *pgx.Conn
-	fetchPool    *pgxpool.Pool
-	incoming     chan delivery
-	fetchJobs    chan *pendingDelivery
-	fetched      chan *pendingDelivery
+	listenerConn   *pgx.Conn
+	fetchPool      *pgxpool.Pool
+	incoming       chan delivery
+	fetchJobs      chan *pendingDelivery
+	fetched        chan *pendingDelivery
+	released       chan *pendingDelivery
+	outputMu       sync.Mutex
+	outputs        map[uint64]*clientOutput
+	liveOutputs    map[*clientOutput]bool
+	outputsRunning bool
+	outputsStopped bool
+	channelHashes  map[string]string
+	channelsByKey  map[string]map[string]bool
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -203,6 +204,10 @@ func NewHub(pool *pgxpool.Pool, connStr string) *Hub {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Hub{
 		pool:          pool,
+		outputs:       make(map[uint64]*clientOutput),
+		liveOutputs:   make(map[*clientOutput]bool),
+		channelHashes: make(map[string]string),
+		channelsByKey: make(map[string]map[string]bool),
 		connStr:       connStr,
 		subscriptions: make(map[string]map[uint64]*subscription),
 		subscribers:   make(map[uint64]map[string]bool),
@@ -251,6 +256,8 @@ func (h *Hub) Start(ctx context.Context) error {
 	h.incoming = make(chan delivery, 256)
 	h.fetchJobs = make(chan *pendingDelivery)
 	h.fetched = make(chan *pendingDelivery)
+	h.released = make(chan *pendingDelivery, dispatchCapacity)
+	h.enableOutputs()
 	h.wg.Add(5)
 	go h.dispatchLoop()
 	for i := 0; i < 4; i++ {
@@ -265,7 +272,17 @@ func (h *Hub) Start(ctx context.Context) error {
 
 // Stop gracefully stops the hub
 func (h *Hub) Stop() {
+	h.outputMu.Lock()
+	h.outputsStopped = true
+	outputs := make([]*clientOutput, 0, len(h.liveOutputs))
+	for output := range h.liveOutputs {
+		outputs = append(outputs, output)
+	}
+	h.outputMu.Unlock()
 	h.cancel()
+	for _, output := range outputs {
+		output.close(true)
+	}
 	h.wg.Wait()
 
 	if h.listenerConn != nil {
@@ -278,6 +295,7 @@ func (h *Hub) Stop() {
 
 // Subscribe adds a subscriber to channels
 func (h *Hub) Subscribe(sub Subscriber, channels ...string) []int {
+	h.ensureOutput(sub)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -293,6 +311,12 @@ func (h *Hub) Subscribe(sub Subscriber, channels ...string) []int {
 		// Initialize channel's subscriber set if needed
 		if _, exists := h.subscriptions[channel]; !exists {
 			h.subscriptions[channel] = make(map[uint64]*subscription)
+			key := channelKey(channel)
+			h.channelHashes[channel] = key
+			if h.channelsByKey[key] == nil {
+				h.channelsByKey[key] = make(map[string]bool)
+			}
+			h.channelsByKey[key][channel] = true
 		}
 
 		// Add subscriber to channel
@@ -337,6 +361,12 @@ func (h *Hub) Unsubscribe(sub Subscriber, channels ...string) []int {
 			delete(subs, subID)
 			if len(subs) == 0 {
 				delete(h.subscriptions, channel)
+				key := h.channelHashes[channel]
+				delete(h.channelHashes, channel)
+				delete(h.channelsByKey[key], channel)
+				if len(h.channelsByKey[key]) == 0 {
+					delete(h.channelsByKey, key)
+				}
 			}
 		}
 
@@ -357,6 +387,7 @@ func (h *Hub) Unsubscribe(sub Subscriber, channels ...string) []int {
 
 // PSubscribe adds a subscriber to pattern subscriptions
 func (h *Hub) PSubscribe(sub Subscriber, patterns ...string) []int {
+	h.ensureOutput(sub)
 	h.patternMu.Lock()
 	defer h.patternMu.Unlock()
 
@@ -552,6 +583,12 @@ func (h *Hub) RemoveSubscriber(subID uint64) {
 				delete(subs, subID)
 				if len(subs) == 0 {
 					delete(h.subscriptions, channel)
+					key := h.channelHashes[channel]
+					delete(h.channelHashes, channel)
+					delete(h.channelsByKey[key], channel)
+					if len(h.channelsByKey[key]) == 0 {
+						delete(h.channelsByKey, key)
+					}
 				}
 			}
 		}
@@ -576,6 +613,7 @@ func (h *Hub) RemoveSubscriber(subID uint64) {
 		delete(h.subPatterns, subID)
 	}
 	h.patternMu.Unlock()
+	h.removeOutput(subID)
 	invalidateSubscriptions(removed)
 }
 
@@ -665,12 +703,12 @@ func (h *Hub) listenLoop() {
 			log.Printf("Warning: failed to decode broadcast payload: %v", err)
 			continue
 		}
-		// Pub/sub is best effort. Drop the incoming notification when capacity is
-		// exhausted rather than blocking LISTEN or retaining unbounded payloads.
+		// Backpressure preserves ordinary messages. PostgreSQL buffers NOTIFY
+		// traffic while bounded local queues drain; only overflowing clients close.
 		select {
 		case h.incoming <- item:
-		default:
-			log.Printf("Warning: pub/sub dispatch queue full; dropping notification")
+		case <-h.ctx.Done():
+			return
 		}
 	}
 }

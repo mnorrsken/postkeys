@@ -107,3 +107,48 @@ func TestSendPubSubMessageDropsStuckSubscriber(t *testing.T) {
 		t.Errorf("stuck subscriber's connection not closed, read err = %v", err)
 	}
 }
+
+type observedWriterConn struct {
+	net.Conn
+	writing chan struct{}
+}
+
+func (conn *observedWriterConn) Write(data []byte) (int, error) {
+	select {
+	case conn.writing <- struct{}{}:
+	default:
+	}
+	return conn.Conn.Write(data)
+}
+func TestPubSubTimeoutIncludesOrdinaryResponseWriterWait(t *testing.T) {
+	old := pubSubWriteTimeout
+	pubSubWriteTimeout = 100 * time.Millisecond
+	defer func() { pubSubWriteTimeout = old }()
+	server, client := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	conn := &observedWriterConn{Conn: server, writing: make(chan struct{}, 1)}
+	state := NewClientState(conn, false)
+	state.SetWriter(resp.NewWriter(conn))
+	ordinary := make(chan error, 1)
+	go func() { ordinary <- state.WriteResponses(resp.Bulk("ordinary response blocks writerMu")) }()
+	<-conn.writing
+	finished := make(chan error, 1)
+	go func() { finished <- state.SendPubSubMessage("message", "channel", "payload") }()
+	select {
+	case err := <-finished:
+		if err == nil {
+			t.Fatal("expected stalled-writer error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pub/sub timeout excluded time waiting on ordinary response")
+	}
+	select {
+	case err := <-ordinary:
+		if err == nil {
+			t.Fatal("expected interrupted ordinary response")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ordinary response remained stuck after deadline")
+	}
+}
