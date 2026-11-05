@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.29.3] - 2026-11-05
+
+### Changed
+- **Dependency bump (dependabot)** — Go modules: `github.com/jackc/pgx/v5` 5.11.0 → 5.12.0 (#42), which also moves `github.com/jackc/puddle/v2` 2.2.2 → 2.2.3.
+
 ## [0.29.2] - 2026-10-31
 
 ### Changed
