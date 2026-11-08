@@ -5,6 +5,10 @@ services:
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: testingpassword
+      # Inside the tmpfs below for every major. Images up to 17 declare a
+      # VOLUME at /var/lib/postgresql/data, which would put the default
+      # data dir on disk instead.
+      PGDATA: /var/lib/postgresql/pgdata
     ports:
       - "5789:5432"
     healthcheck:
