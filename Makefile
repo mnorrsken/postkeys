@@ -1,4 +1,4 @@
-.PHONY: build test vuln bench docker-up docker-down test-up test-down clean docker-build deploy
+.PHONY: build test test-pg-all vuln bench docker-up docker-down test-up test-down clean docker-build deploy
 
 # Load local dev settings if present
 -include .dev.env
@@ -7,6 +7,8 @@ export
 # Default values (can be overridden in .dev.env)
 DEV_REPO ?= ghcr.io/mnorrsken
 DEV_NAMESPACE ?= postkeys-dev
+PG_VERSION ?= 16
+PG_VERSIONS ?= 16 17 18
 
 # Build
 build:
@@ -56,6 +58,16 @@ test-down:
 test: test-up
 	go test -v -tags=postgres ./tests/...
 	go test -v ./internal/...
+
+# Run the PostgreSQL integration tests once per major in PG_VERSIONS
+test-pg-all:
+	@set -e; for v in $(PG_VERSIONS); do \
+		echo "=== PostgreSQL $$v ==="; \
+		$(MAKE) test-down PG_VERSION=$$v; \
+		$(MAKE) test-up PG_VERSION=$$v; \
+		go test -count=1 -tags=postgres ./tests/...; \
+	done; \
+	$(MAKE) test-down
 
 # Check dependencies and stdlib for known vulnerabilities
 vuln:

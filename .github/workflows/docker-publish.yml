@@ -17,12 +17,17 @@ env:
 
 jobs:
   integration-test:
-    name: PostgreSQL integration tests
+    name: PostgreSQL ${{ matrix.postgres }} integration tests
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest supported (README) through newest major.
+        postgres: ['16', '17', '18']
 
     services:
       postgres:
-        image: postgres:16
+        image: postgres:${{ matrix.postgres }}
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: testingpassword
@@ -48,6 +53,7 @@ jobs:
         run: go mod download
 
       - name: govulncheck
+        if: matrix.postgres == '18'
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
       - name: Run PostgreSQL integration tests
