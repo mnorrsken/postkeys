@@ -9,6 +9,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -444,5 +445,150 @@ func TestBlockingPopFollowedByPipelinedCommand(t *testing.T) {
 	}
 	if second != "+PONG\r\n" {
 		t.Errorf("PING reply = %q, want +PONG", second)
+	}
+}
+
+// Concurrent GETSETs on one key: every value written must be handed back
+// exactly once (as some later GETSET's old value, or as the final value).
+// Without the key lock taken before the read, two GETSETs return the same
+// old value and another value is lost.
+func TestConcurrentGetSetReturnsEachValueOnce(t *testing.T) {
+	testSwapReturnsEachValueOnce(t, func(ctx context.Context, c *redis.Client, v string) (string, error) {
+		return c.GetSet(ctx, "gs", v).Result()
+	})
+}
+
+// SET ... GET must swap atomically, like GETSET.
+func TestConcurrentSetGetReturnsEachValueOnce(t *testing.T) {
+	testSwapReturnsEachValueOnce(t, func(ctx context.Context, c *redis.Client, v string) (string, error) {
+		return c.SetArgs(ctx, "gs", v, redis.SetArgs{Get: true}).Result()
+	})
+}
+
+func testSwapReturnsEachValueOnce(t *testing.T, swap func(context.Context, *redis.Client, string) (string, error)) {
+	t.Helper()
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+
+	if err := ts.client.Set(ctx, "gs", "init", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	const workers, rounds = 8, 25
+	var mu sync.Mutex
+	seen := map[string]int{}
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < rounds; i++ {
+				old, err := swap(ctx, ts.client, fmt.Sprintf("w%d-%d", w, i))
+				if err != nil {
+					t.Errorf("swap: %v", err)
+					return
+				}
+				mu.Lock()
+				seen[old]++
+				mu.Unlock()
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	final, err := ts.client.Get(ctx, "gs").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen[final]++
+	if len(seen) != workers*rounds+1 {
+		t.Errorf("got %d distinct values back, want %d", len(seen), workers*rounds+1)
+	}
+	for v, n := range seen {
+		if n != 1 {
+			t.Errorf("value %q returned %d times, want once", v, n)
+		}
+	}
+}
+
+// Concurrent HSETs of the same new fields: each field counts as added once
+// in total, however the HSETs interleave.
+func TestConcurrentHSetCountsEachFieldOnce(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+
+	const rounds, workers, fields = 20, 8, 20
+	pairs := make([]interface{}, 0, 2*fields)
+	for i := 0; i < fields; i++ {
+		pairs = append(pairs, fmt.Sprintf("f%d", i), "v")
+	}
+	for r := 0; r < rounds; r++ {
+		key := fmt.Sprintf("hrace:%d", r)
+		var total atomic.Int64
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				n, err := ts.client.HSet(ctx, key, pairs...).Result()
+				if err != nil {
+					t.Errorf("HSET: %v", err)
+					return
+				}
+				total.Add(n)
+			}()
+		}
+		wg.Wait()
+		if got := total.Load(); got != fields {
+			t.Errorf("%s: HSET replies add up to %d new fields, want %d", key, got, fields)
+		}
+	}
+}
+
+// SET ... XX racing a DEL: in either order the key ends up gone. If XX checks
+// for the key, the DEL runs, and then XX writes, the key comes back.
+func TestConcurrentSetXXDoesNotRecreateDeletedKey(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+
+	for r := 0; r < 50; r++ {
+		key := fmt.Sprintf("xx:%d", r)
+		if err := ts.client.Set(ctx, key, "a", 0).Err(); err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); ts.client.Del(ctx, key) }()
+		go func() { defer wg.Done(); ts.client.SetArgs(ctx, key, "b", redis.SetArgs{Mode: "XX"}) }()
+		wg.Wait()
+		if n, _ := ts.client.Exists(ctx, key).Result(); n != 0 {
+			t.Errorf("%s exists after DEL and SET XX ran together", key)
+		}
+	}
+}
+
+// SET ... KEEPTTL racing a PERSIST: in either order the key ends up without
+// a TTL. If KEEPTTL reads the TTL, the PERSIST runs, and then KEEPTTL writes,
+// the old TTL comes back.
+func TestConcurrentSetKeepTTLDoesNotRestoreRemovedTTL(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+
+	for r := 0; r < 50; r++ {
+		key := fmt.Sprintf("keepttl:%d", r)
+		if err := ts.client.Set(ctx, key, "a", time.Hour).Err(); err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); ts.client.Persist(ctx, key) }()
+		go func() { defer wg.Done(); ts.client.SetArgs(ctx, key, "b", redis.SetArgs{KeepTTL: true}) }()
+		wg.Wait()
+		if ttl, _ := ts.client.TTL(ctx, key).Result(); ttl != -1 {
+			t.Errorf("%s TTL = %v after PERSIST and SET KEEPTTL ran together, want -1", key, ttl)
+		}
 	}
 }

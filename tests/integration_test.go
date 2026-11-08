@@ -155,6 +155,139 @@ func TestSetGet(t *testing.T) {
 	}
 }
 
+func TestGetSet(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+
+	// Missing key: nil, and the value is written.
+	if _, err := ts.client.GetSet(ctx, "gs", "v1").Result(); err != redis.Nil {
+		t.Fatalf("GETSET on missing key = %v, want redis.Nil", err)
+	}
+	old, err := ts.client.GetSet(ctx, "gs", "v2").Result()
+	if err != nil || old != "v1" {
+		t.Fatalf("GETSET = %q, %v; want v1", old, err)
+	}
+	if v, _ := ts.client.Get(ctx, "gs").Result(); v != "v2" {
+		t.Errorf("GET after GETSET = %q, want v2", v)
+	}
+
+	// GETSET clears the TTL.
+	ts.client.Set(ctx, "gsttl", "a", time.Minute)
+	ts.client.GetSet(ctx, "gsttl", "b")
+	if ttl, _ := ts.client.TTL(ctx, "gsttl").Result(); ttl != -1 {
+		t.Errorf("TTL after GETSET = %v, want -1", ttl)
+	}
+
+	// A value whose TTL has passed (not yet swept) counts as missing.
+	ts.client.Set(ctx, "gsexp", "old", 50*time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+	if v, err := ts.client.GetSet(ctx, "gsexp", "new").Result(); err != redis.Nil {
+		t.Errorf("GETSET on expired key = %q, %v; want redis.Nil", v, err)
+	}
+	if v, _ := ts.client.Get(ctx, "gsexp").Result(); v != "new" {
+		t.Errorf("GET after GETSET on expired key = %q, want new", v)
+	}
+}
+
+func TestHSetCountsOnlyNewFields(t *testing.T) {
+	ts := newTestServer(t, "")
+	defer ts.Close()
+	ctx := context.Background()
+
+	tests := []struct {
+		pairs []interface{}
+		want  int64
+	}{
+		{[]interface{}{"a", "1", "b", "2"}, 2},
+		{[]interface{}{"a", "x"}, 0},
+		{[]interface{}{"a", "y", "c", "3", "d", "4"}, 2},
+	}
+	for _, tt := range tests {
+		got, err := ts.client.HSet(ctx, "hcount", tt.pairs...).Result()
+		if err != nil {
+			t.Fatalf("HSET %v: %v", tt.pairs, err)
+		}
+		if got != tt.want {
+			t.Errorf("HSET %v = %d, want %d", tt.pairs, got, tt.want)
+		}
+	}
+	if v, _ := ts.client.HGet(ctx, "hcount", "a").Result(); v != "y" {
+		t.Errorf("HGET a = %q, want y", v)
+	}
+
+	// A field written earlier in the same transaction is not new again.
+	var first, second *redis.IntCmd
+	if _, err := ts.client.TxPipelined(ctx, func(p redis.Pipeliner) error {
+		first = p.HSet(ctx, "hcount", "e", "1")
+		second = p.HSet(ctx, "hcount", "e", "2", "f", "3")
+		return nil
+	}); err != nil {
+		t.Fatalf("MULTI: %v", err)
+	}
+	if first.Val() != 1 || second.Val() != 1 {
+		t.Errorf("HSET in MULTI = %d, %d; want 1, 1", first.Val(), second.Val())
+	}
+}
+
+// PG_TRANSACTION_TIMEOUT is set on each pooled connection on PostgreSQL 17+
+// and skipped on 16, where the setting does not exist.
+func TestTransactionTimeoutSetting(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.New(ctx, storage.Config{
+		Host:               getEnvOrDefault("PG_HOST", "localhost"),
+		Port:               5789,
+		User:               getEnvOrDefault("PG_USER", "postgres"),
+		Password:           getEnvOrDefault("PG_PASSWORD", "testingpassword"),
+		Database:           getEnvOrDefault("PG_DATABASE", "postgres"),
+		SSLMode:            getEnvOrDefault("PG_SSLMODE", "disable"),
+		TransactionTimeout: 1500 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("storage.New with TransactionTimeout: %v", err)
+	}
+	defer store.Close()
+
+	var version int
+	if err := store.Pool().QueryRow(ctx, "SELECT current_setting('server_version_num')::int").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version < 170000 {
+		t.Skipf("server_version_num %d: transaction_timeout needs PostgreSQL 17+", version)
+	}
+	var got string
+	if err := store.Pool().QueryRow(ctx, "SHOW transaction_timeout").Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != "1500ms" {
+		t.Errorf("transaction_timeout = %q, want 1500ms", got)
+	}
+}
+
+// The single-column key indexes duplicated the primary keys. A store that
+// starts on a database that still has them drops them.
+func TestSchemaDropsDuplicateKeyIndexes(t *testing.T) {
+	ts := newTestServer(t, "")
+	ctx := context.Background()
+	if _, err := ts.store.Pool().Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_kv_hashes_key ON kv_hashes(key)"); err != nil {
+		t.Fatal(err)
+	}
+	ts.Close()
+
+	ts = newTestServer(t, "")
+	defer ts.Close()
+	var n int
+	if err := ts.store.Pool().QueryRow(ctx,
+		`SELECT count(*) FROM pg_indexes WHERE indexname = ANY($1)`,
+		[]string{"idx_kv_hashes_key", "idx_kv_lists_key", "idx_kv_sets_key", "idx_kv_zsets_key"},
+	).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("%d duplicate key indexes left, want 0", n)
+	}
+}
+
 func TestSetWithExpiry(t *testing.T) {
 	ts := newTestServer(t, "")
 	defer ts.Close()

@@ -81,7 +81,18 @@ func decodeField(field string) string {
 
 // queryOps provides the actual implementation of storage operations using a Querier.
 // This is shared between Store (using pool) and TxStore (using tx).
-type queryOps struct{}
+type queryOps struct {
+	// serverVersion is the server's server_version_num (e.g. 180001), read
+	// once at startup. It picks between SQL that needs a newer server and
+	// the code path that works on every supported version.
+	serverVersion int
+}
+
+// hasReturningOld reports whether the server supports old.* in RETURNING
+// (PostgreSQL 18+), so an upsert can return the row as it was before.
+func (o queryOps) hasReturningOld() bool {
+	return o.serverVersion >= 180000
+}
 
 // ============== Helper Methods ==============
 
@@ -858,6 +869,16 @@ func (o queryOps) getDel(ctx context.Context, q Querier, key string) (string, bo
 
 func (o queryOps) getSet(ctx context.Context, q Querier, key, value string) (string, bool, error) {
 	key = encodeKey(key)
+	// Lock before reading the old value. Without it two concurrent GETSETs
+	// both read the same old value and one of the writes is never returned.
+	if err := o.lockKey(ctx, q, key); err != nil {
+		return "", false, err
+	}
+
+	if o.hasReturningOld() {
+		return o.getSetReturningOld(ctx, q, key, value)
+	}
+
 	// Get old value
 	var oldValue []byte
 	err := q.QueryRow(ctx,
@@ -880,6 +901,34 @@ func (o queryOps) getSet(ctx context.Context, q Querier, key, value string) (str
 		 ON CONFLICT (key) DO UPDATE SET value = $2, expires_at = NULL`,
 		key, []byte(value),
 	)
+	if err != nil {
+		return "", false, err
+	}
+
+	if exists {
+		return string(oldValue), true, nil
+	}
+	return "", false, nil
+}
+
+// getSetReturningOld is getSet for PostgreSQL 18+: the upsert returns the
+// previous row itself, which saves the separate SELECT.
+func (o queryOps) getSetReturningOld(ctx context.Context, q Querier, key, value string) (string, bool, error) {
+	// Set meta before data table for consistent lock ordering (kv_meta before kv_strings).
+	if err := o.setMeta(ctx, q, key, TypeString, nil); err != nil {
+		return "", false, err
+	}
+
+	// old.* is all NULL when the INSERT did not hit a conflict. An old row
+	// whose TTL has passed counts as missing, like in get.
+	var oldValue []byte
+	var exists bool
+	err := q.QueryRow(ctx,
+		`INSERT INTO kv_strings (key, value, expires_at) VALUES ($1, $2, NULL)
+		 ON CONFLICT (key) DO UPDATE SET value = $2, expires_at = NULL
+		 RETURNING old.value, old.key IS NOT NULL AND (old.expires_at IS NULL OR old.expires_at > NOW())`,
+		key, []byte(value),
+	).Scan(&oldValue, &exists)
 	if err != nil {
 		return "", false, err
 	}
@@ -1229,34 +1278,32 @@ func (o queryOps) hSet(ctx context.Context, q Querier, key string, fields map[st
 		fieldValues = append(fieldValues, []byte(value))
 	}
 
-	// Count existing fields before insert (to calculate newly added)
-	var existingCount int64
-	err = q.QueryRow(ctx,
-		"SELECT COUNT(*) FROM kv_hashes WHERE key = $1 AND field = ANY($2)",
-		key, fieldNames,
-	).Scan(&existingCount)
-	if err != nil {
-		return 0, err
-	}
-
 	// Set metadata before data table for consistent lock ordering (kv_meta before kv_hashes).
 	if err := o.setMeta(ctx, q, key, TypeHash, nil); err != nil {
 		return 0, err
 	}
 
-	// Batch upsert all fields at once
-	_, err = q.Exec(ctx,
-		`INSERT INTO kv_hashes (key, field, value)
-		 SELECT $1, unnest($2::text[]), unnest($3::bytea[])
-		 ON CONFLICT (key, field) DO UPDATE SET value = EXCLUDED.value`,
-		key, fieldNames, fieldValues,
-	)
-	if err != nil {
-		return 0, err
+	// The upsert reports which rows it inserted, so counting the new fields
+	// needs no separate query: that one raced with concurrent HSETs, and its
+	// cached generic plan could scan the whole hash or table. PostgreSQL 18
+	// has old.* (NULL for an inserted row); before 18, xmax is 0 only on a
+	// row the INSERT created.
+	inserted := "xmax = 0"
+	if o.hasReturningOld() {
+		inserted = "old.field IS NULL"
 	}
-
-	// Return number of newly added fields
-	return int64(len(fields)) - existingCount, nil
+	var added int64
+	err = q.QueryRow(ctx,
+		`WITH up AS (
+			INSERT INTO kv_hashes (key, field, value)
+			SELECT $1, unnest($2::text[]), unnest($3::bytea[])
+			ON CONFLICT (key, field) DO UPDATE SET value = EXCLUDED.value
+			RETURNING `+inserted+` AS added
+		)
+		SELECT count(*) FILTER (WHERE added) FROM up`,
+		key, fieldNames, fieldValues,
+	).Scan(&added)
+	return added, err
 }
 
 func (o queryOps) hDel(ctx context.Context, q Querier, key string, fields []string) (int64, error) {

@@ -125,6 +125,10 @@ spec:
             - name: PG_PING_TIMEOUT
               value: {{ . | quote }}
             {{- end }}
+            {{- if hasKey .Values.postgresql.pool "transactionTimeout" }}
+            - name: PG_TRANSACTION_TIMEOUT
+              value: {{ .Values.postgresql.pool.transactionTimeout | quote }}
+            {{- end }}
             {{- end }}
             {{- if or .Values.redis.password.value .Values.redis.password.existingSecret.name }}
             - name: REDIS_PASSWORD

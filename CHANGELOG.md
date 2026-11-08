@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.30.0] - 2026-11-09
+
+### Added
+- **`PG_TRANSACTION_TIMEOUT`** (default `60s`, chart value `postgresql.pool.transactionTimeout`, `0` turns it off) — on PostgreSQL 17+ every pooled connection gets `transaction_timeout`, so a stuck transaction cannot hold key locks forever. Ignored on PostgreSQL 16.
+- **PostgreSQL 18 fast paths**, picked at startup from `server_version_num`: GETSET and HSET use `RETURNING old.*`, so the write itself returns the old value / tells which fields are new (saves a query). PostgreSQL 16 and 17 keep a compatible path.
+- **CI runs the integration tests on PostgreSQL 16, 17 and 18** (matrix in `docker-publish.yml`). `make test-pg-all` does the same locally, `make test PG_VERSION=18` picks one version.
+
+### Fixed
+- **GETSET race** — two concurrent GETSETs could return the same old value and lose a write. The key is now locked before the read.
+- **SET with GET, XX or KEEPTTL raced with other writers** (lost values, XX recreating a just-deleted key, KEEPTTL restoring a TTL that PERSIST removed). These now run in one transaction holding the key lock.
+- **HSET returned a wrong count of new fields under concurrency**, and on PostgreSQL 16/17 its separate count query could get a cached plan that scanned the whole hash or table (HSET of 10 fields on a ~4k-field hash: ~1.9 ms instead of ~0.75 ms). The count now comes from the upsert itself.
+- The integration test database for PostgreSQL 16/17 was on disk instead of tmpfs (`PGDATA` is now set inside the tmpfs).
+
+### Changed
+- **Dropped the indexes** `idx_kv_hashes_key`, `idx_kv_lists_key`, `idx_kv_sets_key`, `idx_kv_zsets_key`: each duplicated the primary key, which starts with `key`. Existing databases lose them on the next startup (`DROP INDEX IF EXISTS` in the schema setup).
+
 ## [0.29.3] - 2026-11-05
 
 ### Changed

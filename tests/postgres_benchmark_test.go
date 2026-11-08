@@ -243,6 +243,42 @@ func BenchmarkPgHSetHGet(b *testing.B) {
 	}
 }
 
+func BenchmarkPgGetSet(b *testing.B) {
+	ts := newPgTestServer(b)
+	defer ts.Close()
+
+	ctx := context.Background()
+	ts.client.Set(ctx, "bench_getset", "0", 0)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := ts.client.GetSet(ctx, "bench_getset", i).Err(); err != nil {
+			b.Fatalf("GETSET failed: %v", err)
+		}
+	}
+}
+
+// HSET of 10 fields per call: 5 that exist and 5 new ones.
+func BenchmarkPgHSetMany(b *testing.B) {
+	ts := newPgTestServer(b)
+	defer ts.Close()
+
+	ctx := context.Background()
+	pairs := make([]interface{}, 0, 20)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pairs = pairs[:0]
+		for j := 0; j < 5; j++ {
+			pairs = append(pairs, fmt.Sprintf("old_%d", j), i)
+			pairs = append(pairs, fmt.Sprintf("new_%d_%d", i, j), i)
+		}
+		if err := ts.client.HSet(ctx, "bench_hset_many", pairs...).Err(); err != nil {
+			b.Fatalf("HSET failed: %v", err)
+		}
+	}
+}
+
 func BenchmarkPgLPushLPop(b *testing.B) {
 	ts := newPgTestServer(b)
 	defer ts.Close()

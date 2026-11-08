@@ -111,75 +111,91 @@ func (h *Handler) setOp(ctx context.Context, ops storage.Operations, args []resp
 		}
 	}
 
-	// KEEPTTL preserves the existing TTL only when no explicit expiry was given.
-	if keepTTL && ttl == 0 {
-		currentTTL, err := ops.TTL(ctx, key)
-		if err != nil {
-			return resp.Err(err.Error())
-		}
-		if currentTTL > 0 {
-			ttl = time.Duration(currentTTL) * time.Second
-		}
-	}
-
-	// Capture the old value up front when GET was requested.
-	var oldValue string
-	var hadOld bool
-	if get {
-		var err error
-		oldValue, hadOld, err = ops.Get(ctx, key)
-		if err != nil {
-			return resp.Err(err.Error())
-		}
-	}
-	reply := func() resp.Value {
-		if get {
-			if hadOld {
-				return resp.Bulk(oldValue)
-			}
-			return resp.NullBulk()
-		}
-		return resp.OK()
-	}
-
-	switch {
-	case nx:
-		ok, err := ops.SetNX(ctx, key, value, ttl)
-		if err != nil {
-			return resp.Err(err.Error())
-		}
-		if !ok {
-			// Condition failed: report the old value with GET, else nil.
-			if get {
-				return reply()
-			}
-			return resp.NullBulk()
-		}
-	case xx:
-		exists := hadOld
-		if !get {
-			_, found, err := ops.Get(ctx, key)
+	run := func(ops storage.Operations) resp.Value {
+		ttl := ttl // runTx may call run again after a deadlock
+		// KEEPTTL preserves the existing TTL only when no explicit expiry was given.
+		if keepTTL && ttl == 0 {
+			currentTTL, err := ops.TTL(ctx, key)
 			if err != nil {
 				return resp.Err(err.Error())
 			}
-			exists = found
-		}
-		if !exists {
-			if get {
-				return reply()
+			if currentTTL > 0 {
+				ttl = time.Duration(currentTTL) * time.Second
 			}
-			return resp.NullBulk()
 		}
-		if err := ops.Set(ctx, key, value, ttl); err != nil {
-			return resp.Err(err.Error())
+
+		// Capture the old value up front when GET was requested.
+		var oldValue string
+		var hadOld bool
+		if get {
+			var err error
+			oldValue, hadOld, err = ops.Get(ctx, key)
+			if err != nil {
+				return resp.Err(err.Error())
+			}
 		}
-	default:
-		if err := ops.Set(ctx, key, value, ttl); err != nil {
-			return resp.Err(err.Error())
+		reply := func() resp.Value {
+			if get {
+				if hadOld {
+					return resp.Bulk(oldValue)
+				}
+				return resp.NullBulk()
+			}
+			return resp.OK()
 		}
+
+		switch {
+		case nx:
+			ok, err := ops.SetNX(ctx, key, value, ttl)
+			if err != nil {
+				return resp.Err(err.Error())
+			}
+			if !ok {
+				// Condition failed: report the old value with GET, else nil.
+				if get {
+					return reply()
+				}
+				return resp.NullBulk()
+			}
+		case xx:
+			exists := hadOld
+			if !get {
+				_, found, err := ops.Get(ctx, key)
+				if err != nil {
+					return resp.Err(err.Error())
+				}
+				exists = found
+			}
+			if !exists {
+				if get {
+					return reply()
+				}
+				return resp.NullBulk()
+			}
+			if err := ops.Set(ctx, key, value, ttl); err != nil {
+				return resp.Err(err.Error())
+			}
+		default:
+			if err := ops.Set(ctx, key, value, ttl); err != nil {
+				return resp.Err(err.Error())
+			}
+		}
+
+		return reply()
 	}
 
-	return reply()
+	// GET, XX and KEEPTTL read the key before writing it. Inside MULTI or a
+	// script the key is already locked; otherwise run the read and the write
+	// in one transaction that holds the key lock, or a concurrent write in
+	// between is lost (or XX recreates a key that was just deleted).
+	readsFirst := get || xx || (keepTTL && ttl == 0)
+	if !readsFirst {
+		return run(ops)
+	}
+	if _, inTx := ops.(storage.Transaction); inTx {
+		return run(ops)
+	}
+	return h.runTx(ctx, []string{key}, func(tx storage.Transaction) resp.Value { return run(tx) })
 }
 
 func (h *Handler) setnxOp(ctx context.Context, ops storage.Operations, args []resp.Value) resp.Value {

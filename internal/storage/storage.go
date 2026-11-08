@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -47,6 +48,11 @@ type Config struct {
 	MaxConnIdleTime   time.Duration // Maximum time a connection can be idle before it's closed
 	HealthCheckPeriod time.Duration // Period between health checks on idle connections
 	PingTimeout       time.Duration // Max wait for the liveness ping of an idle connection
+
+	// TransactionTimeout ends any session whose transaction (or single
+	// statement) runs longer than this. Only applied on PostgreSQL 17+, where
+	// transaction_timeout exists. 0 leaves the server setting alone.
+	TransactionTimeout time.Duration
 }
 
 // New creates a new Store with the given configuration
@@ -84,13 +90,37 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 	if cfg.PingTimeout > 0 {
 		poolConfig.PingTimeout = cfg.PingTimeout
 	}
+	if cfg.TransactionTimeout > 0 {
+		// Sent per connection after connect: on PostgreSQL 16 the setting does
+		// not exist, and an unknown setting in the startup packet would make
+		// every connection fail.
+		timeoutMs := cfg.TransactionTimeout.Milliseconds()
+		poolConfig.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+			if serverMajor(conn.PgConn().ParameterStatus("server_version")) < 17 {
+				return nil
+			}
+			_, err := conn.Exec(ctx, fmt.Sprintf("SET transaction_timeout = %d", timeoutMs))
+			return err
+		}
+	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create pool: %w", err)
 	}
 
-	store := &Store{pool: pool, connStr: connStr, sqlTraceLevel: cfg.SQLTraceLevel}
+	var serverVersion int
+	if err := pool.QueryRow(ctx, "SELECT current_setting('server_version_num')::int").Scan(&serverVersion); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("failed to read server version: %w", err)
+	}
+
+	store := &Store{
+		pool:          pool,
+		connStr:       connStr,
+		ops:           queryOps{serverVersion: serverVersion},
+		sqlTraceLevel: cfg.SQLTraceLevel,
+	}
 	if err := store.initSchema(ctx); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("failed to initialize schema: %w", err)
@@ -108,6 +138,17 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 	}()
 
 	return store, nil
+}
+
+// serverMajor returns the major version from the server_version the server
+// reports at connect (e.g. "18.1 (Debian 18.1-1)" gives 18), or 0 if unknown.
+func serverMajor(v string) int {
+	end := strings.IndexFunc(v, func(r rune) bool { return r < '0' || r > '9' })
+	if end >= 0 {
+		v = v[:end]
+	}
+	n, _ := strconv.Atoi(v)
+	return n
 }
 
 // Close closes the database connection pool and stops the background cleanup loop.
@@ -148,7 +189,7 @@ func (s *Store) initSchema(ctx context.Context) error {
 			PRIMARY KEY (key, field)
 		);
 		CREATE INDEX IF NOT EXISTS idx_kv_hashes_expires ON kv_hashes(expires_at) WHERE expires_at IS NOT NULL;
-		CREATE INDEX IF NOT EXISTS idx_kv_hashes_key ON kv_hashes(key);
+		DROP INDEX IF EXISTS idx_kv_hashes_key; -- the primary key starts with key
 
 		-- List type storage
 		CREATE TABLE IF NOT EXISTS kv_lists (
@@ -159,7 +200,7 @@ func (s *Store) initSchema(ctx context.Context) error {
 			PRIMARY KEY (key, idx)
 		);
 		CREATE INDEX IF NOT EXISTS idx_kv_lists_expires ON kv_lists(expires_at) WHERE expires_at IS NOT NULL;
-		CREATE INDEX IF NOT EXISTS idx_kv_lists_key ON kv_lists(key);
+		DROP INDEX IF EXISTS idx_kv_lists_key; -- the primary key starts with key
 
 		-- Set type storage
 		CREATE TABLE IF NOT EXISTS kv_sets (
@@ -169,7 +210,7 @@ func (s *Store) initSchema(ctx context.Context) error {
 			PRIMARY KEY (key, member)
 		);
 		CREATE INDEX IF NOT EXISTS idx_kv_sets_expires ON kv_sets(expires_at) WHERE expires_at IS NOT NULL;
-		CREATE INDEX IF NOT EXISTS idx_kv_sets_key ON kv_sets(key);
+		DROP INDEX IF EXISTS idx_kv_sets_key; -- the primary key starts with key
 
 		-- Sorted set type storage
 		CREATE TABLE IF NOT EXISTS kv_zsets (
@@ -180,7 +221,7 @@ func (s *Store) initSchema(ctx context.Context) error {
 			PRIMARY KEY (key, member)
 		);
 		CREATE INDEX IF NOT EXISTS idx_kv_zsets_expires ON kv_zsets(expires_at) WHERE expires_at IS NOT NULL;
-		CREATE INDEX IF NOT EXISTS idx_kv_zsets_key ON kv_zsets(key);
+		DROP INDEX IF EXISTS idx_kv_zsets_key; -- the primary key starts with key
 		CREATE INDEX IF NOT EXISTS idx_kv_zsets_score ON kv_zsets(key, score);
 
 		-- Key metadata for tracking types and TTL
@@ -408,7 +449,7 @@ func (s *Store) BeginTx(ctx context.Context) (Transaction, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &TxStore{tx: tx, sqlTraceLevel: s.sqlTraceLevel}, nil
+	return &TxStore{tx: tx, ops: s.ops, sqlTraceLevel: s.sqlTraceLevel}, nil
 }
 
 // ============== String Commands ==============

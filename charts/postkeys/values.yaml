@@ -159,6 +159,9 @@ postgresql:
     healthCheckPeriod: "1m"
     # Max wait for the liveness ping of an idle connection before it is dropped
     pingTimeout: "5s"
+    # PostgreSQL 17+: end a session whose transaction runs longer than this
+    # ("0" turns it off; ignored on PostgreSQL 16)
+    transactionTimeout: "60s"
   
   # Use an existing secret for PostgreSQL credentials
   existingSecret:
